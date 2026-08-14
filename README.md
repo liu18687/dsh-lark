@@ -42,13 +42,13 @@ Transport is `@larksuite/channel` over a WebSocket long connection, so no public
 ## Quickstart
 
 ```sh
-npx @deepseek-ai/dsh plugin --profile web add --allow-build=dsh-lark-channel github:omdsh-dev/dsh-lark \
-  && npx @deepseek-ai/dsh web
+dsh plugin --profile web add dsh-lark-channel
+dsh web
 ```
 
 The console prints a QR code. Scan it in Feishu: that creates the app, and the channel connects without a restart. Add a DeepSeek API key under Settings → Models, then DM the bot or @-mention it in a group.
 
-Already running `dsh`? Drop both `npx @deepseek-ai/` prefixes.
+No global `dsh`? Prefix both commands with `npx @deepseek-ai/`.
 
 <details>
 <summary>Composition details, the QR window, and the invariant row</summary>

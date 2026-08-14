@@ -42,13 +42,13 @@ DeepSeek Harness 的飞书/Lark IM 机器人渠道插件。每个会话（单聊
 ## 快速开始
 
 ```sh
-npx @deepseek-ai/dsh plugin --profile web add --allow-build=dsh-lark-channel github:omdsh-dev/dsh-lark \
-  && npx @deepseek-ai/dsh web
+dsh plugin --profile web add dsh-lark-channel
+dsh web
 ```
 
 控制台会打印一个二维码。用飞书扫它，应用即创建完成，渠道无需重启即建连。在 Settings → Models 里填 DeepSeek API key，然后私聊机器人或在群里 @ 它。
 
-已经在用 `dsh`？把两处 `npx @deepseek-ai/` 前缀去掉即可。
+没有全局 `dsh`？两条命令都加 `npx @deepseek-ai/` 前缀。
 
 <details>
 <summary>组合细节、二维码有效期与 invariant 伴生行</summary>

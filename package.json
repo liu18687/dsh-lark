@@ -2,8 +2,21 @@
   "name": "dsh-lark-channel",
   "description": "Lark/Feishu IM bot channel for DeepSeek Harness: chats drive agents, replies and approvals return as messages and cards",
   "version": "0.0.1",
-  "private": true,
   "type": "module",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek",
+    "deepseek-harness",
+    "lark",
+    "feishu",
+    "larksuite",
+    "channel",
+    "chatbot",
+    "im-bot",
+    "cordis",
+    "ai-agent"
+  ],
   "packageManager": "pnpm@11.7.0",
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
@@ -44,6 +57,11 @@
   },
   "bugs": {
     "url": "https://github.com/omdsh-dev/dsh-lark/issues"
+  },
+  "homepage": "https://github.com/omdsh-dev/dsh-lark#readme",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1",
