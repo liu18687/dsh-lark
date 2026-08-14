@@ -40,10 +40,10 @@
   "license": "BSD-3-Clause",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Roy-oss1/dsh-lark.git"
+    "url": "git+https://github.com/omdsh-dev/dsh-lark.git"
   },
   "bugs": {
-    "url": "https://github.com/Roy-oss1/dsh-lark/issues"
+    "url": "https://github.com/omdsh-dev/dsh-lark/issues"
   },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1",

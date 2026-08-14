@@ -42,7 +42,7 @@ DeepSeek Harness 的飞书/Lark IM 机器人渠道插件。每个会话（单聊
 ## 快速开始
 
 ```sh
-npx @deepseek-ai/dsh plugin --profile web add --allow-build=dsh-lark-channel github:Roy-oss1/dsh-lark \
+npx @deepseek-ai/dsh plugin --profile web add --allow-build=dsh-lark-channel github:omdsh-dev/dsh-lark \
   && npx @deepseek-ai/dsh web
 ```
 
