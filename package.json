@@ -1,7 +1,7 @@
 {
   "name": "dsh-lark-channel",
   "description": "Lark/Feishu IM bot channel for DeepSeek Harness: chats drive agents, replies and approvals return as messages and cards",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "type": "module",
   "keywords": [
     "dsh",
@@ -30,6 +30,9 @@
   },
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
+  "bin": {
+    "dsh-lark-channel": "lib/cli.js"
+  },
   "exports": {
     ".": {
       "types": "./lib/types/index.d.ts",
@@ -45,6 +48,7 @@
   "files": [
     "lib/index.js",
     "lib/invariant.js",
+    "lib/cli.js",
     "lib/types/**/*.d.ts",
     "lib/types/**/*.d.ts.map",
     "src",

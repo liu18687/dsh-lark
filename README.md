@@ -42,13 +42,21 @@ Transport is `@larksuite/channel` over a WebSocket long connection, so no public
 ## Quickstart
 
 ```sh
+npx dsh-lark-channel start
+```
+
+A QR code appears; scan it in Feishu and the bot is live. It runs in the background from the first moment — under launchd on macOS, `systemd --user` on Linux — so it survives the terminal closing and comes back after a reboot. Then DM it or @-mention it in a group.
+
+`stop`, `restart`, and `status` manage it afterwards; re-running `start` applies updates. `dsh` has to be installed (`npm i -g @deepseek-ai/dsh`), since a supervised process cannot depend on npx. Where neither launchd nor systemd exists — Windows, a Linux without systemd — `start` runs in the foreground instead.
+
+Already running `dsh web` and want the channel in that profile instead:
+
+```sh
 dsh plugin --profile web add dsh-lark-channel
 dsh web
 ```
 
-The console prints a QR code. Scan it in Feishu: that creates the app, and the channel connects without a restart. Add a DeepSeek API key under Settings → Models, then DM the bot or @-mention it in a group.
-
-No global `dsh`? Prefix both commands with `npx @deepseek-ai/`.
+The model key comes from the Settings → Models page under `web`, and from `DEEPSEEK_API_KEY` or the managed `$DSH_HOME/.credentials.yaml` anywhere else.
 
 <details>
 <summary>Composition details, the QR window, and the invariant row</summary>

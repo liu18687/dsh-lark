@@ -42,13 +42,21 @@ DeepSeek Harness 的飞书/Lark IM 机器人渠道插件。每个会话（单聊
 ## 快速开始
 
 ```sh
+npx dsh-lark-channel start
+```
+
+终端会打印一个二维码，用飞书扫掉机器人就活了。它从一开始就在后台运行——macOS 交给 launchd，Linux 交给 `systemd --user`——关掉终端不受影响，重启开机自起。然后私聊它或在群里 @ 它。
+
+之后用 `stop`、`restart`、`status` 管理；重跑 `start` 即应用更新。需要装好 `dsh`（`npm i -g @deepseek-ai/dsh`），后台服务不能依赖 npx 联网解析。没有 launchd / systemd 的环境（Windows、无 systemd 的 Linux）里，`start` 会改为前台运行。
+
+已经在跑 `dsh web`、想把渠道挂在那个 profile 上：
+
+```sh
 dsh plugin --profile web add dsh-lark-channel
 dsh web
 ```
 
-控制台会打印一个二维码。用飞书扫它，应用即创建完成，渠道无需重启即建连。在 Settings → Models 里填 DeepSeek API key，然后私聊机器人或在群里 @ 它。
-
-没有全局 `dsh`？两条命令都加 `npx @deepseek-ai/` 前缀。
+模型 key 在 `web` 下从 Settings → Models 页面填；其他情况来自 `DEEPSEEK_API_KEY` 环境变量或宿主托管的 `$DSH_HOME/.credentials.yaml`。
 
 <details>
 <summary>组合细节、二维码有效期与 invariant 伴生行</summary>
