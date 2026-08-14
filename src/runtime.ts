@@ -160,12 +160,17 @@ export function apply(ctx: Context, config: Config): void {
    * on the console: who it serves is a security fact its operator must see, and
    * a groups-only channel (no owner configured yet) is a valid deployment.
    */
+  // Durable plugin state (onboarded credentials, workspace switches) goes
+  // through the settings section when one is composed; false tells the writer
+  // the value lives in memory only.
+  let persistState = async (_patch: object): Promise<boolean> => false
+
   const start = (resolved: ChannelConfig): void => {
     if (!active || started) return
     started = true
     const authorization = resolveAuthorization(resolved)
     internals.notify(describeAuthorization(authorization))
-    installBridge(ctx, resolved, internals.createPort(resolved, authorization), internals.notify, authorization)
+    installBridge(ctx, resolved, internals.createPort(resolved, authorization), internals.notify, authorization, persistState)
   }
 
   const bootstrap = async (): Promise<void> => {
@@ -181,10 +186,11 @@ export function apply(ctx: Context, config: Config): void {
       try {
         const scope = settings.register(SETTINGS_NAMESPACE, Config, { base: config })
         resolved = resolveConfig(scope.get() as Config)
-        persist = async (credentials) => {
-          await scope.update(credentials)
+        persistState = async (patch) => {
+          await scope.update(patch)
           return true
         }
+        persist = async (credentials) => persistState(credentials)
       } catch (error) {
         ctx.logger.error(
           'settings registration failed; continuing with entry config only: %s',

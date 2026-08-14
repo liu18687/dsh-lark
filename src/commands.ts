@@ -10,6 +10,9 @@
  */
 
 import type { HostAgent, HostCommands } from './host.ts'
+import { CD_COMMAND, WS_COMMAND } from './workspace.ts'
+import { MODEL_COMMAND } from './model.ts'
+import { STATUS_COMMAND } from './status.ts'
 
 /** Cancel the running turn. Not a host command: cancellation is an agent method. */
 export const STOP_COMMAND = 'stop'
@@ -59,6 +62,10 @@ export interface CommandOutcome {
 export function helpText(commands: HostCommands | undefined, agent: HostAgent): string {
   const own = [
     `\`/${STOP_COMMAND}\` — 停止当前任务`,
+    `\`/${CD_COMMAND} <路径>\` — 切换本会话的工作区目录`,
+    `\`/${WS_COMMAND}\` — 查看可用工作区`,
+    `\`/${MODEL_COMMAND}\` — 查看或切换本会话模型`,
+    `\`/${STATUS_COMMAND}\` — 查看本会话状态`,
     `\`/${HELP_COMMAND}\` — 显示这条帮助`,
   ]
   const hosted = (commands?.list(agent) ?? [])

@@ -26,6 +26,8 @@ Transport is `@larksuite/channel` over a WebSocket long connection, so no public
 ## Features
 
 - One agent per conversation. `sessionScope` picks the facet: the whole chat, one topic thread, or one sender inside a shared chat. Session ids are stable across restarts.
+- `/cd` points a conversation at a directory; `/ws` lists every workspace the host registry knows, each reachable by bare name. Every (conversation × directory) pair owns a durable session, so coming back to a directory resumes the context built there; switches persist across restarts, `workspaceRoots` can fence where `/cd` may go, and the filesystem root and home are never accepted.
+- `/model` shows the current route and the host llm registry's catalog; `/model use <provider/model>` switches this conversation from the next message on — the SAME session resumes under the new route, context intact. `/status` reports workspace, model, session, and turn activity, before a first message exists.
 - Two output modes: `cot` uses the platform's native thinking process, `stream` keeps a turn in one typewriter card for older clients.
 - A line starting with `/` runs as a host command without a model turn. `/stop` cancels the running turn, `/help` lists what the chat accepts.
 - Host approval questions become cards with 允许一次 / 拒绝 buttons; a click settles the outcome and rewrites the card with the decision.
@@ -44,7 +46,7 @@ Transport is `@larksuite/channel` over a WebSocket long connection, so no public
 ## Quickstart
 
 ```sh
-npx dsh-lark-channel start
+npx dsh-lark-channel@latest start
 ```
 
 A QR code appears; scan it in Feishu and the bot is live. It runs in the background from the first moment — under launchd on macOS, `systemd --user` on Linux — so it survives the terminal closing and comes back after a reboot. Then DM it or @-mention it in a group.
@@ -54,9 +56,11 @@ A QR code appears; scan it in Feishu and the bot is live. It runs in the backgro
 Already running `dsh web` and want the channel in that profile instead:
 
 ```sh
-dsh plugin --profile web add dsh-lark-channel
+dsh plugin --profile web add dsh-lark-channel@latest
 dsh web
 ```
+
+The same command upgrades; restart `dsh web` after.
 
 The model key comes from the Settings → Models page under `web`, and from `DEEPSEEK_API_KEY` or the managed `$DSH_HOME/.credentials.yaml` anywhere else.
 
@@ -77,7 +81,10 @@ The invariant companion row is not part of the default patch: the shipped `web` 
 |---|---|---|
 | `appId`, `appSecret` | first-boot QR onboarding | Lark/Feishu app credentials. Layering below. |
 | `domain` | Feishu | Open-platform domain; set `https://open.larksuite.com` for Lark. |
-| `cwd` | host process cwd | Absolute workspace directory for chat-driven agents. |
+| `cwd` | host process cwd | Absolute workspace directory for chat-driven agents; the default a `/cd` can always return to. |
+| `workspaceRoots` | `[]` | Directory prefixes `/cd` may point a conversation at; empty allows any existing directory. The deployment default is always reachable. |
+| `chatWorkspaces` | `{}` | Managed state, not configuration: the directory each conversation was `/cd`-ed to, written back through the settings service. |
+| `chatModels` | `{}` | Managed state, not configuration: the `provider/model` route each conversation asked for via `/model use`. |
 | `provider`, `model` | host `agentDefaultModel` | Model route for chat agents. |
 | `preset` | roster default | Agent preset chat agents join, when the deployment composes a roster. |
 | `sessionScope` | `chat` | Which conversation facet owns one agent session: `chat` (one shared agent per chat), `chat-thread` (one per topic thread, so parallel topics stop overwriting each other's context), `chat-sender` (one per person in a shared chat). |
@@ -123,7 +130,7 @@ Tool activity is labelled from each tool's own `presentCall` title, the label th
 <details>
 <summary>Slash commands</summary>
 
-A line beginning with `/` is a control, not a prompt — the host runs it without a model turn, so whatever commands the deployment composed — `/compact`, `/plan`, `/permission`, `/export` and the rest — reach the runtime instead of the model reading them as prose. `/stop` cancels the running turn (cancellation is an agent method, not a registered command) and `/help` lists what the chat accepts. An unresolved name is named as unknown with that listing rather than handed to the model.
+A line beginning with `/` is a control, not a prompt — the host runs it without a model turn, so whatever commands the deployment composed — `/compact`, `/plan`, `/permission`, `/export` and the rest — reach the runtime instead of the model reading them as prose. `/stop` cancels the running turn (cancellation is an agent method, not a registered command) and `/help` lists what the chat accepts. `/cd` and `/ws` are also the channel's own and need no agent at all, so a `/cd` in a fresh chat switches the directory without first spending a session on the one it is leaving. An unresolved name is named as unknown with that listing rather than handed to the model.
 
 On first use the channel also registers those commands on the bot itself (`syncSlashCommands`), so Feishu offers them when a user types `/`. The sync reconciles: it adds what the panel is missing and removes what the channel no longer offers, so the menu never offers a command that answers "unknown". A deployment that curates its own menu turns the sync off.
 
@@ -181,7 +188,6 @@ Chat sessions are accounted under the workspace record for their directory, regi
 - A restart resumes a stored conversation, but nothing that arrived while the process was down is replayed: the transport offers no cursor.
 - Files and audio are passed through as the SDK's normalized text only; a file's right home is usually the workspace an agent can already read, not the request. Images are the exception: they are downloaded and attached.
 - The model sees group messages as `sender: text` single-user turns; there is no per-sender identity beyond the prefix.
-- Per-session model switching is not installed: chat agents route through `agentOptions` alone, so the host's scoped model-selection commands do not apply to them.
 - Question tools are denied rather than answered: the `userQuestions` seam takes one provider per context, so a second UI channel cannot participate. Answering questions as chat cards needs either that seam to route by session owner or a deployment with no other provider.
 
 ## Development

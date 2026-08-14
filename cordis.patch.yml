@@ -14,6 +14,9 @@
         appSecret: !!js process.env.LARK_APP_SECRET
         # domain: https://open.larksuite.com   # default is Feishu
         # cwd: an absolute workspace directory  # default is the host process cwd
+        # workspaceRoots: []   # directory prefixes /cd may enter; empty = any
+        # chatWorkspaces: {}   # managed by /cd via the settings service; not hand-edited
+        # chatModels: {}       # managed by /model via the settings service; not hand-edited
         # provider: deepseek                    # default is the host agentDefaultModel
         # model: deepseek-chat
         # Output. `cot` shows the process as a native thinking-process message

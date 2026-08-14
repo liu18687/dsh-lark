@@ -26,6 +26,8 @@ DeepSeek Harness 的飞书/Lark IM 机器人渠道插件。每个会话（单聊
 ## 能力
 
 - 每个会话一个 Agent。`sessionScope` 决定粒度：整个会话、单个话题、或共享会话里的单个发送者。session id 跨重启稳定。
+- `/cd` 把会话指向一个目录；`/ws` 列出宿主注册表里的全部工作区，每个都能用裸名字直达。每个（会话 × 目录）组合拥有各自的持久会话——切回某个目录就续用在那里积累的上下文；切换跨重启保留，`workspaceRoots` 可限定 `/cd` 的可达范围，文件系统根和 Home 根永远拒绝。
+- `/model` 展示当前路由和宿主 llm 注册表的模型目录；`/model use <provider/model>` 从下一条消息起切换本会话——**同一个** session 以新路由续跑，上下文不丢。`/status` 报告工作区、模型、会话与运行状态，第一条消息发出前就能问。
 - 两种输出模式：`cot` 用平台原生思考过程，`stream` 每轮一张打字机卡片，供旧客户端使用。
 - 以 `/` 开头的一行作为宿主命令执行，不开模型轮次。`/stop` 停止当前轮次，`/help` 列出可用命令。
 - 宿主的审批问题变成带「允许一次 / 拒绝」按钮的卡片，点击即结算，卡片改写为决定结果。
@@ -44,7 +46,7 @@ DeepSeek Harness 的飞书/Lark IM 机器人渠道插件。每个会话（单聊
 ## 快速开始
 
 ```sh
-npx dsh-lark-channel start
+npx dsh-lark-channel@latest start
 ```
 
 终端会打印一个二维码，用飞书扫掉机器人就活了。它从一开始就在后台运行——macOS 交给 launchd，Linux 交给 `systemd --user`——关掉终端不受影响，重启开机自起。然后私聊它或在群里 @ 它。
@@ -54,9 +56,11 @@ npx dsh-lark-channel start
 已经在跑 `dsh web`、想把渠道挂在那个 profile 上：
 
 ```sh
-dsh plugin --profile web add dsh-lark-channel
+dsh plugin --profile web add dsh-lark-channel@latest
 dsh web
 ```
+
+升级就是重跑这条命令，然后重启 `dsh web`。
 
 模型 key 在 `web` 下从 Settings → Models 页面填；其他情况来自 `DEEPSEEK_API_KEY` 环境变量或宿主托管的 `$DSH_HOME/.credentials.yaml`。
 
@@ -77,7 +81,10 @@ invariant 伴生行不在默认 patch 里：发货的 `web` profile 未组合 `i
 |---|---|---|
 | `appId`、`appSecret` | 首次启动扫码注册 | 飞书/Lark 应用凭证。分层见下。 |
 | `domain` | 飞书 | 开放平台域名；Lark 用 `https://open.larksuite.com`。 |
-| `cwd` | 宿主进程 cwd | 会话 Agent 的绝对工作目录。 |
+| `cwd` | 宿主进程 cwd | 会话 Agent 的绝对工作目录；`/cd` 永远可以切回的默认目录。 |
+| `workspaceRoots` | `[]` | `/cd` 可以指向的目录前缀；空 = 任何存在的目录。默认目录始终可达。 |
+| `chatWorkspaces` | `{}` | 托管状态而非配置：各会话被 `/cd` 到的目录，经 settings 服务写回。 |
+| `chatModels` | `{}` | 托管状态而非配置：各会话经 `/model use` 指定的 `provider/model` 路由。 |
 | `provider`、`model` | 宿主 `agentDefaultModel` | 会话 Agent 的模型路由。 |
 | `preset` | roster 默认 | 部署组合了 roster 时，会话 Agent 加入的 preset。 |
 | `sessionScope` | `chat` | 一个 Agent 会话对应的会话粒度：`chat`（整个会话共用一个）、`chat-thread`（每个话题各自一个，避免并行话题互相覆盖上下文）、`chat-sender`（共享会话里每个人各自一个）。 |
@@ -123,7 +130,7 @@ invariant 伴生行不在默认 patch 里：发货的 `web` profile 未组合 `i
 <details>
 <summary>斜杠命令</summary>
 
-以 `/` 开头的一行是控制指令而非提问——宿主不开模型轮次就执行它，因此该部署组合了哪些命令就有哪些——`/compact`、`/plan`、`/permission`、`/export` 等——它们会进入命令运行时，而不是被模型当普通文本读。`/stop` 停止当前轮次（取消是 agent 方法，不是注册命令），`/help` 列出本会话可用的命令。无法解析的名字会被明确告知"未知命令"并附上清单，而不是丢给模型。
+以 `/` 开头的一行是控制指令而非提问——宿主不开模型轮次就执行它，因此该部署组合了哪些命令就有哪些——`/compact`、`/plan`、`/permission`、`/export` 等——它们会进入命令运行时，而不是被模型当普通文本读。`/stop` 停止当前轮次（取消是 agent 方法，不是注册命令），`/help` 列出本会话可用的命令。`/cd` 和 `/ws` 同样是渠道自有命令，且完全不需要 agent——新会话里发 `/cd` 会直接切目录，而不是先在旧目录白建一个会话。无法解析的名字会被明确告知"未知命令"并附上清单，而不是丢给模型。
 
 首次使用时还会把这些命令注册到机器人本身（`syncSlashCommands`），用户在飞书里打 `/` 就能看到菜单；同步是**对齐式**的：缺的建、渠道不再提供的删，因此菜单里不会出现一个点了回"未知命令"的条目。自己维护菜单的部署把同步关掉即可。
 
@@ -181,7 +188,6 @@ invariant 伴生行不在默认 patch 里：发货的 `web` profile 未组合 `i
 - 重启会恢复已持久化的会话，但停机期间到达的事件不会重放：传输层没有 cursor。
 - 文件与音频仅透传 SDK 的归一化文本，文件更合适的归宿通常是 Agent 本来就能读的工作区，而不是塞进请求。图片是例外，会下载并附加。
 - 模型将群聊消息视为 `发送者: 文本` 的单用户轮次，除前缀外没有更强的发送者身份。
-- 未安装按会话切换模型的能力：会话 Agent 仅通过 `agentOptions` 路由，宿主的作用域模型选择命令对它们无效。
 - 提问类工具是拒绝而非接管：`userQuestions` seam 每上下文仅一个 provider，第二个 UI 渠道无法参与。要把提问也做成会话卡片，需要该 seam 支持按会话归属路由，或部署里没有其他 provider。
 
 ## 开发

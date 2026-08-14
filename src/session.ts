@@ -129,10 +129,14 @@ export class ConversationSessions {
   /**
    * @param scope - the conversation facet every session is keyed by.
    * @param ladder - the host operations to walk.
+   * @param idFor - session id per conversation key; the default is the plain
+   * branding, and a workspace-aware channel injects a deriver that
+   * discriminates by directory too.
    */
   constructor(
     private readonly scope: SessionScope,
     private readonly ladder: SessionLadder,
+    private readonly idFor: (key: string) => string = sessionIdFor,
   ) {}
 
   /** Session ids currently bound, in insertion order. */
@@ -159,7 +163,15 @@ export class ConversationSessions {
     if (this.closed) throw new Error('lark-channel: sessions are closed')
     const key = conversationKey(this.scope, msg)
     const bound = this.opened.get(key)
-    if (bound !== undefined) return bound
+    if (bound !== undefined) {
+      // The binding is only reusable while it still IS this key's session: a
+      // workspace switch re-derives the id, and a message racing the switch's
+      // release could otherwise be handed an agent mid-disposal. A stale
+      // binding is released here — a second release is a no-op — and the walk
+      // below reaches the session the key derives to now.
+      if (bound.handle.agent.session.id === this.idFor(key)) return bound
+      await this.release(key)
+    }
     let opening = this.opening.get(key)
     if (opening === undefined) {
       opening = this.bind(key)
@@ -168,6 +180,31 @@ export class ConversationSessions {
       opening.catch(() => { this.opening.delete(key) })
     }
     return opening
+  }
+
+  /**
+   * Unbind one conversation and dispose the agent it held, so the next message
+   * walks the ladder afresh — which is what makes a workspace switch take
+   * effect. An adopted agent (another owner's) is unbound but left running:
+   * whoever created it still owns taking it down.
+   * @param key - the conversation key to release.
+   * @returns whether a binding existed.
+   */
+  async release(key: string): Promise<boolean> {
+    // A concurrent acquisition must land before it can be released, or the
+    // released conversation would rebind itself the moment the walk finishes.
+    const opening = this.opening.get(key)
+    if (opening !== undefined) await opening.catch(() => {})
+    const bound = this.opened.get(key)
+    if (bound === undefined) return false
+    this.opened.delete(key)
+    this.keys.delete(bound.handle.agent.session.id)
+    if (bound.owned) {
+      await bound.handle.dispose().catch((error: unknown) => {
+        this.ladder.report(`lark-channel: disposing the released session for ${key} failed: ${failureDetail(error)}`)
+      })
+    }
+    return true
   }
 
   /**
@@ -219,7 +256,7 @@ export class ConversationSessions {
    * @throws when creation — the last rung — also fails.
    */
   private async reach(key: string): Promise<OpenedSession> {
-    const sessionId = sessionIdFor(key)
+    const sessionId = this.idFor(key)
     const live = this.ladder.lookup(sessionId)
     // Whoever created a live agent still owns taking it down.
     if (live !== undefined) return { handle: live, owned: false }

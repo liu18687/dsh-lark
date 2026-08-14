@@ -297,5 +297,76 @@ describe('conversation sessions', () => {
       expect(host.disposals).toEqual([sessionIdFor('oc_chat_1')])
       expect(sessions.sessionIds).toEqual([])
     })
+
+    it('derives ids through an injected deriver, and re-derives after release', async () => {
+      const host = createFakeLadder()
+      let directory: string | undefined
+      const sessions = new ConversationSessions('chat', host.ladder, key =>
+        directory === undefined ? sessionIdFor(key) : `${sessionIdFor(key)}--ws`)
+      await sessions.acquire(fakeMessage())
+      expect(host.asked('create')).toEqual([sessionIdFor('oc_chat_1')])
+
+      directory = '/srv/alpha'
+      await sessions.release('oc_chat_1')
+      await sessions.acquire(fakeMessage())
+      expect(host.asked('create')).toEqual([sessionIdFor('oc_chat_1'), `${sessionIdFor('oc_chat_1')}--ws`])
+    })
+
+    it('self-heals a binding whose id derivation changed, without an explicit release', async () => {
+      const host = createFakeLadder()
+      let suffix = ''
+      const sessions = new ConversationSessions('chat', host.ladder, key => `${sessionIdFor(key)}${suffix}`)
+      const first = await sessions.acquire(fakeMessage())
+
+      // A recorded switch whose release lost the race: the mapping moved on,
+      // the old binding did not. The next message must not reuse it.
+      suffix = '--ws'
+      const second = await sessions.acquire(fakeMessage())
+      expect(second.handle.agent.session.id).toBe(`${sessionIdFor('oc_chat_1')}--ws`)
+      expect(second).not.toBe(first)
+      expect(host.disposals).toEqual([sessionIdFor('oc_chat_1')])
+
+      // Stability restored: the same derivation reuses the same binding.
+      expect(await sessions.acquire(fakeMessage())).toBe(second)
+      expect(host.disposals).toHaveLength(1)
+    })
+
+    it('release disposes an owned agent and unbinds the key', async () => {
+      const host = createFakeLadder()
+      const sessions = new ConversationSessions('chat', host.ladder)
+      const opened = await sessions.acquire(fakeMessage())
+
+      expect(await sessions.release('oc_chat_1')).toBe(true)
+      expect(host.disposals).toEqual([sessionIdFor('oc_chat_1')])
+      expect(sessions.keyOf(opened.handle.agent.session.id)).toBeUndefined()
+      expect(sessions.sessionIds).toEqual([])
+      expect(await sessions.release('oc_chat_1')).toBe(false)
+
+      // The conversation stays serviceable: the next message rebinds afresh.
+      await sessions.acquire(fakeMessage())
+      expect(sessions.sessionIds).toEqual([sessionIdFor('oc_chat_1')])
+    })
+
+    it('release leaves an adopted agent running but unbinds it', async () => {
+      const host = createFakeLadder({ live: [sessionIdFor('oc_chat_1')] })
+      const sessions = new ConversationSessions('chat', host.ladder)
+      await sessions.acquire(fakeMessage())
+
+      expect(await sessions.release('oc_chat_1')).toBe(true)
+      // Whoever created the live agent still owns taking it down.
+      expect(host.disposals).toEqual([])
+    })
+
+    it('release waits out an in-flight acquisition instead of missing it', async () => {
+      const host = createFakeLadder()
+      const sessions = new ConversationSessions('chat', host.ladder)
+      const opening = sessions.acquire(fakeMessage())
+      const released = sessions.release('oc_chat_1')
+
+      await opening
+      expect(await released).toBe(true)
+      expect(host.disposals).toEqual([sessionIdFor('oc_chat_1')])
+      expect(sessions.sessionIds).toEqual([])
+    })
   })
 })

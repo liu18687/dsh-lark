@@ -27,6 +27,7 @@ import type {
   HostApprovalOutcome,
   HostApprovalRequest,
   HostDefaultModel,
+  HostLlm,
   HostLoader,
   HostSessionEvent,
   HostCommands,
@@ -37,19 +38,24 @@ import type {
   HostWorkspace,
   HostWorkspaceRegistry,
 } from './host.ts'
-import { isToolCallEvent, isTurnEndEvent } from './host.ts'
+import { isStepStartEvent, isToolCallEvent, isTurnEndEvent } from './host.ts'
 import { createCotRenderer } from './cot.ts'
 import type { CotPort } from './cot.ts'
 import { createMessageRenderer, createStreamRenderer } from './outbound.ts'
 import type { OutboundPort, OutboundRenderer, ReplyTarget, ToolPresentation } from './outbound.ts'
 import { refuseApprovalClick, refuseMessage } from './authorization.ts'
 import type { Authorization } from './authorization.ts'
-import { HELP_COMMAND, isCommandLine, runCommandLine, STOP_COMMAND } from './commands.ts'
+import { commandName, HELP_COMMAND, isCommandLine, runCommandLine, STOP_COMMAND } from './commands.ts'
+import { CD_COMMAND, ChatWorkspaces, runWorkspaceCommand, WS_COMMAND } from './workspace.ts'
+import { ChatModels, formatRoute, MODEL_COMMAND, runModelCommand } from './model.ts'
+import type { CatalogEntry } from './model.ts'
+import { renderStatus, STATUS_COMMAND } from './status.ts'
+import { ownVersion } from './version.ts'
 import { collectImages } from './images.ts'
 import type { CollectedImages, ImagePort } from './images.ts'
 import { syncSlashPanel } from './slash-panel.ts'
 import type { SlashPanelPort } from './slash-panel.ts'
-import { ConversationSessions } from './session.ts'
+import { ConversationSessions, conversationKey } from './session.ts'
 import type { SessionLadder } from './session.ts'
 
 /**
@@ -390,6 +396,7 @@ export function installBridge(
   port: ChannelPort,
   notify: (line: string) => void,
   authorization: Authorization,
+  persistState: (patch: object) => Promise<boolean> = async () => false,
 ): void {
   const bySession = new Map<string, ChatBinding>()
   const pendingApprovals = new Map<string, PendingApproval>()
@@ -399,28 +406,77 @@ export function installBridge(
    * an escalation without seeing the command; the log already published these.
    */
   const pendingCallArguments = new Map<string, string>()
-  const cwd = resolve(config.cwd ?? process.cwd())
+  const defaultCwd = resolve(config.cwd ?? process.cwd())
+
+  /** Which directory each conversation runs in, and the session id that pair owns. */
+  const chatWorkspaces = new ChatWorkspaces({
+    defaultPath: defaultCwd,
+    entries: config.chatWorkspaces,
+    roots: config.workspaceRoots,
+    persist: persistState,
+    report: notify,
+    // The host registry's listing, read fresh per use: every workspace this
+    // human already uses with the host is a `/cd` destination worth offering.
+    known: () => {
+      const registry = ctx.get('workspaceRegistry') as HostWorkspaceRegistry | undefined
+      if (registry?.list === undefined) return []
+      try {
+        return registry.list().map(workspace => workspace.path)
+      } catch {
+        return []
+      }
+    },
+  })
+
+  /** Which model route each conversation asked for, against the deployment default. */
+  const chatModels = new ChatModels({
+    entries: config.chatModels,
+    persist: persistState,
+    report: notify,
+  })
 
   /**
-   * The workspace chat sessions are accounted under, resolved once. Workspace
-   * grouping is an ACCOUNT, not a cwd derivation: a session nobody attaches
-   * stays in the GUI's Ungrouped bucket however its cwd reads. Registering the
-   * directory when no record exists keeps chat sessions out of that bucket
-   * instead of orphaning every one of them.
+   * The directory and route each session id was derived for. The ladder is
+   * keyed by session id alone, so its rungs read these back here rather than
+   * widening every rung's signature with context most of them ignore. A model
+   * route is NOT part of the id — the same session resumes under a new route,
+   * context intact — so the override map is refreshed on every derivation.
    */
-  let workspacePromise: Promise<HostWorkspace | undefined> | undefined
-  const chatWorkspace = (): Promise<HostWorkspace | undefined> => {
-    workspacePromise ??= (async () => {
-      const registry = ctx.get('workspaceRegistry') as HostWorkspaceRegistry | undefined
-      if (registry === undefined) return undefined
-      return (await registry.resolveByPath(cwd)) ?? await registry.create(cwd)
-    })().catch((error: unknown) => {
-      // Grouping is presentation: a chat must still work in a deployment whose
-      // registry refuses this directory.
-      notify(`lark-channel: workspace lookup failed for ${cwd}: ${String(error)}`)
-      return undefined
-    })
-    return workspacePromise
+  const pathBySession = new Map<string, string>()
+  const routeBySession = new Map<string, HostAgentOptions>()
+  const sessionIdForKey = (key: string): string => {
+    const id = chatWorkspaces.sessionIdFor(key)
+    pathBySession.set(id, chatWorkspaces.pathFor(key))
+    const route = chatModels.routeFor(key)
+    if (route === undefined) routeBySession.delete(id)
+    else routeBySession.set(id, route)
+    return id
+  }
+
+  /**
+   * The workspace record a directory's sessions are accounted under, resolved
+   * once per directory. Workspace grouping is an ACCOUNT, not a cwd derivation:
+   * a session nobody attaches stays in the GUI's Ungrouped bucket however its
+   * cwd reads. Registering the directory when no record exists keeps chat
+   * sessions out of that bucket instead of orphaning every one of them.
+   */
+  const workspaceRecords = new Map<string, Promise<HostWorkspace | undefined>>()
+  const workspaceRecordFor = (path: string): Promise<HostWorkspace | undefined> => {
+    let pending = workspaceRecords.get(path)
+    if (pending === undefined) {
+      pending = (async () => {
+        const registry = ctx.get('workspaceRegistry') as HostWorkspaceRegistry | undefined
+        if (registry === undefined) return undefined
+        return (await registry.resolveByPath(path)) ?? await registry.create(path)
+      })().catch((error: unknown) => {
+        // Grouping is presentation: a chat must still work in a deployment
+        // whose registry refuses this directory.
+        notify(`lark-channel: workspace lookup failed for ${path}: ${String(error)}`)
+        return undefined
+      })
+      workspaceRecords.set(path, pending)
+    }
+    return pending
   }
 
   // Operator-facing, so it goes to the process stream as well as the logger:
@@ -444,6 +500,48 @@ export function installBridge(
       )
     }
     return defaults.currentSelection()
+  }
+
+  /** The deployment default's display form; `/status` must not throw where creation may. */
+  const deploymentRoute = (): string => {
+    try {
+      return formatRoute(modelSelection())
+    } catch {
+      return '未配置'
+    }
+  }
+
+  /**
+   * Every route the host llm registry advertises, flattened. Advisory by that
+   * service's own contract, and absent services or throwing adapters degrade
+   * to an empty catalog rather than a failed command.
+   */
+  const modelCatalog = async (): Promise<readonly CatalogEntry[]> => {
+    const llm = ctx.get('llm') as HostLlm | undefined
+    if (llm === undefined) return []
+    try {
+      const lists = await Promise.all(llm.listProviders().map(async (provider) => {
+        try {
+          return await llm.listModels(provider.id)
+        } catch {
+          return []
+        }
+      }))
+      return lists.flat().map(model => ({ provider: model.provider, id: model.id, name: model.name }))
+    } catch {
+      return []
+    }
+  }
+
+  /** Whether each live session is inside a turn right now, for `/status`. */
+  const runningBySession = new Map<string, boolean>()
+
+  /** Resolved once; a display nicety must not be able to break activation. */
+  let pluginVersion = ''
+  try {
+    pluginVersion = ownVersion()
+  } catch {
+    // The row is simply omitted.
   }
 
   /**
@@ -508,7 +606,7 @@ export function installBridge(
       const composition = await compositionFor(sessionId)
       return agents.resume({
         resumeSessionId: sessionId,
-        agentOptions: modelSelection(),
+        agentOptions: routeBySession.get(sessionId) ?? modelSelection(),
         setup: composition.setup,
       })
     },
@@ -516,14 +614,15 @@ export function installBridge(
       const composition = await compositionFor(sessionId)
       // The workspace's own canonical path, so `attachSession` finds the header
       // cwd it validates against rather than an uncanonicalized variant of it.
-      const workspace = await chatWorkspace()
+      const directory = pathBySession.get(sessionId) ?? defaultCwd
+      const workspace = await workspaceRecordFor(directory)
       const handle = await agents.create({
         sessionId,
         meta: {
-          cwd: workspace?.path ?? cwd,
+          cwd: workspace?.path ?? directory,
           ...composition.presetId === undefined ? {} : { agentPreset: composition.presetId },
         },
-        agentOptions: modelSelection(),
+        agentOptions: routeBySession.get(sessionId) ?? modelSelection(),
         setup: composition.setup,
       })
       if (workspace !== undefined) {
@@ -542,7 +641,7 @@ export function installBridge(
     report: (line) => { ctx.logger.info(line) },
   }
 
-  const sessions = new ConversationSessions(config.sessionScope, ladder)
+  const sessions = new ConversationSessions(config.sessionScope, ladder, sessionIdForKey)
 
   /**
    * The renderer for one session, opened on first use and kept until the fiber
@@ -612,6 +711,10 @@ export function installBridge(
     const desired = [
       ...hosted.map(descriptor => ({ name: descriptor.name, description: descriptor.description })),
       { name: STOP_COMMAND, description: '停止当前任务' },
+      { name: CD_COMMAND, description: '切换本会话的工作区目录' },
+      { name: WS_COMMAND, description: '查看可用工作区' },
+      { name: MODEL_COMMAND, description: '查看或切换本会话模型' },
+      { name: STATUS_COMMAND, description: '查看本会话状态' },
       { name: HELP_COMMAND, description: '显示可用命令' },
     ]
     void syncSlashPanel(port, desired, notify).then(({ added, removed }) => {
@@ -645,6 +748,65 @@ export function installBridge(
     // a turn for nothing. Skipped before the acknowledgement, which would
     // otherwise promise work no turn is doing.
     if (msg.content.trim() === '') return
+    // Channel-owned commands need no agent, so they run BEFORE acquisition: a
+    // `/cd` in a fresh chat must not first create the session in the directory
+    // it is switching away from, and `/status` must answer before a first
+    // message exists.
+    const channelCommand = commandName(msg.content)
+    if (
+      channelCommand === CD_COMMAND || channelCommand === WS_COMMAND
+      || channelCommand === MODEL_COMMAND || channelCommand === STATUS_COMMAND
+    ) {
+      try {
+        const key = conversationKey(config.sessionScope, msg)
+        // Dispose the conversation's current agent so the next message walks
+        // the ladder again — under a new id after `/cd`, or resuming the same
+        // session under the new route after `/model use`. The id is captured
+        // BEFORE the command mutates the mapping: `/cd` re-derives to the new
+        // id by release time, and the activity mark to clear belongs to the
+        // OLD one. Clearing here rather than waiting for a `turn/end` is
+        // deliberate — this side disposed the agent, so "nothing is running"
+        // is a synchronous fact, and the closing event of an aborted turn is
+        // not guaranteed to arrive.
+        const releasedId = chatWorkspaces.sessionIdFor(key)
+        const release = async (): Promise<void> => {
+          await sessions.release(key)
+          runningBySession.delete(releasedId)
+        }
+        let reply: string
+        if (channelCommand === CD_COMMAND || channelCommand === WS_COMMAND) {
+          reply = await runWorkspaceCommand(channelCommand, msg.content, key, chatWorkspaces, release)
+        } else if (channelCommand === MODEL_COMMAND) {
+          reply = await runModelCommand(msg.content, key, chatModels, {
+            catalog: modelCatalog,
+            deploymentRoute,
+            release,
+          })
+        } else {
+          const sessionId = chatWorkspaces.sessionIdFor(key)
+          const override = chatModels.routeFor(key)
+          reply = renderStatus({
+            workspace: chatWorkspaces.pathFor(key),
+            workspaceIsDefault: chatWorkspaces.isDefault(key),
+            route: override === undefined ? deploymentRoute() : formatRoute(override),
+            routeIsDefault: override === undefined,
+            sessionId,
+            bound: sessions.keyOf(sessionId) !== undefined,
+            running: runningBySession.get(sessionId) === true,
+            pendingApprovals: [...pendingApprovals.values()]
+              .filter(pending => pending.chatId === msg.chatId).length,
+            version: pluginVersion,
+          })
+        }
+        await port.send(msg.chatId, { markdown: reply }).catch(reportSendFailure)
+      } catch (error) {
+        notify(`lark-channel: ${channelCommand} command failed in ${msg.chatId}: ${String(error)}`)
+        await port
+          .send(msg.chatId, { text: `⚠️ 命令执行失败：${error instanceof Error ? error.message : String(error)}` })
+          .catch(reportSendFailure)
+      }
+      return
+    }
     try {
       const opened = await sessions.acquire(msg)
       const binding = await bindingFor(opened.handle.agent.session.id, msg)
@@ -814,6 +976,9 @@ export function installBridge(
       pendingCallArguments.set(event.data.callId, event.data.arguments)
     } else if (isTurnEndEvent(event)) {
       pendingCallArguments.clear()
+      runningBySession.set(session.id, false)
+    } else if (isStepStartEvent(event)) {
+      runningBySession.set(session.id, true)
     }
     binding.renderer.handle(event)
   })
@@ -847,6 +1012,7 @@ export function installBridge(
     bySession.clear()
     compositions.clear()
     pendingCallArguments.clear()
+    runningBySession.clear()
     return Promise.allSettled([
       sessions.close(),
       ...bindings.map((binding) => binding.renderer.close()),

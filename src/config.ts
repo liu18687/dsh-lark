@@ -23,6 +23,27 @@ export interface Config {
   domain?: string
   /** Absolute workspace directory for chat-driven agents; defaults to the host process cwd. */
   cwd?: string
+  /**
+   * Directory prefixes `/cd` may point a conversation at; empty allows any
+   * existing directory. The platform already decides who can reach the bot at
+   * all, so this only narrows where those people may aim it — set it when the
+   * bot serves a room whose members should not roam the filesystem.
+   */
+  workspaceRoots?: string[]
+  /**
+   * Managed state, not configuration: the workspace each conversation was
+   * `/cd`-ed to, keyed by conversation key, written back through the settings
+   * service. An empty-string value marks "explicitly the default" — the
+   * persistence layer deep-merges patches, so entries are overwritten rather
+   * than deleted.
+   */
+  chatWorkspaces?: Record<string, string>
+  /**
+   * Managed state, not configuration: the `provider/model` route each
+   * conversation asked for via `/model use`, keyed by conversation key, with
+   * the same empty-string default marker as {@link chatWorkspaces}.
+   */
+  chatModels?: Record<string, string>
   /** Provider route override for chat agents; defaults to the host `agentDefaultModel` selection. */
   provider?: string
   /** Model id override for chat agents; defaults to the host `agentDefaultModel` selection. */
@@ -126,6 +147,9 @@ export interface ResolvedConfig {
   appSecret?: string | undefined
   domain?: string | undefined
   cwd?: string | undefined
+  workspaceRoots: string[]
+  chatWorkspaces: Record<string, string>
+  chatModels: Record<string, string>
   provider?: string | undefined
   model?: string | undefined
   preset?: string | undefined
@@ -148,6 +172,9 @@ export const Config: z<Config> = z.object({
   appSecret: z.string().role('secret'),
   domain: z.string(),
   cwd: z.string(),
+  workspaceRoots: z.array(String),
+  chatWorkspaces: z.dict(String).default({}),
+  chatModels: z.dict(String).default({}),
   provider: z.string(),
   model: z.string(),
   preset: z.string(),
@@ -172,6 +199,9 @@ export const Config: z<Config> = z.object({
 export function resolveConfig(config: Config): ResolvedConfig {
   return {
     ...config,
+    workspaceRoots: config.workspaceRoots ?? [],
+    chatWorkspaces: config.chatWorkspaces ?? {},
+    chatModels: config.chatModels ?? {},
     sessionScope: config.sessionScope ?? 'chat',
     output: config.output ?? 'cot',
     showProcess: config.showProcess ?? true,

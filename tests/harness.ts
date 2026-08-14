@@ -447,6 +447,8 @@ export async function mountChannel(
     commands?: object
     /** The `attachments` store chat images are committed to. */
     attachments?: object
+    /** The `llm` registry `/model` lists routes from. */
+    llm?: object
   } = {},
 ) {
   const ctx = new Context()
@@ -475,6 +477,7 @@ export async function mountChannel(
   if (services.presets !== undefined) ctx.provide('agentPresets', services.presets)
   if (services.tools !== undefined) ctx.provide('tools', services.tools)
   if (services.workspaces !== undefined) ctx.provide('workspaceRegistry', services.workspaces)
+  if (services.llm !== undefined) ctx.provide('llm', services.llm)
   if (services.commands !== undefined) ctx.provide('commands', services.commands)
   if (services.attachments !== undefined) ctx.provide('attachments', services.attachments)
   const fake = createFakePort()
@@ -584,6 +587,10 @@ export function createFakeWorkspaces(registered: Record<string, string> = {}) {
       const id = `ws_created_${created.length}`
       registered[path] = id
       return entity(path, id)
+    },
+    /** Every registered workspace, as the real registry's listing reports them. */
+    list() {
+      return Object.entries(registered).map(([path, id]) => entity(path, id))
     },
   }
   return { service, created, attached, state }

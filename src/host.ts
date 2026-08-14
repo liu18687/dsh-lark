@@ -242,6 +242,35 @@ export interface HostWorkspaceRegistry {
   resolveByPath(path: string): Promise<HostWorkspace | undefined>
   /** Register a workspace for a directory; at most one record exists per canonical path. */
   create(path: string, title?: string): Promise<HostWorkspace>
+  /**
+   * Every registered workspace. Optional in this narrow contract so a
+   * deployment composing an older registry still boots; `/ws` then lists only
+   * what this channel itself has seen.
+   */
+  list?(): readonly HostWorkspace[]
+}
+
+/** One provider route, as the `llm` registry advertises it. */
+export interface HostLlmProvider {
+  readonly id: string
+  readonly name: string
+}
+
+/** One advertised model on a provider route. */
+export interface HostLlmModel {
+  readonly provider: string
+  readonly id: string
+  readonly name: string
+}
+
+/**
+ * The `llm` adapter registry (subset of the host `LlmRuntime`). Listing is
+ * advisory by the host's own contract — adapters may accept model ids they do
+ * not advertise — so a consumer must never turn absence into rejection.
+ */
+export interface HostLlm {
+  listProviders(): HostLlmProvider[]
+  listModels(provider: string): Promise<readonly HostLlmModel[]>
 }
 
 /** The `agentDefaultModel` service (subset of `AgentDefaultModelConfig`). */

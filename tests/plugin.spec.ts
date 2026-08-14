@@ -1,4 +1,6 @@
-import { isAbsolute } from 'node:path'
+import { mkdtempSync, realpathSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { isAbsolute, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import { Context } from '@deepseek-ai/cordis'
@@ -8,6 +10,7 @@ import * as invariant from '../src/invariant.ts'
 import type { HostApprovalOutcome, HostApprovalRequest } from '../src/host.ts'
 import type { RegisterAppPort, RegisterAppRequest } from '../src/onboarding.ts'
 import { stripToolCallMarkup } from '../src/outbound.ts'
+import { workspaceSessionId } from '../src/workspace.ts'
 import {
   approvalValueFromCard,
   createFakeAttachments,
@@ -1450,6 +1453,223 @@ describe('dsh-lark-channel', () => {
       expect(seenSignal!.aborted).toBe(true)
       expect(harness.portConfigs).toHaveLength(0)
       expect(harness.fake.state.subscriptions).toBe(0)
+    })
+  })
+
+  describe('workspace switching', () => {
+    /** Everything a reply sent to the chat said, joined for containment checks. */
+    const sentText = (harness: { fake: { sent: { input: unknown }[] } }): string =>
+      harness.fake.sent.map(m => JSON.stringify(m.input)).join('\n')
+
+    it('runs /cd end to end: dispose, re-derive, account, persist, and switch back', async () => {
+      const target = realpathSync(mkdtempSync(join(tmpdir(), 'ws-target-')))
+      const workspaces = createFakeWorkspaces()
+      const stored: Record<string, unknown> = {}
+      const settings = createFakeSettings(stored)
+      const harness = await mountChannel({}, { workspaces: workspaces.service, settings: settings.settings })
+      await vi.waitFor(() => { expect(harness.fake.state.subscriptions).toBe(INBOUND_SUBSCRIPTIONS) })
+
+      // A first message binds the conversation to the default workspace.
+      await harness.fake.emitMessage(fakeMessage({ content: 'hi' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const original = harness.agents.created[0]!
+      expect(original.sessionId).toBe('lark-oc_chat_1')
+
+      // /cd releases the bound agent and persists the mapping before replying.
+      await harness.fake.emitMessage(fakeMessage({ content: `/cd ${target}` }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已切换到') })
+      expect(original.dispose).toHaveBeenCalledTimes(1)
+      expect(settings.updates).toContainEqual({ chatWorkspaces: { oc_chat_1: target } })
+
+      // The next message reaches a DIFFERENT durable session, in the new directory.
+      await harness.fake.emitMessage(fakeMessage({ content: 'in the new place' }))
+      const switchedId = workspaceSessionId('oc_chat_1', target)
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(2) })
+      const switched = harness.agents.created[1]!
+      expect(switched.sessionId).toBe(switchedId)
+      expect(switched.meta?.cwd).toBe(target)
+      // The resume rung probed the switched id, so a stored one would have carried on.
+      expect(harness.agents.resumed).toContain(switchedId)
+      // The directory is registered and the session accounted under it.
+      expect(workspaces.created).toContain(target)
+      expect(workspaces.attached).toContainEqual(
+        expect.objectContaining({ sessionId: switchedId }),
+      )
+
+      // /ws lists both directories and marks the current one.
+      await harness.fake.emitMessage(fakeMessage({ content: '/ws' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('工作区') })
+      expect(sentText(harness)).toContain(target)
+
+      // /cd back to the default records the explicit marker and re-derives the plain id.
+      const defaultPath = realpathSync(process.cwd())
+      await harness.fake.emitMessage(fakeMessage({ content: `/cd ${defaultPath}` }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已切回默认工作区') })
+      expect(settings.updates).toContainEqual({ chatWorkspaces: { oc_chat_1: '' } })
+      expect(switched.dispose).toHaveBeenCalledTimes(1)
+      await harness.fake.emitMessage(fakeMessage({ content: 'back home' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(3) })
+      expect(harness.agents.created[2]!.sessionId).toBe('lark-oc_chat_1')
+
+      await harness.dispose()
+    })
+
+    it('routes a conversation by its persisted mapping from the first message', async () => {
+      const target = realpathSync(mkdtempSync(join(tmpdir(), 'ws-persist-')))
+      const workspaces = createFakeWorkspaces()
+      // The mapping arrives through configuration, as a restart reads it back.
+      const harness = await mountChannel(
+        { chatWorkspaces: { oc_chat_1: target } },
+        { workspaces: workspaces.service },
+      )
+      await harness.fake.emitMessage(fakeMessage({ content: 'still here?' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      expect(harness.agents.created[0]!.sessionId).toBe(workspaceSessionId('oc_chat_1', target))
+      expect(harness.agents.created[0]!.meta?.cwd).toBe(target)
+      await harness.dispose()
+    })
+
+    it('refuses directories outside workspaceRoots and keeps the session running', async () => {
+      const outside = realpathSync(mkdtempSync(join(tmpdir(), 'ws-outside-')))
+      const inside = realpathSync(mkdtempSync(join(tmpdir(), 'ws-roots-')))
+      const harness = await mountChannel({ workspaceRoots: [inside] })
+      await harness.fake.emitMessage(fakeMessage({ content: 'hi' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+
+      await harness.fake.emitMessage(fakeMessage({ content: `/cd ${outside}` }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('不在允许的 workspaceRoots') })
+      expect(harness.agents.created[0]!.dispose).not.toHaveBeenCalled()
+
+      await harness.fake.emitMessage(fakeMessage({ content: `/cd ${inside}` }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已切换到') })
+      await harness.dispose()
+    })
+
+    it('lists host-registry workspaces in /ws, so directories are discoverable', async () => {
+      const workspaces = createFakeWorkspaces({ '/srv/known-project': 'ws_known' })
+      const harness = await mountChannel({}, { workspaces: workspaces.service })
+      await harness.fake.emitMessage(fakeMessage({ content: '/ws' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('/srv/known-project') })
+      await harness.dispose()
+    })
+
+    it('shows the current directory for a bare /cd without creating a session', async () => {
+      const harness = await mountChannel()
+      await harness.fake.emitMessage(fakeMessage({ content: '/cd' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('当前工作区') })
+      // A workspace command needs no agent, so no session was spent on it.
+      expect(harness.agents.created).toHaveLength(0)
+      await harness.dispose()
+    })
+
+    it('switches the model on the SAME session: dispose, resume with new options', async () => {
+      const stored: Record<string, unknown> = {}
+      const settings = createFakeSettings(stored)
+      const harness = await mountChannel({}, { settings: settings.settings })
+      await vi.waitFor(() => { expect(harness.fake.state.subscriptions).toBe(INBOUND_SUBSCRIPTIONS) })
+
+      await harness.fake.emitMessage(fakeMessage({ content: 'hi' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const original = harness.agents.created[0]!
+      expect(original.agentOptions).toEqual({ provider: 'test-provider', model: 'test-model' })
+      // The session is stored by now, so the post-switch walk can RESUME it.
+      harness.agents.resumable.add(original.sessionId)
+
+      await harness.fake.emitMessage(fakeMessage({ content: '/model use next-provider/next-model' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已切换到 `next-provider/next-model`') })
+      expect(original.dispose).toHaveBeenCalledTimes(1)
+      expect(settings.updates).toContainEqual({ chatModels: { oc_chat_1: 'next-provider/next-model' } })
+
+      await harness.fake.emitMessage(fakeMessage({ content: 'still me?' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(2) })
+      const resumed = harness.agents.created[1]!
+      // Same durable session — context intact — under the new route.
+      expect(resumed.sessionId).toBe(original.sessionId)
+      expect(resumed.meta).toBeUndefined()
+      expect(resumed.agentOptions).toEqual({ provider: 'next-provider', model: 'next-model' })
+      await harness.dispose()
+    })
+
+    it('routes a conversation by its persisted model mapping from the first message', async () => {
+      const harness = await mountChannel({ chatModels: { oc_chat_1: 'stored-provider/stored-model' } })
+      await harness.fake.emitMessage(fakeMessage({ content: 'hello again' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      expect(harness.agents.created[0]!.agentOptions)
+        .toEqual({ provider: 'stored-provider', model: 'stored-model' })
+      await harness.dispose()
+    })
+
+    it('lists the llm registry catalog in /model', async () => {
+      const harness = await mountChannel({}, {
+        llm: {
+          listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
+          listModels: async () => [
+            { provider: 'deepseek', id: 'deepseek-chat', name: 'DeepSeek Chat' },
+            { provider: 'deepseek', id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
+          ],
+        },
+      })
+      await harness.fake.emitMessage(fakeMessage({ content: '/model' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('deepseek/deepseek-reasoner') })
+      expect(harness.agents.created).toHaveLength(0)
+      await harness.dispose()
+    })
+
+    it('reports status without creating a session, and tracks turn activity', async () => {
+      const harness = await mountChannel()
+      await harness.fake.emitMessage(fakeMessage({ content: '/status' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('尚未创建') })
+      expect(sentText(harness)).toContain('lark-oc_chat_1')
+      // The running plugin names its own version, read from this package's manifest.
+      expect(sentText(harness)).toMatch(/版本：`\d+\.\d+\.\d+/)
+      expect(harness.agents.created).toHaveLength(0)
+
+      await harness.fake.emitMessage(fakeMessage({ content: 'work on something' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const session = harness.agents.created[0]!.agent.session
+      harness.ctx.emit('session/event', session, { type: 'step/start', data: { turn: 1, step: 1 } })
+      await harness.fake.emitMessage(fakeMessage({ content: '/status' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('运行中') })
+
+      harness.ctx.emit('session/event', session, {
+        type: 'turn/end',
+        data: { turn: 1, reason: { kind: 'completed' } },
+      })
+      await harness.fake.emitMessage(fakeMessage({ content: '/status' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('空闲') })
+      await harness.dispose()
+    })
+
+    it('clears the running mark when a switch disposes a mid-turn agent', async () => {
+      const harness = await mountChannel()
+      await harness.fake.emitMessage(fakeMessage({ content: 'long task' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const session = harness.agents.created[0]!.agent.session
+      harness.ctx.emit('session/event', session, { type: 'step/start', data: { turn: 1, step: 1 } })
+
+      // The switch tears the agent down itself; the aborted turn's `turn/end`
+      // may never arrive, so the mark must not wait for one.
+      await harness.fake.emitMessage(fakeMessage({ content: '/model use other/model' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已切换到') })
+      await harness.fake.emitMessage(fakeMessage({ content: '/status' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('尚未创建') })
+      expect(sentText(harness)).not.toContain('运行中')
+      await harness.dispose()
+    })
+
+    it('lists the channel commands in help and on the slash panel', async () => {
+      const commands = createFakeCommands()
+      const harness = await mountChannel({}, { commands: commands.service })
+      await harness.fake.emitMessage(fakeMessage({ content: '/help' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('/cd') })
+      expect(sentText(harness)).toContain('/ws')
+      expect(sentText(harness)).toContain('/model')
+      expect(sentText(harness)).toContain('/status')
+      await vi.waitFor(() => { expect(harness.fake.panelCreated).toContain('cd') })
+      expect(harness.fake.panelCreated).toContain('ws')
+      expect(harness.fake.panelCreated).toContain('model')
+      expect(harness.fake.panelCreated).toContain('status')
+      await harness.dispose()
     })
   })
 

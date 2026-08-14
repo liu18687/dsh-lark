@@ -31,6 +31,7 @@ import { open } from 'node:fs/promises'
 import { homedir, userInfo } from 'node:os'
 import { delimiter, dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
+import { ownVersion } from './version.ts'
 
 /** Profile created when the operator names none. */
 export const DEFAULT_PROFILE = 'lark'
@@ -95,17 +96,9 @@ Options
 Where neither launchd nor systemd exists, start runs in the foreground instead.
 `
 
-/**
- * This package's version, so a profile receives the plugin build that matches
- * the CLI the operator just ran. Read through `import.meta.url` rather than a
- * bare specifier: the bundler leaves a runtime URL alone, and both `src/` and
- * the published `lib/` sit one directory below the manifest.
- * @returns the version string from this package's manifest.
- */
-export function ownVersion(): string {
-  const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }
-  return manifest.version
-}
+// Provisioning pins the plugin to the CLI's own version, so the profile gets
+// the build that matches the command the operator just ran.
+export { ownVersion }
 
 /**
  * Parse argv into one command, defaulting a bare invocation to `start` so
