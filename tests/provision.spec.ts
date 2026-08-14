@@ -66,6 +66,13 @@ describe('parseArguments', () => {
     expect(() => parseArguments(['stop', '--profile', 'bot'])).toThrow(/takes no options/)
   })
 
+  it('reads logs with and without follow, and rejects anything else', () => {
+    expect(parseArguments(['logs'])).toEqual({ kind: 'logs', follow: false })
+    expect(parseArguments(['logs', '-f'])).toEqual({ kind: 'logs', follow: true })
+    expect(parseArguments(['logs', '--follow'])).toEqual({ kind: 'logs', follow: true })
+    expect(() => parseArguments(['logs', '-n', '50'])).toThrow(/logs takes only -f/)
+  })
+
   it.each([['help'], ['--help'], ['-h']])('answers %s with the help command', (flag) => {
     expect(parseArguments([flag])).toEqual({ kind: 'help' })
   })
@@ -193,6 +200,13 @@ describe('unit files', () => {
     expect(launchdPlist(spec)).toContain('<key>RunAtLoad</key><true/>')
     expect(systemdUnit(spec)).toContain('Restart=always')
     expect(systemdUnit(spec)).toContain('WantedBy=default.target')
+  })
+
+  it('points both supervisors\' console at the same log file the CLI relays', () => {
+    const unit = systemdUnit(spec)
+    expect(unit).toContain('StandardOutput=append:')
+    expect(unit).toContain('StandardError=append:')
+    expect(launchdPlist(spec)).toContain('<key>StandardOutPath</key>')
   })
 
   it('always carries a PATH, since a supervisor supplies almost none', () => {

@@ -1,5 +1,7 @@
 # dsh-lark-channel
 
+[![npm](https://img.shields.io/npm/v/dsh-lark-channel)](https://www.npmjs.com/package/dsh-lark-channel) [![CI](https://github.com/omdsh-dev/dsh-lark/actions/workflows/ci.yml/badge.svg)](https://github.com/omdsh-dev/dsh-lark/actions/workflows/ci.yml) [![license](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
+
 English | [中文](README.zh.md)
 
 A Lark/Feishu IM bot channel plugin for DeepSeek Harness. Each chat (direct message or group) drives its own DSH agent; the assistant's reasoning and tool calls show as the platform's native thinking process, the answer is sent separately, and host approval questions become interactive cards decided by button clicks.
@@ -47,7 +49,7 @@ npx dsh-lark-channel start
 
 A QR code appears; scan it in Feishu and the bot is live. It runs in the background from the first moment — under launchd on macOS, `systemd --user` on Linux — so it survives the terminal closing and comes back after a reboot. Then DM it or @-mention it in a group.
 
-`stop`, `restart`, and `status` manage it afterwards; re-running `start` applies updates. `dsh` has to be installed (`npm i -g @deepseek-ai/dsh`), since a supervised process cannot depend on npx. Where neither launchd nor systemd exists — Windows, a Linux without systemd — `start` runs in the foreground instead.
+`stop`, `restart`, `status`, and `logs` manage it afterwards; re-running `start` applies updates. `dsh` has to be installed (`npm i -g @deepseek-ai/dsh`), since a supervised process cannot depend on npx. Where neither launchd nor systemd exists — Windows, a Linux without systemd — `start` runs in the foreground instead.
 
 Already running `dsh web` and want the channel in that profile instead:
 

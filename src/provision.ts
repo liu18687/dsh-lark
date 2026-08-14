@@ -28,7 +28,7 @@
 import { spawnSync } from 'node:child_process'
 import { accessSync, chmodSync, constants, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { open } from 'node:fs/promises'
-import { homedir } from 'node:os'
+import { homedir, userInfo } from 'node:os'
 import { delimiter, dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 
@@ -51,6 +51,7 @@ export const LOG_TRUNCATE_BYTES = 10 * 1024 * 1024
 export type Command =
   | { readonly kind: 'start'; readonly profile: string; readonly workspace: string }
   | { readonly kind: 'stop' | 'restart' | 'status' }
+  | { readonly kind: 'logs'; readonly follow: boolean }
   | { readonly kind: 'help' }
 
 /** App credentials the operator supplied through the environment. */
@@ -85,6 +86,7 @@ export const USAGE = `dsh-lark-channel — Lark/Feishu IM bot channel for DeepSe
                                the profile and its credentials stay.
   dsh-lark-channel restart     Restart the running bot.
   dsh-lark-channel status      Report what the supervisor is running.
+  dsh-lark-channel logs [-f]   Print the bot's recent console output; -f follows.
 
 Options
   --profile <name>    Profile to create and boot. Default: ${DEFAULT_PROFILE}
@@ -118,6 +120,11 @@ export function parseArguments(argv: readonly string[]): Command {
   if (verb === 'stop' || verb === 'restart' || verb === 'status') {
     if (argv.length > 1) throw new Error(`${verb} takes no options`)
     return { kind: verb }
+  }
+  if (verb === 'logs') {
+    const follow = argv[1] === '-f' || argv[1] === '--follow'
+    if (argv.length > (follow ? 2 : 1)) throw new Error('logs takes only -f')
+    return { kind: 'logs', follow }
   }
   if (verb !== undefined && verb !== 'start' && !verb.startsWith('-')) {
     throw new Error(`unknown command ${verb}`)
@@ -314,7 +321,10 @@ ${pairs}
 }
 
 /**
- * systemd user unit for one profile.
+ * systemd user unit for one profile. Output goes to the same file launchd
+ * uses, not the journal: `start` relays that file to the terminal for the
+ * first-run QR code, and `logs` reads it, so the journal swallowing stdout
+ * would break both.
  * @param spec - the resolved service description.
  * @returns unit file contents.
  */
@@ -329,7 +339,9 @@ After=network-online.target
 [Service]
 ExecStart=${systemdQuote(spec.dsh)} --profile ${systemdQuote(spec.profile)}
 WorkingDirectory=${spec.workspace}
-${environment}Restart=always
+${environment}StandardOutput=append:${logPath()}
+StandardError=append:${logPath()}
+Restart=always
 RestartSec=5
 
 [Install]
@@ -437,6 +449,21 @@ async function superviseService(kind: 'launchd' | 'systemd', spec: ServiceSpec):
   }
 }
 
+/**
+ * A systemd user service stops at logout unless the user lingers, and the whole
+ * point of supervising a bot is surviving exactly that. Enabling lingering for
+ * oneself usually needs no privilege; when it stays off, say so rather than
+ * letting the promise break silently at the next logout.
+ */
+function ensureLinger(): void {
+  quiet(['loginctl', 'enable-linger'])
+  const user = userInfo().username
+  const check = spawnSync('loginctl', ['show-user', user, '--property=Linger', '--value'], { encoding: 'utf8' })
+  if (check.status === 0 && check.stdout.trim() === 'no') {
+    process.stderr.write(`dsh-lark-channel: lingering is off, so the bot stops when you log out — enable it with \`sudo loginctl enable-linger ${user}\`\n`)
+  }
+}
+
 /** Byte length of the log, or zero when the supervisor has not written one yet. */
 function logSize(): number {
   try {
@@ -506,6 +533,7 @@ async function start(profile: string, workspace: string): Promise<void> {
   if (logSize() > LOG_TRUNCATE_BYTES) writeFileSync(logPath(), '')
   const from = logSize()
   await superviseService(kind, { dsh, profile, workspace, dshHome: process.env.DSH_HOME, credentials: envCredentials() })
+  if (kind === 'systemd') ensureLinger()
   process.stderr.write(`dsh-lark-channel: running in the background, logs at ${logPath()}\n`)
 
   if (onboarded) {
@@ -559,6 +587,27 @@ async function restart(): Promise<void> {
 }
 
 /**
+ * Print the tail of the supervised log — the file both unit writers point the
+ * bot's console at — optionally following new output until interrupted.
+ * @param follow - keep relaying as the file grows.
+ */
+async function logs(follow: boolean): Promise<void> {
+  if (!existsSync(logPath())) {
+    process.stderr.write(`dsh-lark-channel: no log yet at ${logPath()} — has \`dsh-lark-channel start\` run?\n`)
+    process.exitCode = 1
+    return
+  }
+  const lines = readFileSync(logPath(), 'utf8').split('\n')
+  process.stdout.write(lines.slice(Math.max(0, lines.length - 201)).join('\n'))
+  if (!follow) return
+  let offset = logSize()
+  for (;;) {
+    offset = await relayNewOutput(offset)
+    await delay(500)
+  }
+}
+
+/**
  * Report what the supervisor is running, passing its exit code through — a
  * stopped service is information, not a CLI failure.
  */
@@ -585,6 +634,7 @@ export async function execute(command: Command): Promise<void> {
   else if (command.kind === 'start') await start(command.profile, command.workspace)
   else if (command.kind === 'stop') stop()
   else if (command.kind === 'restart') await restart()
+  else if (command.kind === 'logs') await logs(command.follow)
   else status()
 }
 

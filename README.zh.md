@@ -1,5 +1,7 @@
 # dsh-lark-channel
 
+[![npm](https://img.shields.io/npm/v/dsh-lark-channel)](https://www.npmjs.com/package/dsh-lark-channel) [![CI](https://github.com/omdsh-dev/dsh-lark/actions/workflows/ci.yml/badge.svg)](https://github.com/omdsh-dev/dsh-lark/actions/workflows/ci.yml) [![license](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
+
 [English](README.md) | 中文
 
 DeepSeek Harness 的飞书/Lark IM 机器人渠道插件。每个会话（单聊或群聊）驱动一个独立的 DSH Agent；助手的推理与工具调用以平台原生的思考过程呈现，最终答案单独发送，宿主的审批问题变成交互卡片，按钮点击即作答。
@@ -47,7 +49,7 @@ npx dsh-lark-channel start
 
 终端会打印一个二维码，用飞书扫掉机器人就活了。它从一开始就在后台运行——macOS 交给 launchd，Linux 交给 `systemd --user`——关掉终端不受影响，重启开机自起。然后私聊它或在群里 @ 它。
 
-之后用 `stop`、`restart`、`status` 管理；重跑 `start` 即应用更新。需要装好 `dsh`（`npm i -g @deepseek-ai/dsh`），后台服务不能依赖 npx 联网解析。没有 launchd / systemd 的环境（Windows、无 systemd 的 Linux）里，`start` 会改为前台运行。
+之后用 `stop`、`restart`、`status`、`logs` 管理；重跑 `start` 即应用更新。需要装好 `dsh`（`npm i -g @deepseek-ai/dsh`），后台服务不能依赖 npx 联网解析。没有 launchd / systemd 的环境（Windows、无 systemd 的 Linux）里，`start` 会改为前台运行。
 
 已经在跑 `dsh web`、想把渠道挂在那个 profile 上：
 
