@@ -1,0 +1,10 @@
+lib/
+node_modules/
+*.tsbuildinfo
+*.tgz
+coverage/
+.pnpm-store/
+
+# Editor and OS metadata
+.idea/
+.DS_Store

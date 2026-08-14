@@ -1,0 +1,10 @@
+packages:
+  - .
+
+autoInstallPeers: false
+
+allowBuilds:
+  esbuild: true
+  # protobufjs's postinstall only prints a version-compatibility notice; the
+  # runtime works without it, so builds stay disabled for reproducibility.
+  protobufjs: false
