@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.5 — 2026-08-15
 
 ### Added
 - Model questions reach the chat as cards. `ask_user_question` is shadowed in each chat agent's own layer — the host's layered tool registry resolves the nearest registration and reserves only `run_code` from shadowing — so the model's options render as buttons and a click answers them; when no option fits, an ordinary reply is the answer and does not start another turn. Cancellation, session release, and a thirty-minute silence all settle the question empty and repaint its card, so a turn is never hung on one. `ask_user_question` accordingly leaves the default `denyTools`.
