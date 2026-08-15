@@ -4,7 +4,7 @@
 
 English | [简体中文](README.md)
 
-**Put the DeepSeek Harness you already run into Feishu/Lark.**
+**Put the DeepSeek Harness (DSH) you already run into Feishu/Lark.**
 
 Hand your agent work from the chat, watch it run, switch workspace and model as you go. Questions, plan reviews, and tool approvals come back to the same conversation, so nothing sends you to a terminal. When it helps, put several agents in one group and let them work together.
 

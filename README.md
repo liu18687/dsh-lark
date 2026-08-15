@@ -4,7 +4,7 @@
 
 简体中文 | [English](README.en.md)
 
-**把你正在使用的 DeepSeek Harness 接进飞书。**
+**把你正在使用的 DeepSeek Harness（DSH）接进飞书。**
 
 直接在聊天里给 Agent 派任务、看执行过程、切换工作区和模型。遇到提问、计划确认或工具审批，也不用回到终端，直接在飞书里处理。需要时，还能把多个 Agent 放进同一个群里协作。
 
