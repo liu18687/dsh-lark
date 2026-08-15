@@ -98,8 +98,8 @@ export function conversationKey(scope: SessionScope, msg: NormalizedMessage): st
  * @param key - a conversation key from {@link conversationKey}.
  * @returns the session id to look up, resume, or create.
  */
-export function sessionIdFor(key: string): string {
-  return `${SESSION_PREFIX}${key}`
+export function sessionIdFor(key: string, prefix: string = SESSION_PREFIX): string {
+  return `${prefix}${key}`
 }
 
 /** One agent this channel drives, and whether disposing it is this channel's job. */

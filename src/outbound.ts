@@ -131,11 +131,20 @@ function failureLine(detail: string): string {
  * @param target - the aimed reply target, or undefined for plain chat sends.
  * @returns the options every outbound call of that reply carries, or undefined to send with none.
  */
-function replyOptions(target: ReplyTarget | undefined): SendOptions | undefined {
-  if (target === undefined) return undefined
+function replyOptions(target: ReplyTarget | undefined): SendOptions {
   return {
-    replyTo: target.messageId,
-    ...target.threadId === undefined ? {} : { replyInThread: true },
+    // An `@name` the model typed becomes a real mention, resolved against the
+    // chat's own roster — the platform leaves an unknown or ambiguous name as
+    // plain text. This is how an agent hands the turn to someone: mentioning a
+    // colleague reaches them, and leaving the mention out ends the exchange,
+    // which is exactly what a person means by either.
+    resolveMentionsInText: true,
+    ...target === undefined
+      ? {}
+      : {
+        replyTo: target.messageId,
+        ...target.threadId === undefined ? {} : { replyInThread: true },
+      },
   }
 }
 
@@ -153,8 +162,8 @@ export function createMessageRenderer(
   chatId: string,
   onFailure: (error: unknown) => void,
 ): OutboundRenderer {
-  /** Options carried by every send while a reply target is aimed. */
-  let aimed: SendOptions | undefined
+  /** Options carried by every send; a reply target adds its aim to them. */
+  let aimed: SendOptions = replyOptions(undefined)
   const send = (input: SendInput): void => {
     void port.send(chatId, input, aimed).catch(onFailure)
   }
@@ -312,7 +321,7 @@ export function createStreamRenderer(
   const { showProcess, presentCall, onFailure } = options
   let live: LiveTurn | undefined
   /** Options carried by every card opened, and every send made, while a reply target is aimed. */
-  let aimed: SendOptions | undefined
+  let aimed: SendOptions = replyOptions(undefined)
   /** Settlements of turns already closed, awaited by {@link OutboundRenderer.close}. */
   const closing = new Set<Promise<void>>()
 

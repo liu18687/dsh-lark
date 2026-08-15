@@ -5,6 +5,7 @@ import {
   questionActionValue,
   questionCard,
   shadowQuestionTool,
+  SUBMIT_OPTION,
 } from '../src/questions.ts'
 import type { AskedQuestion, QuestionAnswer } from '../src/questions.ts'
 import { assertRegistrableTool, assertSupportedSchema, cardControls, cardTexts } from './harness.ts'
@@ -91,6 +92,66 @@ describe('question card', () => {
   it('invites a typed answer, and says so differently when there are no options', () => {
     expect(textOf(questionCard(asked, 'q1'))).toContain('选项都不合适时直接回复消息')
     expect(textOf(questionCard({ id: 'q', question: '叫什么名字？' }, 'q1'))).toContain('直接回复消息作答')
+  })
+})
+
+describe('multiple choice', () => {
+  /** One question the model marked as taking several answers. */
+  const many: AskedQuestion = {
+    id: 'q-scope',
+    header: '选择范围',
+    question: '这次重构覆盖哪些模块？',
+    multiSelect: true,
+    options: [
+      { label: 'bridge', description: '消息与卡片' },
+      { label: 'cards', description: '视觉层' },
+      { label: 'session' },
+    ],
+  }
+
+  it('submits a set instead of settling on the first press', () => {
+    const card = questionCard(many, 'q1')
+    const controls = cardControls(card)
+    // One control, and it is the submit: a per-option press would settle a
+    // question that may take three answers on the first of them.
+    expect(controls).toHaveLength(1)
+    expect(questionActionValue(controls[0]!.value)?.option).toBe(SUBMIT_OPTION)
+    // Every option is offered by position, so what comes back is an index
+    // into the question we asked rather than a string that made a round trip.
+    expect(textOf(card)).toContain('"value":"2"')
+    expect(cardTexts(card).map((text) => text.content)).toContain('bridge')
+  })
+
+  it('answers with every option the submission named', async () => {
+    const { store, sent, updated } = createStore()
+    const answer = store.ask({ sessionId: 's1', chatId: 'oc_1', question: many })
+    await vi.waitFor(() => { expect(sent).toHaveLength(1) })
+    const submit = questionActionValue(cardControls(sent[0]!.card)[0]!.value)!
+
+    const settled = store.answerByClick(submit, ['0', '2'])
+    expect(await answer).toEqual({ id: 'q-scope', selected: ['bridge', 'session'] })
+    expect(settled).toBeDefined()
+    expect(textOf(settled!)).toContain('bridge、session')
+    expect(updated).toHaveLength(0)
+  })
+
+  it('refuses a submission that named nothing, leaving the card live', async () => {
+    const { store, sent } = createStore()
+    const answer = store.ask({ sessionId: 's1', chatId: 'oc_1', question: many })
+    await vi.waitFor(() => { expect(sent).toHaveLength(1) })
+    const submit = questionActionValue(cardControls(sent[0]!.card)[0]!.value)!
+
+    expect(store.answerByClick(submit, [])).toBeUndefined()
+    expect(store.answerByClick(submit, ['9'])).toBeUndefined()
+    expect(store.awaiting('s1')).toBe(true)
+    // Still answerable, by the same means as any other question.
+    store.answerByText('s1', '全都要')
+    expect(await answer).toEqual({ id: 'q-scope', selected: [], custom: '全都要' })
+  })
+
+  it('keeps a single-choice question on buttons', () => {
+    const controls = cardControls(questionCard(asked, 'q1'))
+    expect(controls.map((control) => questionActionValue(control.value)?.option)).toEqual([0, 1])
   })
 })
 

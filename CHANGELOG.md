@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Chat agents are told where they woke up, in one sentence: the bot account they speak as, that their reply IS the message, and that answering is optional. Without it an agent read "say hello to the other bot" as an investigation and shelled out to a CLI to send a message its own reply would have sent. A message from another agent carries one more line — the exact `<at user_id="…"></at>` that hands the turn back to THAT agent, or silence to end it — which rides that message rather than every human one. By id rather than by name: names repeat, and a mention resolving to the wrong colleague or to nobody would end an exchange meant to continue.
+- Two bots can talk to each other, by default. A message from a bot used to be dropped outright; bot traffic is now narrowed rather than gated, like every other reach here — `botPeers` restricts it to named ids when a deployment wants that, and empty narrows nothing. What bounds the exchange instead is `botHops`: a conversation may run six consecutive bot-sourced turns before the channel stops and says so in the chat, and a human message refills the budget. Each bot is named once per chat on the operator console, whether it was answered or narrowed out, and a channel never answers its own voice.
+- A second bot can be composed alongside the first. `instance` names a row, and that name keys the three identifiers two rows would otherwise write over each other with: the settings section holding their workspace and model maps, the credential holding their app secret, and the prefix their session ids carry — without which two bots invited to the SAME group derive one session id and share one agent. A row with no name keeps the original identifiers byte for byte, so nothing an existing deployment has stored moves.
+- `/status` reports what the conversation is spending: how full the model's context is (`32.5k / 128k`, with the share of the window) and the whole-session token totals, read from the host's own token-meter projections. Both rows appear only where a deployment composed that meter and the session has actually made a request — a row claiming zero where nothing is measured is a lie an operator acts on.
+
+### Changed
+- The app secret is stored through the host `credentials` seam instead of the user settings document. Onboarding writes the scanned secret to the credential `LARK_APP_SECRET` and keeps only a reference in settings; a secret already sitting in the settings document moves behind that reference on the next boot, so an existing deployment is repaired by restarting rather than by scanning again. A deployment that injects `appSecret` in its composition still owns it, and one with no credentials provider composed keeps working exactly as before.
+
+### Fixed
+- A question the model marked `multi_select` can now be answered with more than one option. Its card was built from single-choice controls, so the first press settled a question that may take three answers; it now renders a form whose multi-select submits the chosen set in one action, carrying option positions rather than labels. A submission that names nothing leaves the card live, and typing an answer still works as it does for every other question.
+
 ## 0.0.5 — 2026-08-15
 
 ### Added

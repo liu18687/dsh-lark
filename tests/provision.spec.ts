@@ -17,6 +17,10 @@ import {
   supervisorKind,
   systemdUnit,
   whichSync,
+  filterConsole,
+  newConsoleFilter,
+  withInstanceRow,
+  withoutInstanceRow,
 } from '../src/provision.ts'
 import type { ServiceSpec } from '../src/provision.ts'
 
@@ -256,5 +260,103 @@ describe('unit files', () => {
 describe('ownVersion', () => {
   it('reads this package\'s version, so a profile gets the matching build', () => {
     expect(ownVersion()).toMatch(/^\d+\.\d+\.\d+/)
+  })
+})
+
+describe('extra bots', () => {
+  /** The empty patch layer a fresh profile ships with. */
+  const EMPTY = '# Your patch layer for this dsh profile.\n[]\n'
+
+  it('parses one bot name, and refuses anything else', () => {
+    expect(parseArguments(['add', 'support'])).toEqual({ kind: 'add', profile: 'lark', name: 'support' })
+    expect(parseArguments(['remove', 'support', '--profile', 'work']))
+      .toEqual({ kind: 'remove', profile: 'work', name: 'support' })
+    expect(() => parseArguments(['add'])).toThrow('one bot name')
+    expect(() => parseArguments(['add', 'a', 'b'])).toThrow('one bot name')
+    expect(() => parseArguments(['add', 'support', '--nope'])).toThrow('unknown option')
+  })
+
+  it('replaces the empty layer with the first row, then appends', () => {
+    const first = withInstanceRow(EMPTY, 'support')!
+    // `[]` cannot hold a list item, so the first row has to take its place.
+    expect(first).not.toContain('[]')
+    expect(first).toContain('instance: support')
+    expect(first).toContain('id: lark-channel-support')
+    const second = withInstanceRow(first, 'sales')!
+    expect(second).toContain('instance: support')
+    expect(second).toContain('instance: sales')
+    // Idempotent: adding a name already there changes nothing.
+    expect(withInstanceRow(second, 'sales')).toBeUndefined()
+  })
+
+  it('takes back exactly what it added', () => {
+    const both = withInstanceRow(withInstanceRow(EMPTY, 'support')!, 'sales')!
+    const withoutSales = withoutInstanceRow(both, 'sales')!
+    expect(withoutSales).toContain('instance: support')
+    expect(withoutSales).not.toContain('instance: sales')
+    // Emptied again, the layer says so in YAML rather than being blank.
+    const emptied = withoutInstanceRow(withoutSales, 'support')!
+    expect(emptied.trimEnd().endsWith('[]')).toBe(true)
+    expect(withoutInstanceRow(emptied, 'support')).toBeUndefined()
+  })
+
+  it('leaves a hand-written row of the operator own alone', () => {
+    const handWritten = '- insert:\n    - id: something-else\n      name: other-plugin\n'
+    const added = withInstanceRow(handWritten, 'support')!
+    const removed = withoutInstanceRow(added, 'support')!
+    expect(removed).toContain('id: something-else')
+    expect(removed).not.toContain('lark-channel-support')
+  })
+})
+
+describe('scan console', () => {
+  /** The log as it actually looked while a second bot was being added. */
+  const LOG = [
+    "[info]: [ '[ws]', 'ws client closed manually' ]",
+    '[2026-08-15 18:55:55] lark-channel: direct messages: anyone the app is visible to',
+    "[info]: [ 'client ready' ]",
+    "[info]: [ 'event-dispatch is ready' ]",
+    '[2026-08-15 18:55:55] lark-channel: 未配置应用凭证。用飞书扫下面的二维码创建应用，60 分钟内有效：',
+    '[2026-08-15 18:55:55] ',
+    '█ ▄▄▄▄▄ █▄█▀▄██ ▀█▀█▄▀▄▀ ▀██ ▄▀ ▄▀▀██▄ ▀▀ █ ▄▄▄▄▄ █',
+    '█ █   █ █ ▄█  ██ █▀ ██▄▄▄ █▀▀█▄▀ ▄█ ▀  █ ▄█ █   █ █',
+    '[2026-08-15 18:55:55]   https://open.feishu.cn/page/launcher?user_code=A5JD-RFKC',
+    "[info]: [",
+    "  '[ws]',",
+    "  'receive events or callbacks through persistent connection only available in',",
+    ']',
+    "[info]: [ '[ws]', 'ws client ready' ]",
+    '',
+  ].join('\n')
+
+  it('keeps the QR code and drops the library chatter around it', () => {
+    const shown = filterConsole(LOG, newConsoleFilter())
+    // The whole point: the code and the link a person has to act on.
+    expect(shown).toContain('▄▄▄▄▄')
+    expect(shown).toContain('https://open.feishu.cn/page/launcher')
+    expect(shown).toContain('未配置应用凭证')
+    // And none of the transport library's own output, including the block
+    // that spans several lines — suppression runs to the next stamped line.
+    expect(shown).not.toContain('ws client ready')
+    expect(shown).not.toContain('event-dispatch')
+    expect(shown).not.toContain('receive events or callbacks')
+    // Including the line that merely closes the block.
+    expect(shown.split('\n')).not.toContain(']')
+  })
+
+  it('holds a line that a chunk boundary split in half', () => {
+    const state = newConsoleFilter()
+    const first = filterConsole('[2026-08-15 18:55:55] lark-cha', state)
+    expect(first).toBe('')
+    const second = filterConsole('nnel: 已连接\n', state)
+    expect(second).toBe('[2026-08-15 18:55:55] lark-channel: 已连接\n')
+  })
+
+  it('carries suppression across chunks, so half a block is not printed', () => {
+    const state = newConsoleFilter()
+    filterConsole("[info]: [\n  '[ws]',\n", state)
+    expect(filterConsole("  'still inside the block',\n", state)).toBe('')
+    expect(filterConsole('[2026-08-15 18:55:56] lark-channel: back\n', state))
+      .toBe('[2026-08-15 18:55:56] lark-channel: back\n')
   })
 })

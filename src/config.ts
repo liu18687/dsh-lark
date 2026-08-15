@@ -4,6 +4,7 @@
  */
 
 import z from '@deepseek-ai/schemastery'
+import { DEFAULT_BOT_HOPS } from './botchat.ts'
 import type { SessionScope } from './session.ts'
 
 /**
@@ -21,10 +22,31 @@ const DEFAULT_DENY_TOOLS = [] as const
 
 /** Plugin configuration supplied by the profile composition. */
 export interface Config {
+  /**
+   * Names this row when a deployment composes more than one, so two bots keep
+   * separate settings sections, separate app-secret credentials, and separate
+   * session ids — two bots in one group would otherwise share an agent.
+   *
+   * Absent is the original single-row deployment, whose identifiers are
+   * unchanged: name the SECOND row, never the first, and nothing already
+   * stored moves.
+   */
+  instance?: string
   /** Lark/Feishu app id (`cli_…`); absent (with no stored credential) starts first-boot QR registration. */
   appId?: string
-  /** Lark/Feishu app secret paired with {@link appId}. */
+  /**
+   * Lark/Feishu app secret paired with {@link appId}. A deployment that
+   * injects one here keeps owning it; onboarding stores what it scans behind
+   * {@link Config.appSecretRef} instead, so nothing writes a secret into the
+   * user settings document that a credentials provider could hold.
+   */
   appSecret?: string
+  /**
+   * Name of the credential holding the app secret, resolved through
+   * `ctx.credentials` on every boot: an environment variable, a dotenv entry,
+   * or the provider's own store, whichever is configured.
+   */
+  appSecretRef?: string
   /** Open-platform domain: `https://open.feishu.cn` (default) or `https://open.larksuite.com`. */
   domain?: string
   /** Absolute workspace directory for chat-driven agents; defaults to the host process cwd. */
@@ -120,6 +142,19 @@ export interface Config {
    * reply is an ordinary message this bridge already turns into the next turn.
    */
   denyTools?: string[]
+  /**
+   * Bot open ids this channel answers, when a deployment wants only certain
+   * ones. Empty — the default — narrows nothing, exactly like every other list
+   * here: a bot someone added to a room this channel already serves is part of
+   * that room's arrangement. {@link botHops} is what bounds the exchange.
+   */
+  botPeers?: string[]
+  /**
+   * Consecutive bot-sourced turns one conversation may run before this channel
+   * stops answering. A human message refills it. Without a bound, two agents
+   * answer each other until someone notices the bill.
+   */
+  botHops?: number
   /** In group chats, only respond when the bot is @-mentioned. */
   requireMention?: boolean
   /**
@@ -149,8 +184,10 @@ export interface Config {
 
 /** Configuration after defaults have been resolved; credentials may still be pending onboarding. */
 export interface ResolvedConfig {
+  instance?: string | undefined
   appId?: string | undefined
   appSecret?: string | undefined
+  appSecretRef?: string | undefined
   domain?: string | undefined
   cwd?: string | undefined
   workspaceRoots: string[]
@@ -166,6 +203,8 @@ export interface ResolvedConfig {
   hideProcessWhenDone: boolean
   syncSlashCommands: boolean
   denyTools: string[]
+  botPeers: string[]
+  botHops: number
   requireMention: boolean
   senderAllowlist: string[]
   groupAllowlist: string[]
@@ -174,8 +213,10 @@ export interface ResolvedConfig {
 
 /** Loader-visible configuration schema and defaults. */
 export const Config: z<Config> = z.object({
+  instance: z.string(),
   appId: z.string(),
   appSecret: z.string().role('secret'),
+  appSecretRef: z.string(),
   domain: z.string(),
   cwd: z.string(),
   workspaceRoots: z.array(String),
@@ -191,6 +232,8 @@ export const Config: z<Config> = z.object({
   hideProcessWhenDone: z.boolean().default(false),
   syncSlashCommands: z.boolean().default(true),
   denyTools: z.array(String).default([...DEFAULT_DENY_TOOLS]),
+  botPeers: z.array(String).default([]),
+  botHops: z.number().default(DEFAULT_BOT_HOPS),
   requireMention: z.boolean().default(true),
   senderAllowlist: z.array(String),
   groupAllowlist: z.array(String),
@@ -215,6 +258,8 @@ export function resolveConfig(config: Config): ResolvedConfig {
     hideProcessWhenDone: config.hideProcessWhenDone ?? false,
     syncSlashCommands: config.syncSlashCommands ?? true,
     denyTools: config.denyTools ?? [...DEFAULT_DENY_TOOLS],
+    botPeers: config.botPeers ?? [],
+    botHops: config.botHops ?? DEFAULT_BOT_HOPS,
     requireMention: config.requireMention ?? true,
     senderAllowlist: config.senderAllowlist ?? [],
     groupAllowlist: config.groupAllowlist ?? [],

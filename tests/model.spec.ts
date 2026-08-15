@@ -8,7 +8,7 @@ import {
   runModelCommand,
 } from '../src/model.ts'
 import type { CatalogEntry } from '../src/model.ts'
-import { renderStatusCard, STATUS_ACTION } from '../src/status.ts'
+import { readMeters, renderStatusCard, STATUS_ACTION } from '../src/status.ts'
 import { cardControls, cardTexts } from './harness.ts'
 
 const catalog: CatalogEntry[] = [
@@ -197,6 +197,44 @@ describe('runModelCommand', () => {
   })
 })
 
+describe('readMeters', () => {
+  /** A projection registry answering with one fixed cut. */
+  const projections = (values: Record<string, unknown>) => ({
+    snapshot: () => ({ asOfSeq: 1, values }),
+  })
+  const session = { id: 's1' }
+
+  it('reads context occupancy and whole-session tokens', () => {
+    const meters = readMeters(
+      projections({
+        contextPressure: { pressureTokens: 30_000, projectedTokens: 32_500, contextWindow: 128_000 },
+        tokenUsage: { uncachedInputTokens: 41_000, outputTokens: 6_200, cacheReadTokens: 12_000, cacheWriteTokens: 0 },
+      }),
+      session,
+    )
+    // The projected figure wins: a status report answers for the NEXT message.
+    expect(meters.context).toEqual({ used: 32_500, window: 128_000 })
+    expect(meters.usage).toEqual({ input: 41_000, output: 6_200, cacheRead: 12_000, cacheWrite: 0 })
+  })
+
+  it('says nothing where there is nothing to say', () => {
+    // No meter composed, no live session, and a session that has not asked yet.
+    expect(readMeters(undefined, session)).toEqual({})
+    expect(readMeters(projections({}), undefined)).toEqual({})
+    expect(readMeters(projections({}), session)).toEqual({})
+    const fresh = readMeters(
+      projections({ tokenUsage: { uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 } }),
+      session,
+    )
+    expect(fresh.usage).toBeUndefined()
+  })
+
+  it('survives a meter that throws rather than losing the whole report', () => {
+    const broken = { snapshot: () => { throw new Error('projection exploded') } }
+    expect(readMeters(broken, session)).toEqual({})
+  })
+})
+
 describe('renderStatusCard', () => {
   /** Every string one status card renders. */
   const shown = (card: object): string[] => cardTexts(card).map((text) => text.content)
@@ -214,6 +252,8 @@ describe('renderStatusCard', () => {
       version: '0.0.3',
     }, SUBJECT)
     expect(shown(idle)).toContain('/srv/work')
+    // Meters are absent here, so the card claims no numbers at all.
+    expect(shown(idle).some((text) => text.includes('上下文'))).toBe(false)
     expect(shown(idle)).toContain('0.0.3')
     expect(shown(idle)).toContain('空闲')
     expect(shown(idle)).not.toContain('待审批')

@@ -543,6 +543,8 @@ export async function mountChannel(
     planMode?: object
     /** False models a tool registry too old to take per-agent registrations. */
     agentsCanRegisterTools?: boolean
+    /** The `credentials` seam the app secret is stored behind. */
+    credentials?: object
   } = {},
 ) {
   const ctx = new Context()
@@ -573,6 +575,7 @@ export async function mountChannel(
   if (services.workspaces !== undefined) ctx.provide('workspaceRegistry', services.workspaces)
   if (services.llm !== undefined) ctx.provide('llm', services.llm)
   if (services.planMode !== undefined) ctx.provide('planMode', services.planMode)
+  if (services.credentials !== undefined) ctx.provide('credentials', services.credentials)
   if (services.commands !== undefined) ctx.provide('commands', services.commands)
   if (services.attachments !== undefined) ctx.provide('attachments', services.attachments)
   const fake = createFakePort()
@@ -785,6 +788,7 @@ interface CardNode {
   readonly behaviors?: { readonly type?: string; readonly value?: unknown }[]
   readonly elements?: CardNode[]
   readonly columns?: CardNode[]
+  readonly options?: CardNode[]
   readonly body?: CardNode
 }
 
@@ -802,7 +806,7 @@ export function cardNodes(card: object): CardNode[] {
   const walk = (node: CardNode | undefined): void => {
     if (node === undefined || node === null || typeof node !== 'object') return
     found.push(node)
-    for (const child of [...node.elements ?? [], ...node.columns ?? []]) walk(child)
+    for (const child of [...node.elements ?? [], ...node.columns ?? [], ...node.options ?? []]) walk(child)
     walk(node.body)
   }
   walk(card as CardNode)
@@ -849,6 +853,32 @@ export function cardControls(card: object): { label: string; value: unknown }[] 
       ?? ''
     return [{ label, value: callback.value }]
   })
+}
+
+/**
+ * An in-memory credentials provider, as the host seam behaves: `resolve`
+ * answers with a value and its source, `set` stores one.
+ * @param seeded - references already configured before the plugin starts.
+ * @returns the service and the store behind it.
+ */
+export function createFakeCredentials(seeded: Record<string, string> = {}) {
+  const values = new Map(Object.entries(seeded))
+  const stored: { ref: string; value: string }[] = []
+  return {
+    values,
+    stored,
+    credentials: {
+      resolve: async (ref: string) => {
+        const value = values.get(ref)
+        return value === undefined ? undefined : { value, source: 'file' }
+      },
+      set: async (ref: string, value: string) => {
+        if (value === '') throw new Error('an empty value cannot be stored (fake)')
+        values.set(ref, value)
+        stored.push({ ref, value })
+      },
+    },
+  }
 }
 
 /** Extract the approval correlation payload from a sent card's buttons. */

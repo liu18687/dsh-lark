@@ -348,6 +348,100 @@ function panel(elements: readonly object[]): object {
   }
 }
 
+/** Names the form and the select inside it, so a submission can be read back. */
+export const QUESTION_FORM = 'dsh_question_form'
+export const QUESTION_SELECT = 'dsh_question_options'
+
+/**
+ * The options as a multiple choice: a form holding one multi-select and the
+ * button that submits it.
+ *
+ * A form rather than a row of toggles, because a toggle answers on every
+ * press — and a question that may take three answers must not settle on the
+ * first. The platform collects the set and delivers it once, on submit.
+ * Values are indices, not labels: what comes back is then a position in the
+ * question we asked, not a string a card round-trip could have altered.
+ * @param options - the untrusted labels, in the model's own order.
+ * @param submit - the callback payload the submit button carries.
+ * @returns a body element.
+ */
+function multipleChoice(
+  options: readonly { readonly label: string; readonly description?: string | undefined }[],
+  submit: object,
+): object {
+  return {
+    tag: 'form',
+    name: QUESTION_FORM,
+    direction: 'vertical',
+    horizontal_spacing: '8px',
+    vertical_spacing: '8px',
+    horizontal_align: 'left',
+    vertical_align: 'top',
+    padding: '0px 0px 0px 0px',
+    margin: '12px 0px 0px 0px',
+    elements: [
+      {
+        tag: 'multi_select_static',
+        name: QUESTION_SELECT,
+        placeholder: textNode(QUESTION.pick, SIZE.body),
+        // The platform enforces it, so a submission can never be an empty
+        // answer the model would read as "they declined".
+        required: true,
+        width: 'fill',
+        margin: '0px 20px 0px 20px',
+        options: options.map((option, index) => ({
+          value: String(index),
+          text: textNode(option.label, SIZE.body),
+        })),
+      },
+      // A dropdown has nowhere to put an explanation, so the ones the model
+      // wrote sit under it rather than being dropped.
+      ...options.flatMap((option, index) => option.description === undefined || option.description === ''
+        ? []
+        : [line(`${index + 1}. ${option.label} — ${option.description}`, SIZE.label, '6px 20px 0px 20px', 'grey')]),
+      {
+        tag: 'button',
+        text: textNode(QUESTION.submit, SIZE.body, undefined, 'center'),
+        type: 'primary_filled',
+        width: 'default',
+        form_action_type: 'submit',
+        name: 'dsh_question_submit',
+        margin: '14px 20px 0px 20px',
+        behaviors: [{ type: 'callback', value: submit }],
+      },
+    ],
+  }
+}
+
+/**
+ * A token count at a glance: thousands past a thousand, whole below it. An
+ * exact 127,431 is a number to parse; 127.4k is a number to read.
+ * @param tokens - the count.
+ * @returns the short form.
+ */
+function compactCount(tokens: number): string {
+  if (tokens < 1000) return String(tokens)
+  const thousands = tokens / 1000
+  return `${thousands >= 100 ? Math.round(thousands) : thousands.toFixed(1)}k`
+}
+
+/**
+ * How full the context is: what the next request carries, and — when the
+ * provider says how big the window is — the share of it that leaves.
+ * @param context - the used tokens and the window they sit in.
+ * @returns the reading, localized.
+ */
+function contextReading(context: { readonly used: number; readonly window?: number | undefined }): Copy {
+  const used = compactCount(context.used)
+  const window = context.window
+  if (window === undefined || window <= 0) return { zh: used, en: used }
+  const share = Math.round((context.used / window) * 100)
+  return {
+    zh: `${used} / ${compactCount(window)}（${share}%）`,
+    en: `${used} / ${compactCount(window)} (${share}%)`,
+  }
+}
+
 /** Cut a string to a budget, reporting what was left out. */
 function clip(value: string, max: number): { readonly shown: string; readonly hidden: number } {
   return value.length <= max
@@ -393,6 +487,12 @@ const QUESTION = {
     en: 'Just reply — your next message is the answer.',
   },
   received: { zh: '助手已收到，正在继续。', en: 'Received; the assistant is continuing.' },
+  pick: { zh: '可以多选', en: 'Pick any number' },
+  submit: { zh: '提交', en: 'Submit' },
+  replyWithChoices: {
+    zh: '选好后点提交；都不合适时直接回复消息，你的下一条消息就是答案。',
+    en: 'Submit once you have picked; if none fit, just reply — your next message is the answer.',
+  },
   dropped: { zh: '助手已不再等待这个回答。', en: 'The assistant is no longer waiting on this.' },
 }
 
@@ -463,6 +563,10 @@ export function questionCard(input: {
   readonly header?: string | undefined
   readonly options: readonly { readonly label: string; readonly description?: string | undefined }[]
   readonly valueFor: (index: number) => object
+  /** Several answers may be chosen; the card then submits a set, not a press. */
+  readonly multiSelect?: boolean | undefined
+  /** The callback payload the submit button carries, for a multiple choice. */
+  readonly submit?: object | undefined
 }): object {
   // Bare labels fit a button row, which is the most obviously clickable shape
   // available; the moment any option needs a sentence to justify it, the whole
@@ -476,17 +580,25 @@ export function questionCard(input: {
     line(input.question, SIZE.body, '12px 20px 0px 20px'),
     ...input.options.length === 0
       ? []
-      : explained
-        ? input.options.map((option, index) => optionRow(option, input.valueFor(index)))
-        // The first option carries the emphasis: by the tool's own convention
-        // a recommendation is listed first, so a flat row of identical
-        // buttons would throw away a signal the model already gave.
-        : [actions(input.options.map((option, index) => ({
-          label: option.label,
-          value: input.valueFor(index),
-          kind: index === 0 ? 'primary' as const : 'default' as const,
-        })))],
-    ...footer(input.options.length === 0 ? QUESTION.replyOnly : QUESTION.replyWithOptions),
+      : input.multiSelect === true && input.submit !== undefined
+        ? [multipleChoice(input.options, input.submit)]
+        : explained
+          ? input.options.map((option, index) => optionRow(option, input.valueFor(index)))
+          // The first option carries the emphasis: by the tool's own convention
+          // a recommendation is listed first, so a flat row of identical
+          // buttons would throw away a signal the model already gave.
+          : [actions(input.options.map((option, index) => ({
+            label: option.label,
+            value: input.valueFor(index),
+            kind: index === 0 ? 'primary' as const : 'default' as const,
+          })))],
+    ...footer(
+      input.options.length === 0
+        ? QUESTION.replyOnly
+        : input.multiSelect === true && input.submit !== undefined
+          ? QUESTION.replyWithChoices
+          : QUESTION.replyWithOptions,
+    ),
   ])
 }
 
@@ -538,13 +650,20 @@ const MODEL = {
 }
 const STATUS = {
   title: { zh: '本会话状态', en: 'This conversation' },
-  context: { zh: '你的下一条消息会怎么跑', en: 'What your next message will do' },
+  subtitle: { zh: '你的下一条消息会怎么跑', en: 'What your next message will do' },
   workspace: { zh: '工作区', en: 'Workspace' },
   model: { zh: '模型', en: 'Model' },
   session: { zh: '会话', en: 'Session' },
   activity: { zh: '当前', en: 'Activity' },
   version: { zh: '版本', en: 'Version' },
   pending: { zh: '待审批', en: 'Awaiting approval' },
+  context: { zh: '上下文', en: 'Context' },
+  usage: { zh: '本会话用量', en: 'Tokens this session' },
+  usageOf: {
+    zh: '输入 %s · 输出 %s',
+    en: '%s in · %s out',
+  },
+  cached: { zh: '，缓存命中 %s', en: ', %s cached' },
   pendingCount: { zh: '%s 个审批卡片等待处理', en: '%s approval cards waiting' },
   isDefault: { zh: '部署默认', en: 'deployment default' },
   running: { zh: '正在跑一轮任务', en: 'Running a turn' },
@@ -635,6 +754,13 @@ function settledRow(label: string, detail: string | undefined, note: Copy): obje
  * @returns a schema 2.0 card object.
  */
 export function statusCard(input: {
+  readonly context?: { readonly used: number; readonly window?: number | undefined } | undefined
+  readonly usage?: {
+    readonly input: number
+    readonly output: number
+    readonly cacheRead: number
+    readonly cacheWrite: number
+  } | undefined
   readonly workspace: string
   readonly workspaceIsDefault: boolean
   readonly route: string
@@ -646,7 +772,7 @@ export function statusCard(input: {
   readonly refresh: object
 }): object {
   return card('neutral', STATUS.summary, [
-    ...heading('neutral', STATUS.title, STATUS.context),
+    ...heading('neutral', STATUS.title, STATUS.subtitle),
     panel([
       ...field(STATUS.workspace, input.workspace, input.workspaceIsDefault ? STATUS.isDefault : undefined, true),
       ...field(STATUS.model, input.route, input.routeIsDefault ? STATUS.isDefault : undefined),
@@ -654,6 +780,16 @@ export function statusCard(input: {
       ...input.pendingApprovals === 0
         ? []
         : field(STATUS.pending, fill(STATUS.pendingCount, String(input.pendingApprovals))),
+      ...input.context === undefined
+        ? []
+        : field(STATUS.context, contextReading(input.context)),
+      ...input.usage === undefined
+        ? []
+        : field(STATUS.usage, join(
+          fill(fill(STATUS.usageOf, compactCount(input.usage.input)), compactCount(input.usage.output)),
+          input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, compactCount(input.usage.cacheRead)).zh,
+          input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, compactCount(input.usage.cacheRead)).en,
+        )),
       ...field(STATUS.session, input.sessionId),
       ...input.version === '' ? [] : field(STATUS.version, input.version),
     ]),

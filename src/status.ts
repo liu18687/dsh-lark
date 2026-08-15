@@ -7,7 +7,66 @@
  */
 
 import { statusCard } from './cards.ts'
+import type { HostContextPressure, HostSession, HostSessionProjections, HostTokenUsage } from './host.ts'
 import type { ConversationSubject } from './session.ts'
+
+/** What one session's meters report, in the shape the status card takes. */
+export interface SessionMeters {
+  readonly context?: { readonly used: number; readonly window?: number | undefined } | undefined
+  readonly usage?: {
+    readonly input: number
+    readonly output: number
+    readonly cacheRead: number
+    readonly cacheWrite: number
+  } | undefined
+}
+
+/** Read one number out of an untyped projection value. */
+function count(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0
+}
+
+/**
+ * Read one live session's token meters.
+ *
+ * Everything here is optional by the host's own contract: a deployment may
+ * compose no token meter, and a session that has not made a request yet has no
+ * sample. Absent stays absent — a status row claiming zero tokens where the
+ * meter simply is not there would be a lie an operator acts on.
+ * @param projections - the session projection registry, when composed.
+ * @param session - the live session; an unbound conversation has none.
+ * @returns the meters worth showing, each present only when known.
+ */
+export function readMeters(
+  projections: HostSessionProjections | undefined,
+  session: HostSession | undefined,
+): SessionMeters {
+  if (projections === undefined || session === undefined) return {}
+  let values: Record<string, unknown>
+  try {
+    values = projections.snapshot(session).values
+  } catch {
+    // A meter that cannot be read is a meter this report does without.
+    return {}
+  }
+  const pressure = values.contextPressure as HostContextPressure | undefined
+  const totals = values.tokenUsage as HostTokenUsage | undefined
+  const used = pressure?.projectedTokens ?? pressure?.pressureTokens
+  const usage = totals === undefined
+    ? undefined
+    : {
+        input: count(totals.uncachedInputTokens),
+        output: count(totals.outputTokens),
+        cacheRead: count(totals.cacheReadTokens),
+        cacheWrite: count(totals.cacheWriteTokens),
+      }
+  return {
+    ...used === undefined
+      ? {}
+      : { context: { used: count(used), window: pressure?.contextWindow } },
+    ...usage === undefined || (usage.input === 0 && usage.output === 0) ? {} : { usage },
+  }
+}
 
 /** Show this conversation's routing and activity. Channel-owned: needs no agent. */
 export const STATUS_COMMAND = 'status'
@@ -61,6 +120,19 @@ export interface StatusFields {
   readonly pendingApprovals: number
   /** The running plugin's version; empty hides the row rather than lying. */
   readonly version: string
+  /**
+   * What the next request would carry against what the model can hold. Absent
+   * until a session has made one request, and absent entirely where the
+   * deployment composed no token meter.
+   */
+  readonly context?: { readonly used: number; readonly window?: number | undefined } | undefined
+  /** Whole-session token totals, when the meter is composed. */
+  readonly usage?: {
+    readonly input: number
+    readonly output: number
+    readonly cacheRead: number
+    readonly cacheWrite: number
+  } | undefined
 }
 
 /**
@@ -84,6 +156,8 @@ export function renderStatusCard(fields: StatusFields, subject: ConversationSubj
     activity: fields.running ? 'running' : fields.bound ? 'idle' : 'unbound',
     pendingApprovals: fields.pendingApprovals,
     version: fields.version,
+    ...fields.context === undefined ? {} : { context: fields.context },
+    ...fields.usage === undefined ? {} : { usage: fields.usage },
     refresh: {
       kind: STATUS_ACTION,
       key: subject.key,

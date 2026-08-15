@@ -26,17 +26,76 @@ function logged(logs: readonly LoggedLine[], type: LoggedLine['type'], needle: s
 }
 
 describe('inbound admission', () => {
-  it('never answers a message a bot authored', async () => {
+  it('answers a bot by default, naming it once on the console', async () => {
     const harness = await mountChannel()
     try {
-      await harness.fake.emitMessage(fakeMessage({ senderIsBot: true, content: 'from another bot' }))
+      // Empty lists narrow nothing here, as they do everywhere else in this
+      // channel: a bot in a room it serves is part of that room's arrangement.
+      await harness.fake.emitMessage(
+        fakeMessage({ senderIsBot: true, senderId: 'ou_other_bot', content: 'from another bot' }),
+      )
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      expect(harness.notices.join('\n')).toContain('answering bot ou_other_bot')
+
+      // Said once per bot per chat, not once per message.
+      await harness.fake.emitMessage(
+        fakeMessage({ senderIsBot: true, senderId: 'ou_other_bot', content: 'again' }),
+      )
+      await vi.waitFor(() => {
+        expect(harness.agents.created[0]!.agent.followup).toHaveBeenCalledTimes(2)
+      })
+      expect(harness.notices.filter((line) => line.includes('answering bot ou_other_bot'))).toHaveLength(1)
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  it('narrows to the listed bots when a deployment lists any', async () => {
+    const harness = await mountChannel({ botPeers: ['ou_wanted'] })
+    try {
+      await harness.fake.emitMessage(
+        fakeMessage({ senderIsBot: true, senderId: 'ou_other_bot', content: 'from a bot nobody listed' }),
+      )
       await new Promise((done) => { setTimeout(done, 30) })
       expect(harness.agents.created).toHaveLength(0)
-      // Not even probed for: a bot's message is refused before any session work.
+      // Not even probed for: a narrowed-out bot is refused before session work.
       expect(harness.agents.looked).toEqual([])
-      // Nothing reaches the chat either: no process, no message.
-      expect(harness.fake.cots).toHaveLength(0)
       expect(harness.fake.sent).toHaveLength(0)
+      // The console carries the id, since allowing it is one paste away.
+      expect(harness.notices.join('\n')).toContain('ou_other_bot')
+      expect(harness.notices.join('\n')).toContain('botPeers')
+
+      await harness.fake.emitMessage(
+        fakeMessage({ senderIsBot: true, senderId: 'ou_wanted', content: 'from the listed one' }),
+      )
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+    } finally {
+      await harness.dispose()
+    }
+  })
+
+  it('answers a listed bot until the exchange runs out of hops', async () => {
+    const harness = await mountChannel({ botHops: 2 })
+    try {
+      const fromPeer = (content: string) =>
+        harness.fake.emitMessage(fakeMessage({ senderIsBot: true, senderId: 'ou_peer_bot', content }))
+      await fromPeer('hello from the other agent')
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      await fromPeer('and again')
+      await vi.waitFor(() => { expect(harness.agents.created[0]!.agent.followup).toHaveBeenCalledTimes(2) })
+
+      // The third hop is refused, and the room is told how to restart it.
+      await fromPeer('and again')
+      await vi.waitFor(() => {
+        expect(harness.fake.sent.some((m) => JSON.stringify(m.input).includes('说句话'))).toBe(true)
+      })
+      expect(harness.agents.created[0]!.agent.followup).toHaveBeenCalledTimes(2)
+
+      // A person speaking refills it.
+      await harness.fake.emitMessage(fakeMessage({ content: 'carry on' }))
+      await vi.waitFor(() => { expect(harness.agents.created[0]!.agent.followup).toHaveBeenCalledTimes(3) })
+      await fromPeer('back and forth')
+      await vi.waitFor(() => { expect(harness.agents.created[0]!.agent.followup).toHaveBeenCalledTimes(4) })
     } finally {
       await harness.dispose()
     }

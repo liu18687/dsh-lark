@@ -100,8 +100,8 @@ export function withinRoots(path: string, roots: readonly string[]): boolean {
  * @param overridePath - canonical override directory, absent for the default.
  * @returns the branded session id.
  */
-export function workspaceSessionId(key: string, overridePath?: string): string {
-  const base = sessionIdFor(key)
+export function workspaceSessionId(key: string, overridePath?: string, prefix?: string): string {
+  const base = sessionIdFor(key, prefix)
   if (overridePath === undefined) return base
   return `${base}--${createHash('sha256').update(overridePath).digest('hex').slice(0, 10)}`
 }
@@ -137,6 +137,8 @@ export interface ChatWorkspacesOptions {
   readonly probe?: WorkspaceProbe | undefined
   /** Home for `~` expansion and the forbidden-directory rules; tests substitute one. */
   readonly home?: string | undefined
+  /** Prefix this row's session ids carry; absent keeps the original one. */
+  readonly sessionPrefix?: string | undefined
   /**
    * Directories known outside this channel — the host workspace registry's
    * listing, when the deployment composes one. What `/ws` shows and what a
@@ -163,6 +165,7 @@ export class ChatWorkspaces {
   private readonly probe: WorkspaceProbe
   private readonly home: string | undefined
   private readonly known: () => readonly string[]
+  private readonly sessionPrefix: string | undefined
   /** The non-durable warning is orientation; once is enough. */
   private warnedNotDurable = false
 
@@ -174,6 +177,7 @@ export class ChatWorkspaces {
     this.probe = options.probe ?? probeDirectory
     this.home = options.home
     this.known = options.known ?? (() => [])
+    this.sessionPrefix = options.sessionPrefix
     this.entries = new Map(Object.entries(options.entries ?? {}))
     const probed = this.probe(this.defaultPath)
     this.defaultCanonical = 'canonical' in probed ? probed.canonical : this.defaultPath
@@ -188,8 +192,8 @@ export class ChatWorkspaces {
   /** The session id one conversation currently resolves to. */
   sessionIdFor(key: string): string {
     const entry = this.entries.get(key)
-    if (entry === undefined || entry === DEFAULT_MARKER) return workspaceSessionId(key)
-    return workspaceSessionId(key, entry)
+    if (entry === undefined || entry === DEFAULT_MARKER) return workspaceSessionId(key, undefined, this.sessionPrefix)
+    return workspaceSessionId(key, entry, this.sessionPrefix)
   }
 
   /**

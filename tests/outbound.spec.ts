@@ -124,7 +124,7 @@ describe('outbound reply targeting', () => {
       renderer.handle(failed(1))
 
       expect(sends.map(call => call.to)).toStrictEqual([CHAT, CHAT])
-      expect(sends.map(call => call.opts)).toStrictEqual([undefined, undefined])
+      expect(sends.map(call => call.opts)).toStrictEqual([{ resolveMentionsInText: true }, { resolveMentionsInText: true }])
       expect(sends.map(call => call.input)).toStrictEqual([{ markdown: '你好' }, { text: FAILURE }])
     })
 
@@ -137,7 +137,7 @@ describe('outbound reply targeting', () => {
 
       expect(sends).toHaveLength(3)
       // Outside a topic thread the flag is absent, not false.
-      for (const call of sends) expect(call.opts).toStrictEqual({ replyTo: 'om_trigger_1' })
+      for (const call of sends) expect(call.opts).toStrictEqual({ resolveMentionsInText: true, replyTo: 'om_trigger_1' })
       expect(sends.map(call => call.input)).toStrictEqual([
         { markdown: '第一步' },
         { markdown: '第二步' },
@@ -150,7 +150,7 @@ describe('outbound reply targeting', () => {
       renderer.aim({ messageId: 'om_trigger_1', threadId: 'omt_thread_1' })
       renderer.handle(committed(1, '你好'))
 
-      expect(sends[0]!.opts).toStrictEqual({ replyTo: 'om_trigger_1', replyInThread: true })
+      expect(sends[0]!.opts).toStrictEqual({ resolveMentionsInText: true, replyTo: 'om_trigger_1', replyInThread: true })
     })
 
     it('returns to plain chat sends once the target is cleared', () => {
@@ -160,7 +160,7 @@ describe('outbound reply targeting', () => {
       renderer.aim(undefined)
       renderer.handle(committed(2, '没目标'))
 
-      expect(sends.map(call => call.opts)).toStrictEqual([{ replyTo: 'om_trigger_1' }, undefined])
+      expect(sends.map(call => call.opts)).toStrictEqual([{ resolveMentionsInText: true, replyTo: 'om_trigger_1' }, { resolveMentionsInText: true }])
       expect(sends.map(call => call.input)).toStrictEqual([{ markdown: '有目标' }, { markdown: '没目标' }])
     })
   })
@@ -176,7 +176,7 @@ describe('outbound reply targeting', () => {
 
       expect(cards).toHaveLength(1)
       expect(cards[0]!.to).toBe(CHAT)
-      expect(cards[0]!.opts).toBeUndefined()
+      expect(cards[0]!.opts).toEqual({ resolveMentionsInText: true })
       expect(cards[0]!.content).toBe('你好')
       expect(cards[0]!.closed).toBe(true)
       expect(sends).toHaveLength(0)
@@ -190,7 +190,7 @@ describe('outbound reply targeting', () => {
       renderer.handle(completed(1))
       await renderer.close()
 
-      expect(cards[0]!.opts).toStrictEqual({ replyTo: 'om_trigger_1' })
+      expect(cards[0]!.opts).toStrictEqual({ resolveMentionsInText: true, replyTo: 'om_trigger_1' })
       expect(cards[0]!.content).toBe('答案')
     })
 
@@ -202,7 +202,7 @@ describe('outbound reply targeting', () => {
       renderer.handle(completed(1))
       await renderer.close()
 
-      expect(cards[0]!.opts).toStrictEqual({ replyTo: 'om_trigger_1', replyInThread: true })
+      expect(cards[0]!.opts).toStrictEqual({ resolveMentionsInText: true, replyTo: 'om_trigger_1', replyInThread: true })
     })
 
     it('aims the plain message reporting a turn that opened no card', () => {
@@ -213,7 +213,7 @@ describe('outbound reply targeting', () => {
       expect(cards).toHaveLength(0)
       expect(sends).toHaveLength(1)
       expect(sends[0]!.input).toStrictEqual({ text: FAILURE })
-      expect(sends[0]!.opts).toStrictEqual({ replyTo: 'om_trigger_1', replyInThread: true })
+      expect(sends[0]!.opts).toStrictEqual({ resolveMentionsInText: true, replyTo: 'om_trigger_1', replyInThread: true })
     })
 
     it('falls back to a plain message carrying the options its card opened with', async () => {
@@ -232,7 +232,7 @@ describe('outbound reply targeting', () => {
       expect(onFailure).toHaveBeenCalledTimes(1)
       expect(sends).toHaveLength(1)
       expect(sends[0]!.input).toStrictEqual({ markdown: '答案' })
-      expect(sends[0]!.opts).toStrictEqual({ replyTo: 'om_trigger_1', replyInThread: true })
+      expect(sends[0]!.opts).toStrictEqual({ resolveMentionsInText: true, replyTo: 'om_trigger_1', replyInThread: true })
     })
 
     it('aims each turn without moving the card already streaming', async () => {
@@ -254,9 +254,9 @@ describe('outbound reply targeting', () => {
       await renderer.close()
 
       expect(cards.map(card => card.opts)).toStrictEqual([
-        { replyTo: 'om_trigger_1' },
-        { replyTo: 'om_trigger_2' },
-        undefined,
+        { resolveMentionsInText: true, replyTo: 'om_trigger_1' },
+        { resolveMentionsInText: true, replyTo: 'om_trigger_2' },
+        { resolveMentionsInText: true },
       ])
       expect(cards.map(card => card.content)).toStrictEqual(['first half', 'second', 'third'])
     })

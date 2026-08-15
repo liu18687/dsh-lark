@@ -9,6 +9,9 @@ import type { Context } from '@deepseek-ai/cordis'
 import { Config, resolveConfig } from './config.ts'
 import type { ResolvedConfig } from './config.ts'
 import { installBridge, type ChannelPort } from './bridge.ts'
+import { migrateAppSecret, resolveAppSecret, storeAppSecret } from './credentials.ts'
+import type { HostCredentials } from './credentials.ts'
+import { instanceIdentity } from './instance.ts'
 import type { CotEvent, CotHandle } from './cot.ts'
 import type { PanelCommand } from './slash-panel.ts'
 import { beginOnboarding } from './onboarding.ts'
@@ -28,9 +31,6 @@ const SLASH_COMMAND_API = '/open-apis/application/v7/app_slash_commands'
  * terminal `RUN_FINISHED` closes it without a further call.
  */
 const COT_API = '/open-apis/im/v1/message_cot'
-
-/** The user-settings namespace holding this plugin's section (onboarded credentials included). */
-const SETTINGS_NAMESPACE = 'lark-channel'
 
 /**
  * Narrow a resolved configuration to one carrying live credentials.
@@ -138,9 +138,12 @@ export const internals: {
   reissueFloorMs?: number
   /** Reconnect-watchdog deadline override; absent keeps the bridge default. */
   reconnectDeadlineMs?: number
+  /** How an onboarded secret is stored; substituted in tests. */
+  storeSecret: typeof storeAppSecret
 } = {
   createPort: createLarkChannelPort,
   registerApp,
+  storeSecret: storeAppSecret,
   // Stamped because the incident this console exists for was dated off a file
   // mtime: the log itself could not answer WHEN its last line was written.
   notify: (line) => void process.stderr.write(`[${new Date().toLocaleString('sv-SE')}] ${line}\n`),
@@ -192,17 +195,33 @@ export function apply(ctx: Context, config: Config): void {
     if (!active) return
 
     let resolved = resolveConfig(config)
+    // A named row keys its settings, its credential, and its session ids apart
+    // from every other row; an unnamed one keeps the original identifiers.
+    const identity = instanceIdentity(resolved.instance)
     let persist = async (_app: OnboardedApp): Promise<boolean> => false
+    const credentials = ctx.get('credentials') as HostCredentials | undefined
     const settings = ctx.get('settings') as HostSettings | undefined
     if (settings !== undefined) {
       try {
-        const scope = settings.register(SETTINGS_NAMESPACE, Config, { base: config })
+        const scope = settings.register(identity.settingsNamespace, Config, { base: config })
         resolved = resolveConfig(scope.get() as Config)
         persistState = async (patch) => {
           await scope.update(patch)
           return true
         }
-        persist = async (credentials) => persistState(credentials)
+        // Onboarding hands the secret to the credentials seam and records only
+        // the reference, so the settings document never learns it.
+        persist = async (app) => {
+          const stored = await internals.storeSecret(credentials, app.appSecret, internals.notify, identity.secretRef)
+          return persistState({
+            ...app,
+            ...stored.ref === undefined ? {} : { appSecretRef: stored.ref },
+            // Blanked rather than omitted: the patch deep-merges, so a key is
+            // overwritten and never removed, and an empty secret is an absent
+            // one everywhere here.
+            ...stored.inSettings ? {} : { appSecret: '' },
+          })
+        }
       } catch (error) {
         ctx.logger.error(
           'settings registration failed; continuing with entry config only: %s',
@@ -210,6 +229,15 @@ export function apply(ctx: Context, config: Config): void {
         )
       }
     }
+
+    // A secret already sitting in the settings document moves behind a
+    // reference on this boot, so a bot onboarded before the seam was used is
+    // repaired by restarting rather than by scanning again.
+    const migratedRef = await migrateAppSecret(credentials, resolved, persistState, internals.notify, identity.secretRef)
+    if (migratedRef !== undefined) resolved = { ...resolved, appSecret: '', appSecretRef: migratedRef }
+
+    const secret = await resolveAppSecret(credentials, resolved, internals.notify)
+    if (secret !== undefined) resolved = { ...resolved, appSecret: secret }
 
     if (hasCredentials(resolved)) {
       start(resolved)
@@ -223,6 +251,7 @@ export function apply(ctx: Context, config: Config): void {
       persist,
       onCredentials: app => { start({ ...base, ...app }) },
       appId: resolved.appId,
+      ...identity.name === undefined ? {} : { instance: identity.name },
       ...internals.reissueFloorMs === undefined ? {} : { reissueFloorMs: internals.reissueFloorMs },
     })
   }

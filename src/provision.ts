@@ -32,6 +32,7 @@ import { homedir, userInfo } from 'node:os'
 import { delimiter, dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { ownVersion } from './version.ts'
+import { instanceIdentity, refuseInstanceName } from './instance.ts'
 
 /** Profile created when the operator names none. */
 export const DEFAULT_PROFILE = 'lark'
@@ -51,6 +52,7 @@ export const LOG_TRUNCATE_BYTES = 10 * 1024 * 1024
 /** What the operator asked for, after argument parsing. */
 export type Command =
   | { readonly kind: 'start'; readonly profile: string; readonly workspace: string }
+  | { readonly kind: 'add' | 'remove'; readonly profile: string; readonly name: string }
   | { readonly kind: 'stop' | 'restart' | 'status' }
   | { readonly kind: 'logs'; readonly follow: boolean }
   | { readonly kind: 'help' }
@@ -83,6 +85,15 @@ export const USAGE = `dsh-lark-channel — Lark/Feishu IM bot channel for DeepSe
       systemd --user, and show the first-run QR code here until it is
       scanned. Re-running start applies updates by restarting the bot.
 
+  dsh-lark-channel add <name>
+      Add another bot: writes its row, restarts, and shows its QR code here
+      until it is scanned. The new bot keeps its own settings, credential,
+      and sessions, so two bots in one group never share an agent.
+
+  dsh-lark-channel remove <name>
+      Take that bot out again. Its credential and settings stay, so adding
+      the same name back reaches the same bot.
+
   dsh-lark-channel stop        Stop the bot and remove it from the supervisor;
                                the profile and its credentials stay.
   dsh-lark-channel restart     Restart the running bot.
@@ -113,6 +124,27 @@ export function parseArguments(argv: readonly string[]): Command {
   if (verb === 'stop' || verb === 'restart' || verb === 'status') {
     if (argv.length > 1) throw new Error(`${verb} takes no options`)
     return { kind: verb }
+  }
+  if (verb === 'add' || verb === 'remove') {
+    const rest = argv.slice(1)
+    let profile = DEFAULT_PROFILE
+    const names: string[] = []
+    for (let index = 0; index < rest.length; index += 1) {
+      const argument = rest[index]
+      if (argument === '--profile') {
+        const value = rest[index + 1]
+        if (value === undefined) throw new Error('--profile needs a name')
+        profile = value
+        index += 1
+      } else if (argument !== undefined && argument.startsWith('-')) {
+        throw new Error(`unknown option ${argument}`)
+      } else if (argument !== undefined) {
+        names.push(argument)
+      }
+    }
+    const name = names[0]
+    if (name === undefined || names.length > 1) throw new Error(`${verb} takes one bot name, e.g. \`dsh-lark-channel ${verb} support\``)
+    return { kind: verb, profile, name }
   }
   if (verb === 'logs') {
     const follow = argv[1] === '-f' || argv[1] === '--follow'
@@ -205,8 +237,8 @@ export function unitPath(platform: NodeJS.Platform = process.platform): string {
  * @param document - contents of the settings document.
  * @returns true when the section is present.
  */
-export function hasCredentialSection(document: string): boolean {
-  return new RegExp(`^${ROW_ID}\\s*:`, 'm').test(document)
+export function hasCredentialSection(document: string, namespace: string = ROW_ID): boolean {
+  return new RegExp(`^${namespace}\\s*:`, 'm').test(document)
 }
 
 /**
@@ -228,10 +260,13 @@ export function envCredentials(environment: NodeJS.ProcessEnv = process.env): En
  * settings service.
  * @returns true when the bot already has credentials to connect with.
  */
-export function isOnboarded(): boolean {
-  if (envCredentials() !== undefined) return true
+export function isOnboarded(instance?: string): boolean {
+  // The environment pair belongs to the unnamed row; a named one has its own
+  // credential and its own settings section, so it is never onboarded by it.
+  if (instance === undefined && envCredentials() !== undefined) return true
   try {
-    return hasCredentialSection(readFileSync(join(dshHome(), 'settings.yaml'), 'utf8'))
+    const document = readFileSync(join(dshHome(), 'settings.yaml'), 'utf8')
+    return hasCredentialSection(document, instanceIdentity(instance).settingsNamespace)
   } catch {
     return false
   }
@@ -471,7 +506,57 @@ function logSize(): number {
  * @param offset - byte offset the previous relay ended at.
  * @returns the offset the next relay should start at.
  */
-async function relayNewOutput(offset: number): Promise<number> {
+/** What a console filter remembers between two chunks of the log. */
+export interface ConsoleFilter {
+  /** Inside a host-library log block whose remaining lines are noise. */
+  suppressing: boolean
+  /** A line the previous chunk ended mid-way through. */
+  partial: string
+}
+
+/** A fresh filter state, for one relay session. */
+export function newConsoleFilter(): ConsoleFilter {
+  return { suppressing: false, partial: '' }
+}
+
+/** A line this plugin wrote: the console stamps every one of them. */
+const OWN_LINE = /^\[\d{4}-\d{2}-\d{2} /
+
+/** A line the transport library wrote, which opens a block of its own. */
+const LIBRARY_LINE = /^\[(?:info|warn|error|debug|trace)\]/
+
+/**
+ * Keep this channel's own console lines and drop the transport library's.
+ *
+ * A scan is watched by relaying the supervised process's log, and that log
+ * carries the Feishu SDK's own chatter — connection notices, a paragraph about
+ * developer-console settings — which buried the QR code it was printed to
+ * show. The library's blocks span several lines, so suppression runs until the
+ * next stamped line rather than to the end of the one that opened it. The log
+ * FILE keeps everything: a dropped `[ws]` line is exactly what diagnosing a
+ * dead connection needs.
+ * @param chunk - newly appended log bytes, decoded.
+ * @param state - carried between chunks; mutated.
+ * @returns the text worth showing, possibly empty.
+ */
+export function filterConsole(chunk: string, state: ConsoleFilter): string {
+  const text = state.partial + chunk
+  const lines = text.split('\n')
+  // A chunk rarely ends on a line boundary; the tail waits for its rest.
+  state.partial = lines.pop() ?? ''
+  const kept: string[] = []
+  for (const line of lines) {
+    if (LIBRARY_LINE.test(line)) {
+      state.suppressing = true
+      continue
+    }
+    if (OWN_LINE.test(line)) state.suppressing = false
+    if (!state.suppressing) kept.push(line)
+  }
+  return kept.length === 0 ? '' : `${kept.join('\n')}\n`
+}
+
+async function relayNewOutput(offset: number, filter?: ConsoleFilter): Promise<number> {
   const size = logSize()
   let from = offset
   if (size < from) from = 0 // The log was truncated or replaced.
@@ -480,7 +565,8 @@ async function relayNewOutput(offset: number): Promise<number> {
   try {
     const buffer = Buffer.alloc(size - from)
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, from)
-    process.stdout.write(buffer.subarray(0, bytesRead))
+    const text = buffer.subarray(0, bytesRead).toString('utf8')
+    process.stdout.write(filter === undefined ? text : filterConsole(text, filter))
     return from + bytesRead
   } finally {
     await handle.close()
@@ -495,19 +581,130 @@ async function relayNewOutput(offset: number): Promise<number> {
  * @param deadline - epoch milliseconds after which to stop waiting.
  * @returns true when a scan landed, false when the deadline passed first.
  */
-async function relayUntilOnboarded(from: number, deadline: number): Promise<boolean> {
+async function relayUntilOnboarded(from: number, deadline: number, instance?: string): Promise<boolean> {
   let offset = from
+  // Only this channel's own lines: the QR code was being buried by the
+  // transport library's connection chatter.
+  const filter = newConsoleFilter()
   while (Date.now() < deadline) {
-    offset = await relayNewOutput(offset)
-    if (isOnboarded()) {
+    offset = await relayNewOutput(offset, filter)
+    if (isOnboarded(instance)) {
       // Give the host a beat to print its connected line, then drain it too.
       await delay(750)
-      await relayNewOutput(offset)
+      await relayNewOutput(offset, filter)
       return true
     }
     await delay(500)
   }
   return false
+}
+
+/** The profile's own patch layer, where a deployment's extra rows live. */
+export function patchPath(profile: string): string {
+  return join(dshHome(), 'profiles', profile, 'cordis.patch.yml')
+}
+
+/** Marks a row this CLI wrote, so `remove` can take back exactly what `add` put. */
+const INSTANCE_MARKER = '# dsh-lark-channel bot:'
+
+/**
+ * The patch entry one extra bot needs: its own row of this plugin, named.
+ * @param name - the instance name.
+ * @returns the YAML entry, marker line included.
+ */
+export function instanceRow(name: string): string {
+  return `${INSTANCE_MARKER} ${name}\n`
+    + '- insert:\n'
+    + `    - id: lark-channel-${name}\n`
+    + "      name: 'dsh-lark-channel'\n"
+    + '      config:\n'
+    + `        instance: ${name}\n`
+}
+
+/**
+ * Add one bot's row to a patch layer.
+ *
+ * The empty layer a fresh profile ships is the literal `[]`, which cannot hold
+ * a list item — so the first row REPLACES it and every later one appends.
+ * @param document - the current patch layer.
+ * @param name - the instance name.
+ * @returns the layer with the row, or undefined when it already had it.
+ */
+export function withInstanceRow(document: string, name: string): string | undefined {
+  if (document.includes(`${INSTANCE_MARKER} ${name}\n`)) return undefined
+  const emptied = document.replace(/^\[\]\s*$/m, '')
+  return `${emptied.replace(/\s*$/, '')}\n${emptied.trim() === '' ? '' : '\n'}${instanceRow(name)}`.replace(/^\n/, '')
+}
+
+/**
+ * Take one bot's row back out, from its marker to the next top-level entry.
+ * @param document - the current patch layer.
+ * @param name - the instance name.
+ * @returns the layer without the row, or undefined when it had no such row.
+ */
+export function withoutInstanceRow(document: string, name: string): string | undefined {
+  const marker = `${INSTANCE_MARKER} ${name}`
+  const lines = document.split('\n')
+  const start = lines.findIndex(line => line.trimEnd() === marker)
+  if (start < 0) return undefined
+  // The marker's own entry, then everything indented under it: a line back at
+  // column zero belongs to whoever wrote it, not to this row.
+  let end = start + 1
+  if (lines[end]?.startsWith('- ') === true) {
+    end += 1
+    while (end < lines.length && (lines[end] === '' || lines[end]?.startsWith(' ') === true)) end += 1
+  }
+  const remaining = [...lines.slice(0, start), ...lines.slice(end)].join('\n')
+  // A layer with nothing left has to say so in YAML, not by being blank.
+  const empty = remaining.trimEnd().split('\n')
+    .every(line => line.trim() === '' || line.trimStart().startsWith('#'))
+  return empty ? `${remaining.trimEnd()}\n[]\n` : remaining
+}
+
+/**
+ * Add a second (third, …) bot: write its row, restart, and stay attached for
+ * the scan, so one command covers everything a new bot needs.
+ * @param profile - the profile whose patch layer takes the row.
+ * @param name - the instance name.
+ */
+async function addBot(profile: string, name: string): Promise<void> {
+  const refusal = refuseInstanceName(name)
+  if (refusal !== undefined) throw new Error(refusal)
+  const path = patchPath(profile)
+  if (!existsSync(path)) {
+    throw new Error(`no profile at ${dirname(path)} — run \`dsh-lark-channel start\` first`)
+  }
+  const added = withInstanceRow(readFileSync(path, 'utf8'), name)
+  if (added === undefined) process.stderr.write(`dsh-lark-channel: bot ${name} is already configured — restarting to finish it\n`)
+  else writeFileSync(path, added)
+
+  const from = logSize()
+  await restart()
+  if (isOnboarded(name)) {
+    process.stderr.write(`dsh-lark-channel: bot ${name} is live — DM it or @-mention it in a group\n`)
+    return
+  }
+  process.stderr.write(`dsh-lark-channel: scan the QR code below in Feishu to create bot ${name}; Ctrl-C leaves it running\n\n`)
+  const scanned = await relayUntilOnboarded(from, Date.now() + ONBOARDING_WATCH_MS, name)
+  process.stderr.write(scanned
+    ? `\ndsh-lark-channel: bot ${name} is live — it has its own settings, credential, and sessions\n`
+    : `\ndsh-lark-channel: still waiting for a scan; the bot keeps issuing codes, follow ${logPath()}\n`)
+}
+
+/**
+ * Take one bot's row back out and restart. Its settings section and credential
+ * stay where they are, so adding the same name back reaches the same bot.
+ * @param profile - the profile whose patch layer holds the row.
+ * @param name - the instance name.
+ */
+async function removeBot(profile: string, name: string): Promise<void> {
+  const path = patchPath(profile)
+  if (!existsSync(path)) throw new Error(`no profile at ${dirname(path)}`)
+  const removed = withoutInstanceRow(readFileSync(path, 'utf8'), name)
+  if (removed === undefined) throw new Error(`no bot named ${name} in ${path}`)
+  writeFileSync(path, removed)
+  await restart()
+  process.stderr.write(`dsh-lark-channel: bot ${name} removed — its credential and settings stay, so adding it back reaches the same bot\n`)
 }
 
 /** Provision, supervise, and stay attached for the first-run scan. */
@@ -625,6 +822,8 @@ function status(): void {
 export async function execute(command: Command): Promise<void> {
   if (command.kind === 'help') process.stdout.write(USAGE)
   else if (command.kind === 'start') await start(command.profile, command.workspace)
+  else if (command.kind === 'add') await addBot(command.profile, command.name)
+  else if (command.kind === 'remove') await removeBot(command.profile, command.name)
   else if (command.kind === 'stop') stop()
   else if (command.kind === 'restart') await restart()
   else if (command.kind === 'logs') await logs(command.follow)

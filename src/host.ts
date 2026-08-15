@@ -318,6 +318,45 @@ export interface HostSettings {
   register(ns: string, schema: unknown, options?: { base?: unknown }): HostSettingsScope
 }
 
+/**
+ * The `sessionProjections` registry, narrowed to reading one session's cut.
+ *
+ * Every projection the deployment composed folds the same session log: token
+ * usage, context occupancy, step counts. Reading is synchronous and consistent
+ * — one snapshot answers for one log position — so a status report never
+ * mixes two.
+ */
+export interface HostSessionProjections {
+  /**
+   * Read every registered projection for one session.
+   * @param session - the session to read.
+   * @returns the cut, keyed by projection, and the log position it answers for.
+   */
+  snapshot(session: HostSession): { readonly asOfSeq: number; readonly values: Record<string, unknown> }
+}
+
+/** Whole-session token totals, as the host's `tokenUsage` projection reports them. */
+export interface HostTokenUsage {
+  readonly uncachedInputTokens: number
+  readonly outputTokens: number
+  readonly cacheReadTokens: number
+  readonly cacheWriteTokens: number
+}
+
+/**
+ * How full the model's context is, as the host's `contextPressure` projection
+ * reports it. Every field is optional: a session that has not yet made a
+ * request has no sample, and a provider that reports no window has no
+ * denominator.
+ */
+export interface HostContextPressure {
+  /** Prompt-side tokens the last request actually carried. */
+  readonly pressureTokens?: number
+  /** What the NEXT request would carry, moved by everything logged since. */
+  readonly projectedTokens?: number
+  readonly contextWindow?: number
+}
+
 /** One immutable entry in the host session log; narrowed via the guards below. */
 export interface HostSessionEvent {
   readonly type: string

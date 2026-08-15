@@ -18,6 +18,7 @@ import type {
 } from '@larksuite/channel'
 import {
   approvalCard as buildApprovalCard,
+  QUESTION_SELECT,
   settledApprovalCard as buildSettledApprovalCard,
   toast,
   TOAST,
@@ -36,6 +37,7 @@ import type {
   HostLlm,
   HostLoader,
   HostSessionEvent,
+  HostSessionProjections,
   HostCommands,
   HostContentBlock,
   HostSystemPrompt,
@@ -63,7 +65,7 @@ import {
   runModelCommand,
 } from './model.ts'
 import type { CatalogEntry, ModelActionValue } from './model.ts'
-import { renderStatusCard, STATUS_COMMAND, statusActionValue } from './status.ts'
+import { readMeters, renderStatusCard, STATUS_COMMAND, statusActionValue } from './status.ts'
 import type { StatusFields } from './status.ts'
 import { ChatQuestions, questionActionValue, shadowQuestionTool } from './questions.ts'
 import { PLAN_TOOL, planReviewQuestion, shadowPlanTool } from './plan.ts'
@@ -77,6 +79,10 @@ import type { SlashPanelPort } from './slash-panel.ts'
 import { ConversationSessions, conversationKey } from './session.ts'
 import type { ConversationSubject, SessionLadder } from './session.ts'
 import { createAttemptQuota, createReconnectWatchdog } from './liveness.ts'
+import { createHopBudget, exhaustedNotice, judgeBotMessage, servedNotice, strangerNotice } from './botchat.ts'
+import { batonNote, PRESENCE_ORDER, PRESENCE_SECTION, presenceSection } from './presence.ts'
+import type { BotSelf } from './presence.ts'
+import { instanceIdentity } from './instance.ts'
 
 /**
  * The transport surface the bridge drives. `LarkChannel` from
@@ -114,6 +120,12 @@ export interface ChannelPort extends OutboundPort, SlashPanelPort, ImagePort, Co
   on(name: 'reconnecting', handler: () => void): () => void
   /** The long connection is live again. */
   on(name: 'reconnected', handler: () => void): () => void
+  /**
+   * This bot's own identity, resolved during connect. Optional here so a fake
+   * port need not implement it; it throws before connect, which callers treat
+   * as "not known yet".
+   */
+  getBotIdentity?(): { readonly openId: string; readonly name?: string }
   /** Replace a sent card's content in place. */
   updateCard(messageId: string, card: object): Promise<void>
 }
@@ -363,6 +375,7 @@ function composeChatAgent(
   config: ResolvedConfig,
   askQuestions: ((questions: readonly AskedQuestion[], sessionId: string | undefined) => Promise<QuestionAnswer[]>) | undefined,
   planReview: PlanReviewPorts | undefined,
+  self: BotSelf,
 ): void {
   const tools = agentCtx.get('tools') as HostTools | undefined
   const denied = new Set(config.denyTools)
@@ -390,9 +403,15 @@ function composeChatAgent(
   if (shadowedPlan) tools?.register?.(shadowPlanTool(planReview!))
   if (!shadowedPlan && planReview?.planMode() !== undefined) denied.add(PLAN_TOOL)
 
-  // Emptied by a shadow that registered, so the guard and the prompt sentence
-  // are both keyed on what is ACTUALLY denied — a configured list is not the
-  // only way a name lands here, and neither is it a way one leaves.
+  // Every chat agent gets its bearings, denials or none: an agent told nothing
+  // about where it woke up treats a chat like a ticket queue.
+  const prompt = agentCtx.get('systemPrompt') as HostSystemPrompt | undefined
+  prompt?.section({
+    name: PRESENCE_SECTION,
+    order: PRESENCE_ORDER,
+    text: presenceSection(self, [...denied]),
+  })
+
   if (denied.size === 0) return
   // A guard rather than `tools.restrict()`: restrict validates its names
   // against the inherited registry and THROWS for one this composition does
@@ -404,14 +423,6 @@ function composeChatAgent(
         + 'different interface. Ask the user directly in your reply instead, and continue when they answer.'
       : undefined,
   )
-  const prompt = agentCtx.get('systemPrompt') as HostSystemPrompt | undefined
-  prompt?.section({
-    name: 'lark-channel:interaction',
-    order: 150,
-    text: 'You are talking to the user in a chat. '
-      + `These tools are unavailable here: ${[...denied].join(', ')}. `
-      + 'Ask in your reply instead — their next message is the answer.',
-  })
 }
 
 /**
@@ -424,9 +435,12 @@ export function chatUserMessage(msg: NormalizedMessage, images: CollectedImages)
   const spoken = msg.chatType === 'group'
     ? `${msg.senderName ?? msg.senderId}: ${msg.content}`
     : msg.content
+  // Only an agent's message carries the baton note: a human reads everything
+  // said in their own chat, mention or not.
+  const note = msg.senderIsBot === true ? batonNote(msg.senderId) : ''
   // Notes ride the text so a model that cannot be shown an image still knows
   // one was sent, instead of answering as though it had seen it.
-  const text = [spoken, ...images.notes].filter(line => line !== '').join('\n')
+  const text = [spoken, note, ...images.notes].filter(line => line !== '').join('\n')
   const content: HostContentBlock[] = [
     ...text === '' ? [] : [{ type: 'text' as const, text }],
     ...images.blocks,
@@ -482,6 +496,9 @@ export function installBridge(
     roots: config.workspaceRoots,
     persist: persistState,
     report: notify,
+    // Every session id this row derives carries its own prefix, so two bots
+    // invited to one group drive two agents rather than fighting over one.
+    sessionPrefix: instanceIdentity(config.instance).sessionPrefix,
     // The host registry's listing, read fresh per use: every workspace this
     // human already uses with the host is a `/cd` destination worth offering.
     known: () => {
@@ -698,7 +715,7 @@ export function installBridge(
       presentCall: createCallPresenter(ctx.get('tools') as HostTools | undefined, toolScope),
       setup: async (agentCtx: Context) => {
         if (presets !== undefined && presetId !== undefined) await presets.mount(agentCtx, presetId)
-        composeChatAgent(agentCtx, config, askQuestions, planReview)
+        composeChatAgent(agentCtx, config, askQuestions, planReview, botSelf())
       },
     }
   }
@@ -886,6 +903,28 @@ export function installBridge(
     })
   }
 
+  /** Bot senders this channel answers, and the budget their exchanges spend. */
+  const botPeers = new Set(config.botPeers)
+  const hops = createHopBudget(config.botHops)
+  /** Conversations already told their exchange stopped, so it is said once. */
+  const exhausted = new Set<string>()
+  /** Bots already named on the console, so an unlisted one is reported once per chat. */
+  const reportedBots = new Set<string>()
+  /**
+   * This channel's own bot id, so it can never answer itself. The transport
+   * resolves it during connect and THROWS before that, which is a diagnosis
+   * this path must not turn into a dropped message.
+   */
+  const botSelf = (): BotSelf => {
+    try {
+      const identity = port.getBotIdentity?.()
+      return identity === undefined ? {} : { name: identity.name, openId: identity.openId }
+    } catch {
+      return {}
+    }
+  }
+  const ownBotId = (): string | undefined => botSelf().openId
+
   /** Aborts in-flight command executions when this bridge unwinds. */
   const commands = new AbortController()
   ctx.effect(() => () => { commands.abort() }, 'lark:commands')
@@ -929,10 +968,20 @@ export function installBridge(
   const statusFieldsFor = (subject: ConversationSubject): StatusFields => {
     const sessionId = chatWorkspaces.sessionIdFor(subject.key)
     const override = chatModels.routeFor(subject.key)
+    const route = override === undefined ? deploymentRoute() : formatRoute(override)
+    // Meters come off the LIVE session: a conversation whose agent has not been
+    // built yet has spent nothing, and reading its stored log to say so would
+    // load a log to report a zero.
+    const live = (ctx.get('agents') as DurableAgentRegistry | undefined)?.get(sessionId)
+    const meters = readMeters(
+      ctx.get('sessionProjections') as HostSessionProjections | undefined,
+      live?.session,
+    )
     return {
+      ...meters,
       workspace: chatWorkspaces.pathFor(subject.key),
       workspaceIsDefault: chatWorkspaces.isDefault(subject.key),
-      route: override === undefined ? deploymentRoute() : formatRoute(override),
+      route,
       routeIsDefault: override === undefined,
       sessionId,
       bound: sessions.keyOf(sessionId) !== undefined,
@@ -979,11 +1028,53 @@ export function installBridge(
       notify(`lark-channel: ignored a message in ${msg.chatId}: ${refusal}`)
       return
     }
-    // A bot answering a bot is how mention loops start. `undefined` means the
-    // event omitted the sender kind, which is "unknown", not "not a bot" — and
+    // A message from a bot is answered only where the deployment named that
+    // bot and the exchange still has hops left. `undefined` means the event
+    // omitted the sender kind, which is "unknown", not "not a bot" — and
     // refusing every unknown sender would refuse ordinary traffic, so only a
-    // positive bot signal is skipped.
-    if (msg.senderIsBot === true) return
+    // positive bot signal is judged here.
+    const conversation = conversationKey(config.sessionScope, msg)
+    if (msg.senderIsBot === true) {
+      const verdict = judgeBotMessage(
+        { senderId: msg.senderId, key: conversation, ownBotId: ownBotId() },
+        botPeers,
+        hops,
+      )
+      if (verdict.kind === 'stranger') {
+        // Once per bot per chat: the id is what an operator needs to allow it,
+        // and repeating it for every message would bury the rest of the log.
+        const seen = `${msg.chatId}/${verdict.senderId}`
+        if (!reportedBots.has(seen)) {
+          reportedBots.add(seen)
+          notify(strangerNotice(verdict.senderId, msg.chatId))
+        }
+        return
+      }
+      if (verdict.kind === 'self') return
+      if (verdict.kind === 'answer') {
+        // Named once per bot per chat: who can drive a shell-capable agent is
+        // a fact worth seeing, and here the answer is "a bot".
+        const seen = `${msg.chatId}/${msg.senderId}`
+        if (!reportedBots.has(seen)) {
+          reportedBots.add(seen)
+          notify(servedNotice(msg.senderId, msg.chatId))
+        }
+      }
+      if (verdict.kind === 'exhausted') {
+        // Said once, in the chat, because the humans there are the ones who
+        // can restart it — and saying it again per message is the very noise
+        // the budget exists to stop.
+        if (!exhausted.has(conversation)) {
+          exhausted.add(conversation)
+          await port.send(msg.chatId, { text: exhaustedNotice(verdict.spent) }).catch(reportSendFailure)
+        }
+        return
+      }
+    } else {
+      // A person speaking is the signal that the exchange is still wanted.
+      hops.reset(conversation)
+      exhausted.delete(conversation)
+    }
     // An @-only ping carries no text; starting a turn on an empty prompt spends
     // a turn for nothing. Skipped before the acknowledgement, which would
     // otherwise promise work no turn is doing.
@@ -998,7 +1089,7 @@ export function installBridge(
       || channelCommand === MODEL_COMMAND || channelCommand === STATUS_COMMAND
     ) {
       try {
-        const key = conversationKey(config.sessionScope, msg)
+        const key = conversation
         // Dispose the conversation's current agent so the next message walks
         // the ladder again — under a new id after `/cd`, or resuming the same
         // session under the new route after `/model use`. The id is captured
@@ -1212,7 +1303,14 @@ export function installBridge(
     if (choice !== undefined) {
       // A question is a choice, not an escalation: anyone the chat serves may
       // answer it, exactly as they could by typing the answer instead.
-      const settled = questions.answerByClick(choice)
+      //
+      // A multiple choice arrives as a form submission, whose chosen set the
+      // platform delivers beside the button's own value rather than in it.
+      const submitted = (evt.action.formValue as Record<string, unknown> | undefined)?.[QUESTION_SELECT]
+      const settled = questions.answerByClick(
+        choice,
+        Array.isArray(submitted) ? submitted.map(entry => String(entry)) : [],
+      )
       return settled === undefined
         ? { toast: toast('info', TOAST.questionGone) }
         : { toast: toast('success', TOAST.answered), card: { type: 'raw', data: settled } }

@@ -31,13 +31,14 @@ Transport is `@larksuite/channel` over a WebSocket long connection, so no public
 - Two output modes: `cot` uses the platform's native thinking process, `stream` keeps a turn in one typewriter card for older clients.
 - A line starting with `/` runs as a host command without a model turn. `/stop` cancels the running turn, `/help` lists what the chat accepts.
 - Host approval questions become cards with 允许一次 / 拒绝 buttons; a click settles the outcome and rewrites the card with the decision.
-- Model questions (`ask_user_question`) become cards too: the tool is shadowed in each chat agent's own layer, its options render as buttons, and an ordinary reply answers it when none of them fit.
+- Model questions (`ask_user_question`) become cards too: the tool is shadowed in each chat agent's own layer, its options render as buttons — or, when the model marks the question `multi_select`, as a form that submits the whole chosen set — and an ordinary reply answers it when none of them fit.
 - Plan review (`exit_plan_mode`) lands in the chat: the plan arrives as an ordinary message so its markdown renders, and the decision follows as a card that approves or sends feedback back to the model.
 - `/model` answers with a picker over the advertised routes, `/status` with a readout of what the next message will do. Both stay typeable: `/model use <provider/model>` switches without reading a card.
 - Every card speaks one visual language, in the reader's own language: this channel's own copy ships bilingual (zh/en) and the platform renders each viewer's, while model-authored text is shown literally and never as card markup.
 - Images can be turned on: they are downloaded, committed to the host attachment store, and ride the message to the model.
 - Every reply is aimed at the message that asked for it, and stays inside that message's topic thread when it had one.
 - Authorization narrows within the app's visibility scope; every allowlist is empty by default.
+- More than one bot: compose the plugin once per Lark app and name each extra row with `instance`, which keys its settings, its credential, and its sessions apart.
 - With no credentials configured, boot draws a QR code; scanning it creates the app through the official flow, event subscription included.
 
 ## Requirements
@@ -97,7 +98,10 @@ The invariant companion row is not part of the default patch: the shipped `web` 
 | `hideProcessWhenDone` | `false` | Let the platform drop the process once its run finishes (`cot` only). |
 | `attachImages` | `false` | Pass images on to the model. Only for a route that accepts them: one rejected image ends the conversation. |
 | `syncSlashCommands` | `true` | Register the chat's commands on the bot so Feishu offers them when a user types `/`. |
+| `instance` | — | Names this row when a deployment composes more than one bot, keying its settings, its app-secret credential, and its session ids apart. Leave it unset on the first row: an unnamed row keeps the original identifiers. |
 | `denyTools` | `[]` | Tools chat agents may not call, denied per agent at execution. Empty by default: the human-interaction tools are shadowed and answered here rather than denied. A name added here still wins over its shadow. |
+| `botPeers` | `[]` | Restrict which bots this channel answers, so two agents in one room can talk. Empty narrows nothing, like every other list here; each bot that speaks is named once per chat on the console. |
+| `botHops` | `6` | Consecutive bot-sourced turns one conversation may run before the channel stops answering. A human message refills it. |
 | `requireMention` | `true` | In group chats, only respond when @-mentioned. |
 | `senderAllowlist` | `[]` | Open ids allowed to send direct messages; empty serves anyone the app is visible to. |
 | `groupAllowlist` | `[]` | When non-empty, only these `oc_…` group chats are served; empty serves any group. |

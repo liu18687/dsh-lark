@@ -53,14 +53,20 @@ export interface QuestionAnswer {
   readonly custom?: string
 }
 
-/** Card-button payload carried by one option choice. */
+/** Card payload carried by one option choice, or by a submitted set of them. */
 export interface QuestionActionValue {
   readonly kind: typeof QUESTION_ACTION
   /** Correlation id of the pending question, not the model's own id. */
   readonly id: string
-  /** Index into the question's options. */
+  /**
+   * Index into the question's options; -1 on the submit button of a multiple
+   * choice, whose chosen set arrives in the action's form value instead.
+   */
   readonly option: number
 }
+
+/** The index a submit button carries, having no single option of its own. */
+export const SUBMIT_OPTION = -1
 
 /**
  * Narrow one card action to a question choice.
@@ -91,6 +97,12 @@ export function questionCard(question: AskedQuestion, id: string): object {
     header: question.header,
     options: question.options ?? [],
     valueFor: index => ({ kind: QUESTION_ACTION, id, option: index } satisfies QuestionActionValue),
+    ...question.multiSelect === true
+      ? {
+          multiSelect: true,
+          submit: { kind: QUESTION_ACTION, id, option: SUBMIT_OPTION } satisfies QuestionActionValue,
+        }
+      : {},
   })
 }
 
@@ -217,9 +229,10 @@ export class ChatQuestions {
    * @param value - the parsed card action.
    * @returns whether it settled a live question.
    */
-  answerByClick(value: QuestionActionValue): object | undefined {
+  answerByClick(value: QuestionActionValue, chosen?: readonly string[]): object | undefined {
     const entry = this.pending.get(value.id)
     if (entry === undefined || entry.settled) return undefined
+    if (value.option === SUBMIT_OPTION) return this.answerBySubmission(value.id, entry, chosen ?? [])
     const option = (entry.question.options ?? [])[value.option]
     if (option === undefined) return undefined
     const question = entry.question
@@ -229,6 +242,29 @@ export class ChatQuestions {
     // The settled card goes back in the click's own response: the platform
     // repaints it from that, immediately, with no second API call to fail.
     return settledQuestionCard(question, { answer: option.label })
+  }
+
+  /**
+   * Settle a multiple choice from what its form submitted.
+   *
+   * The submission carries positions rather than labels, so an empty or
+   * unreadable set is a submission that named nothing this question offered —
+   * refused rather than answered, leaving the card live for another try.
+   * @param id - the pending question's correlation id.
+   * @param entry - the question awaiting an answer.
+   * @param chosen - option indices, as the form returned them.
+   * @returns the settled card to paint, or undefined when nothing was chosen.
+   */
+  private answerBySubmission(id: string, entry: Pending, chosen: readonly string[]): object | undefined {
+    const options = entry.question.options ?? []
+    const picked = [...new Set(chosen)]
+      .map(index => options[Number(index)])
+      .filter((option): option is QuestionOption => option !== undefined)
+      .map(option => option.label)
+    if (picked.length === 0) return undefined
+    const shown = picked.join('、')
+    if (!this.finish(id, { id: entry.question.id, selected: picked }, false, shown, false)) return undefined
+    return settledQuestionCard(entry.question, { answer: shown })
   }
 
   /**

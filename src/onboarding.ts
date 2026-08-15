@@ -82,6 +82,27 @@ const REGISTRATION_PRESET: Pick<RegisterAppRequest, 'source' | 'appPreset'> = {
   },
 }
 
+/**
+ * The name and description the app-creation page opens with.
+ *
+ * A named row asks for a named app. Every row filling in the SAME name is how
+ * a second bot's QR page ends up looking exactly like the first bot's — two
+ * identical `DSH Agent` entries in the console, and a scan that reads as
+ * re-registering the bot you already have rather than creating another one.
+ * @param instance - the row's instance name, absent for the original row.
+ * @returns the registration preset for this row.
+ */
+function presetFor(instance?: string): Pick<RegisterAppRequest, 'source' | 'appPreset'> {
+  if (instance === undefined || instance === '') return REGISTRATION_PRESET
+  return {
+    source: REGISTRATION_PRESET.source,
+    appPreset: {
+      name: `DSH Agent (${instance})`,
+      desc: `DSH 会话机器人（${instance}）`,
+    },
+  }
+}
+
 /** The rejection code the flow reports when nobody scanned before the code expired. */
 const EXPIRED_CODE = 'expired_token'
 
@@ -180,6 +201,8 @@ export interface OnboardingRun {
   readonly onCredentials: (app: OnboardedApp) => void
   /** An existing app to re-authorize, when the deployment configured an id but no secret. */
   readonly appId?: string | undefined
+  /** This row's instance name, which names the app it creates. */
+  readonly instance?: string | undefined
   /** Overrides {@link REISSUE_FLOOR_MS}, so a test need not wait out a real one. */
   readonly reissueFloorMs?: number
 }
@@ -206,7 +229,7 @@ export function beginOnboarding(run: OnboardingRun): void {
     /** Drive one code to a scan, or to the reason it produced none. */
     const issue = async (round: number): Promise<Awaited<ReturnType<RegisterAppPort>>> =>
       register({
-        ...REGISTRATION_PRESET,
+        ...presetFor(run.instance),
         ...appId === undefined || appId === '' ? {} : { appId },
         signal,
         onQRCodeReady({ url, expireIn }) {
@@ -255,7 +278,7 @@ export function beginOnboarding(run: OnboardingRun): void {
         })
         if (signal.aborted) return
         announce(persisted
-          ? `lark-channel: 应用 ${credentials.appId} 注册成功，凭证已写入用户设置。`
+          ? `lark-channel: 应用 ${credentials.appId} 注册成功，密钥已存入凭据存储，设置里只保留引用。`
             + (credentials.registeredBy === undefined
               ? ''
               : ` 注册者：${credentials.registeredBy}（需要收窄时可填入 senderAllowlist / approvers）。`)

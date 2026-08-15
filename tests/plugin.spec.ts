@@ -17,6 +17,7 @@ import {
   cardControls,
   cardTexts,
   createFakeAttachments,
+  createFakeCredentials,
   createFakeCommands,
   createFakePresets,
   createFakeSettings,
@@ -355,7 +356,10 @@ describe('dsh-lark-channel', () => {
       // no prompt section claims otherwise.
       expect(created.denyReason('exit_plan_mode')).toBeUndefined()
       expect(created.denyReason('bash')).toBeUndefined()
-      expect(created.promptSections.find((s) => s.name === 'lark-channel:interaction')).toBeUndefined()
+      // Nothing is denied, but the agent is still told where it woke up.
+      const presence = created.promptSections.find((s) => s.name === 'lark-channel:presence')
+      expect(presence?.text).toContain('Your reply IS the message')
+      expect(presence?.text).not.toContain('Unavailable here')
       await harness.dispose()
     })
 
@@ -379,8 +383,8 @@ describe('dsh-lark-channel', () => {
       expect(created.denyReason('exit_plan_mode')).toContain('Ask the user directly in your reply')
       expect(created.denyReason('ask_user_question')).toBeDefined()
       // And the model is told up front, so it asks in prose instead.
-      const section = created.promptSections.find((s) => s.name === 'lark-channel:interaction')
-      expect(section?.text).toContain('their next message is the answer')
+      const section = created.promptSections.find((s) => s.name === 'lark-channel:presence')
+      expect(section?.text).toContain('Unavailable here: ask_user_question, exit_plan_mode')
       await harness.dispose()
     })
 
@@ -396,7 +400,9 @@ describe('dsh-lark-channel', () => {
       const harness = await mountChannel({ denyTools: [] })
       const created = await firstAgent(harness)
       expect(created.denyReason('ask_user_question')).toBeUndefined()
-      expect(created.promptSections).toEqual([])
+      // One section either way: the agent's bearings, with no denial line.
+      expect(created.promptSections.map((s) => s.name)).toEqual(['lark-channel:presence'])
+      expect(created.promptSections[0]!.text).not.toContain('Unavailable here')
       await harness.dispose()
     })
 
@@ -1224,6 +1230,82 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
+    it('keys a named row apart end to end, and leaves an unnamed one alone', async () => {
+      const store = createFakeSettings()
+      const vault = createFakeCredentials()
+      const harness = await mountChannel(
+        { instance: 'support', appId: undefined, appSecret: undefined },
+        {
+          settings: store.settings,
+          credentials: vault.credentials,
+          registerApp: async () => ({ client_id: 'cli_second', client_secret: 'second-secret' }),
+        },
+      )
+      await vi.waitFor(() => { expect(harness.fake.state.connects).toBe(1) })
+
+      // Its own settings section and its own credential.
+      expect(store.registered[0]!.ns).toBe('lark-channel-support')
+      expect(vault.stored).toEqual([{ ref: 'LARK_APP_SECRET_SUPPORT', value: 'second-secret' }])
+
+      // And its own session ids: the same chat under two rows is two agents.
+      await harness.fake.emitMessage(fakeMessage())
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      expect(harness.agents.created[0]!.sessionId).toBe('lark-support-oc_chat_1')
+      await harness.dispose()
+    })
+
+    it('stores an onboarded secret behind a credential, not in the settings document', async () => {
+      const store = createFakeSettings()
+      const vault = createFakeCredentials()
+      const harness = await mountChannel(
+        { appId: undefined, appSecret: undefined },
+        {
+          settings: store.settings,
+          credentials: vault.credentials,
+          registerApp: async () => ({ client_id: 'cli_new', client_secret: 'new-secret' }),
+        },
+      )
+      await vi.waitFor(() => { expect(harness.fake.state.connects).toBe(1) })
+
+      expect(vault.stored).toEqual([{ ref: 'LARK_APP_SECRET', value: 'new-secret' }])
+      // The settings keep the reference and a blanked secret: a deep-merged
+      // patch cannot delete a key, and an empty secret is an absent one.
+      expect(store.updates).toEqual([
+        { appId: 'cli_new', appSecret: '', appSecretRef: 'LARK_APP_SECRET' },
+      ])
+      expect(JSON.stringify(store.updates)).not.toContain('new-secret')
+      await harness.dispose()
+    })
+
+    it('moves a secret already in the settings document behind a credential', async () => {
+      const store = createFakeSettings({ appId: 'cli_stored', appSecret: 'old-secret' })
+      const vault = createFakeCredentials()
+      const harness = await mountChannel(
+        { appId: undefined, appSecret: undefined },
+        { settings: store.settings, credentials: vault.credentials },
+      )
+      // Repaired by restarting rather than by scanning again — and the channel
+      // still connects on this boot, with the secret it just moved.
+      await vi.waitFor(() => { expect(harness.fake.state.connects).toBe(1) })
+      expect(vault.stored).toEqual([{ ref: 'LARK_APP_SECRET', value: 'old-secret' }])
+      expect(store.updates).toEqual([{ appSecret: '', appSecretRef: 'LARK_APP_SECRET' }])
+      expect(harness.portConfigs[0]!.appSecret).toBe('old-secret')
+      await harness.dispose()
+    })
+
+    it('connects from a reference alone, resolved on every boot', async () => {
+      const vault = createFakeCredentials({ LARK_APP_SECRET: 'vault-secret' })
+      const harness = await mountChannel(
+        { appId: 'cli_ref', appSecret: undefined, appSecretRef: 'LARK_APP_SECRET' },
+        { credentials: vault.credentials },
+      )
+      await vi.waitFor(() => { expect(harness.fake.state.connects).toBe(1) })
+      expect(harness.portConfigs[0]!.appSecret).toBe('vault-secret')
+      // Nothing was written: the value was already configured.
+      expect(vault.stored).toEqual([])
+      await harness.dispose()
+    })
+
     it('reports who registered the app without authorizing on it', async () => {
       const store = createFakeSettings()
       const harness = await mountChannel(
@@ -1927,7 +2009,7 @@ describe('dsh-lark-channel', () => {
         type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } },
       })
       await vi.waitFor(() => { expect(harness.fake.sent).toHaveLength(2) })
-      expect(harness.fake.sent[1]!.opts).toBeUndefined()
+      expect(harness.fake.sent[1]!.opts).toEqual({ resolveMentionsInText: true })
       await harness.dispose()
     })
   })

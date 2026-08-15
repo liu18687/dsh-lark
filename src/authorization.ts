@@ -20,6 +20,10 @@ export interface Authorization {
   readonly groups: ReadonlySet<string>
   /** Open ids that may answer approvals; empty lets anyone who may drive the chat answer. */
   readonly approvers: ReadonlySet<string>
+  /** Bot open ids answered; empty narrows nothing, as every list here does. */
+  readonly botPeers: ReadonlySet<string>
+  /** Consecutive bot-sourced turns one conversation may run. */
+  readonly botHops: number
 }
 
 /**
@@ -32,6 +36,8 @@ export function resolveAuthorization(config: ResolvedConfig): Authorization {
     directSenders: new Set(config.senderAllowlist),
     groups: new Set(config.groupAllowlist),
     approvers: new Set(config.approvers),
+    botPeers: new Set(config.botPeers),
+    botHops: config.botHops,
   }
 }
 
@@ -51,7 +57,10 @@ export function describeAuthorization(authorization: Authorization): string {
   const approvers = authorization.approvers.size === 0
     ? 'approvals: anyone who may drive that chat'
     : `approvals: ${[...authorization.approvers].join(', ')}`
-  return `lark-channel: ${direct}; ${groups}; ${approvers}`
+  const bots = authorization.botPeers.size === 0
+    ? `bots: any bot in a chat it serves, up to ${authorization.botHops} consecutive turns (narrow with botPeers)`
+    : `bots: ${[...authorization.botPeers].join(', ')}, up to ${authorization.botHops} consecutive turns`
+  return `lark-channel: ${direct}; ${groups}; ${approvers}; ${bots}`
 }
 
 /** One inbound message's authorization subject. */
