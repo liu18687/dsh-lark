@@ -18,6 +18,7 @@ import { createHash } from 'node:crypto'
 import { realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, resolve, sep } from 'node:path'
+import { epochSessionId } from './epoch.ts'
 import { sessionIdFor } from './session.ts'
 
 /** Switch or show this conversation's workspace. Channel-owned: it needs no agent. */
@@ -140,6 +141,11 @@ export interface ChatWorkspacesOptions {
   /** Prefix this row's session ids carry; absent keeps the original one. */
   readonly sessionPrefix?: string | undefined
   /**
+   * How many times a conversation has started over, by the id it derives at
+   * epoch zero. Absent keeps every conversation on its first.
+   */
+  readonly epochOf?: ((baseId: string) => number) | undefined
+  /**
    * Directories known outside this channel — the host workspace registry's
    * listing, when the deployment composes one. What `/ws` shows and what a
    * bare-name `/cd` can reach, so a chat can discover every project its human
@@ -166,6 +172,7 @@ export class ChatWorkspaces {
   private readonly home: string | undefined
   private readonly known: () => readonly string[]
   private readonly sessionPrefix: string | undefined
+  private readonly epochOf: (baseId: string) => number
   /** The non-durable warning is orientation; once is enough. */
   private warnedNotDurable = false
 
@@ -178,6 +185,7 @@ export class ChatWorkspaces {
     this.home = options.home
     this.known = options.known ?? (() => [])
     this.sessionPrefix = options.sessionPrefix
+    this.epochOf = options.epochOf ?? (() => 0)
     this.entries = new Map(Object.entries(options.entries ?? {}))
     const probed = this.probe(this.defaultPath)
     this.defaultCanonical = 'canonical' in probed ? probed.canonical : this.defaultPath
@@ -189,11 +197,24 @@ export class ChatWorkspaces {
     return entry === undefined || entry === DEFAULT_MARKER ? this.defaultPath : entry
   }
 
+  /**
+   * The id this conversation derives before it ever started over. The epoch
+   * map is keyed by it, so a `/new` in one directory leaves the thread in
+   * another untouched.
+   * @param key - conversation key.
+   * @returns the session id at epoch zero.
+   */
+  baseSessionIdFor(key: string): string {
+    const entry = this.entries.get(key)
+    return entry === undefined || entry === DEFAULT_MARKER
+      ? workspaceSessionId(key, undefined, this.sessionPrefix)
+      : workspaceSessionId(key, entry, this.sessionPrefix)
+  }
+
   /** The session id one conversation currently resolves to. */
   sessionIdFor(key: string): string {
-    const entry = this.entries.get(key)
-    if (entry === undefined || entry === DEFAULT_MARKER) return workspaceSessionId(key, undefined, this.sessionPrefix)
-    return workspaceSessionId(key, entry, this.sessionPrefix)
+    const base = this.baseSessionIdFor(key)
+    return epochSessionId(base, this.epochOf(base))
   }
 
   /**

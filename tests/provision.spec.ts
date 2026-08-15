@@ -18,6 +18,10 @@ import {
   systemdUnit,
   whichSync,
   filterConsole,
+  invocation,
+  isNewer,
+  latestVersion,
+  usage,
   newConsoleFilter,
   withInstanceRow,
   withoutInstanceRow,
@@ -358,5 +362,55 @@ describe('scan console', () => {
     expect(filterConsole("  'still inside the block',\n", state)).toBe('')
     expect(filterConsole('[2026-08-15 18:55:56] lark-channel: back\n', state))
       .toBe('[2026-08-15 18:55:56] lark-channel: back\n')
+  })
+})
+
+describe('how the command spells itself', () => {
+  it('answers with the form the caller actually used', () => {
+    // Run through npx the binary lives in a throwaway cache, so telling that
+    // caller to run a bare `dsh-lark-channel` is telling them to run nothing.
+    expect(invocation('/home/dev/.npm/_npx/abc123/node_modules/dsh-lark-channel/lib/cli.js'))
+      .toBe('npx dsh-lark-channel@latest')
+    expect(invocation('/usr/local/lib/node_modules/dsh-lark-channel/lib/cli.js'))
+      .toBe('dsh-lark-channel')
+    // An unknown path is the installed form: the shorter, likelier one.
+    expect(invocation('')).toBe('dsh-lark-channel')
+  })
+
+  it('spells every line of the usage text the same way', () => {
+    const text = usage('npx dsh-lark-channel@latest')
+    expect(text).toContain('npx dsh-lark-channel@latest start')
+    expect(text).toContain('npx dsh-lark-channel@latest add <name>')
+    expect(text).not.toMatch(/\n {2}dsh-lark-channel /)
+  })
+})
+
+describe('upgrading', () => {
+  it('parses the verb with the same options start takes', () => {
+    expect(parseArguments(['upgrade'])).toEqual({
+      kind: 'upgrade',
+      profile: 'lark',
+      workspace: process.cwd(),
+    })
+    expect(parseArguments(['upgrade', '--profile', 'work'])).toMatchObject({ kind: 'upgrade', profile: 'work' })
+    expect(() => parseArguments(['upgrade', '--nope'])).toThrow('unknown option')
+  })
+
+  it('compares versions by their release numbers', () => {
+    expect(isNewer('0.0.6', '0.0.5')).toBe(true)
+    expect(isNewer('0.1.0', '0.0.9')).toBe(true)
+    expect(isNewer('1.0.0', '0.9.9')).toBe(true)
+    expect(isNewer('0.0.5', '0.0.5')).toBe(false)
+    expect(isNewer('0.0.4', '0.0.5')).toBe(false)
+    // A prerelease of the same numbers is not newer than the release.
+    expect(isNewer('0.0.5-rc.1', '0.0.5')).toBe(false)
+    // Missing parts read as zero rather than throwing.
+    expect(isNewer('1', '0.9.9')).toBe(true)
+  })
+
+  it('answers nothing when the registry cannot be reached', async () => {
+    // The check is a courtesy on top of whatever the caller actually ran, so
+    // it must cost that command nothing when it fails.
+    await expect(latestVersion(1)).resolves.toBeUndefined()
   })
 })

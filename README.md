@@ -1,220 +1,172 @@
-# dsh-lark-channel
+# dsh-lark
 
 [![npm](https://img.shields.io/npm/v/dsh-lark-channel)](https://www.npmjs.com/package/dsh-lark-channel) [![CI](https://github.com/omdsh-dev/dsh-lark/actions/workflows/ci.yml/badge.svg)](https://github.com/omdsh-dev/dsh-lark/actions/workflows/ci.yml) [![license](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
 
-English | [中文](README.zh.md)
+简体中文 | [English](README.en.md)
 
-A Lark/Feishu IM bot channel plugin for DeepSeek Harness. Each chat (direct message or group) drives its own DSH agent; the assistant's reasoning and tool calls show as the platform's native thinking process, the answer is sent separately, and host approval questions become interactive cards decided by button clicks.
+**把你正在使用的 DeepSeek Harness 接进飞书。**
 
-Transport is `@larksuite/channel` over a WebSocket long connection, so no public callback URL is needed.
+直接在聊天里给 Agent 派任务、看执行过程、切换工作区和模型。遇到提问、计划确认或工具审批，也不用回到终端，直接在飞书里处理。需要时，还能把多个 Agent 放进同一个群里协作。
 
-<!-- Screenshots: drop PNGs under .github/assets/ and uncomment.
-<p align="center">
-  <img src=".github/assets/thinking-process.png" alt="native thinking process" width="45%">
-  <img src=".github/assets/approval-card.png" alt="approval card" width="45%">
-</p>
--->
+## 快速开始
 
-- [Features](#features)
-- [Requirements](#requirements)
-- [Quickstart](#quickstart)
-- [Configuration](#configuration)
-- [Behavior](#behavior)
-- [Limitations](#limitations)
-- [Development](#development)
+```sh
+npm i -g dsh-lark-channel
+dsh-lark-channel start
+```
 
-## Features
+终端会显示二维码。用飞书扫码完成应用创建，然后私聊机器人，或在群里 @ 它即可开始。
 
-- One agent per conversation. `sessionScope` picks the facet: the whole chat, one topic thread, or one sender inside a shared chat. Session ids are stable across restarts.
-- `/cd` points a conversation at a directory; `/ws` lists every workspace the host registry knows, each reachable by bare name. Every (conversation × directory) pair owns a durable session, so coming back to a directory resumes the context built there; switches persist across restarts, `workspaceRoots` can fence where `/cd` may go, and the filesystem root and home are never accepted.
-- `/model` shows the current route and the host llm registry's catalog; `/model use <provider/model>` switches this conversation from the next message on — the SAME session resumes under the new route, context intact. `/status` reports workspace, model, session, and turn activity, before a first message exists.
-- Two output modes: `cot` uses the platform's native thinking process, `stream` keeps a turn in one typewriter card for older clients.
-- A line starting with `/` runs as a host command without a model turn. `/stop` cancels the running turn, `/help` lists what the chat accepts.
-- Host approval questions become cards with 允许一次 / 拒绝 buttons; a click settles the outcome and rewrites the card with the decision.
-- Model questions (`ask_user_question`) become cards too: the tool is shadowed in each chat agent's own layer, its options render as buttons — or, when the model marks the question `multi_select`, as a form that submits the whole chosen set — and an ordinary reply answers it when none of them fit.
-- Plan review (`exit_plan_mode`) lands in the chat: the plan arrives as an ordinary message so its markdown renders, and the decision follows as a card that approves or sends feedback back to the model.
-- `/model` answers with a picker over the advertised routes, `/status` with a readout of what the next message will do. Both stay typeable: `/model use <provider/model>` switches without reading a card.
-- Every card speaks one visual language, in the reader's own language: this channel's own copy ships bilingual (zh/en) and the platform renders each viewer's, while model-authored text is shown literally and never as card markup.
-- Images can be turned on: they are downloaded, committed to the host attachment store, and ride the message to the model.
-- Every reply is aimed at the message that asked for it, and stays inside that message's topic thread when it had one.
-- Authorization narrows within the app's visibility scope; every allowlist is empty by default.
-- More than one bot: compose the plugin once per Lark app and name each extra row with `instance`, which keys its settings, its credential, and its sessions apart.
-- With no credentials configured, boot draws a QR code; scanning it creates the app through the official flow, event subscription included.
-
-## Requirements
-
-- Node `^22.19.0 || >=24.0.0`, pnpm 11.7.
-- A DeepSeek Harness deployment (`dsh` 0.1.0-rc.6 or newer). `@deepseek-ai/cordis` (`^4.0.1`) is a peer dependency supplied by the host.
-- A Feishu or Lark tenant. The app itself can be created by the first-boot QR flow.
-- `cot` output needs a client new enough to render a thinking process: PC 7.70, mobile 7.74. Older clients use `output: 'stream'`.
-
-## Quickstart
+不想装到全局也可以直接跑，只是之后每条命令都要带 `npx`：
 
 ```sh
 npx dsh-lark-channel@latest start
 ```
 
-A QR code appears; scan it in Feishu and the bot is live. It runs in the background from the first moment — under launchd on macOS, `systemd --user` on Linux — so it survives the terminal closing and comes back after a reboot. Then DM it or @-mention it in a group.
+如果还没有安装 DeepSeek Harness，先运行：
 
-`stop`, `restart`, `status`, and `logs` manage it afterwards; re-running `start` applies updates. `dsh` has to be installed (`npm i -g @deepseek-ai/dsh`), since a supervised process cannot depend on npx. Where neither launchd nor systemd exists — Windows, a Linux without systemd — `start` runs in the foreground instead.
+```sh
+npm i -g @deepseek-ai/dsh
+```
 
-Already running `dsh web` and want the channel in that profile instead:
+无需公网服务器，也无需配置回调地址。
+
+## 为什么值得装
+
+- **不用守着终端**：从飞书发起任务，随时查看进度和结果。
+- **不只是聊天机器人**：可以切换真实工作区和模型，执行 Harness 已有的命令与工具。
+- **关键决定仍由你控制**：模型提问、计划审阅和工具审批都会回到当前聊天，按钮或文字都能作答。
+- **上下文不会混在一起**：不同聊天、话题和工作区可以保留各自的会话。
+- **Agent 之间也能协作**：一条命令添加更多机器人，让它们在群聊中通过 @ 交接回合，并用轮数上限防止无限对话。
+
+## 可以这样开始
+
+先看看当前状态和可用工作区：
+
+```text
+/status
+/ws
+/cd my-project
+/model
+```
+
+然后直接派一个任务：
+
+```text
+检查这个项目为什么构建失败。先给我计划，需要操作时让我确认。
+```
+
+Agent 的执行过程会显示在飞书中；需要你参与时，会发送提问、计划或审批卡片。渠道自带文案会按每位读者的飞书语言显示中文或英文。
+
+## 主要能力
+
+| 能力 | 使用体验 |
+|---|---|
+| 持久会话 | 重启后可以恢复；后续消息继续当前上下文，`/new` 可以原地重开一个 |
+| 多工作区 | `/ws` 查看、`/cd` 切换；回到原工作区时继续之前的任务 |
+| 模型切换 | `/model` 打开模型选择卡片；切换后保留当前会话，也可随时恢复默认模型 |
+| 原生执行过程 | 在飞书中查看推理、工具调用和结果，最终答案单独发送 |
+| 人机协作卡片 | 单选、多选或文字回答问题；批准计划或提出修改意见；允许或拒绝工具调用 |
+| 实时状态 | `/status` 展示工作区、模型和 session；可用时还显示上下文占用与累计 token，并支持刷新 |
+| 会话隔离 | 可按聊天、话题或群成员划分独立 Agent 会话 |
+| 多 Agent 协作 | 多个机器人拥有独立设置、凭据和 session，可以在同一个群里对话与交接任务 |
+| 斜杠命令 | 宿主自带的命令（`/plan`、`/compact`、`/permission` 等）直接进入 DSH 命令运行时 |
+
+## 常用命令
+
+| 命令 | 用途 |
+|---|---|
+| `/status` | 查看并刷新工作区、模型和 session；可用时包含上下文与 token 状态 |
+| `/ws` | 查看可用工作区 |
+| `/cd <名称或路径>` | 切换工作区 |
+| `/model` | 打开模型选择卡片 |
+| `/model use <provider/model>` | 直接切换模型 |
+| `/model reset` | 恢复默认模型 |
+| `/new` | 原地开一个新会话，清空上下文，工作区和模型保持不变 |
+| `/stop` | 停止当前任务 |
+| `/help` | 查看全部命令（含宿主提供的） |
+
+## 日常运行
+
+macOS 和采用 systemd 的 Linux 会使用用户级后台服务，关闭终端后仍可运行：
+
+```sh
+dsh-lark-channel status
+dsh-lark-channel logs -f
+dsh-lark-channel restart
+dsh-lark-channel stop
+```
+
+用 `npx` 启动的话，这些命令同样要带 `npx dsh-lark-channel@latest` 前缀——工具会按你实际的启动方式打印提示，读到什么就能直接粘贴。
+
+升级：
+
+```sh
+dsh-lark-channel upgrade
+```
+
+它会装上最新的 CLI 并在新版本上重启机器人。用 npx 的话不需要这一步，`npx dsh-lark-channel@latest start` 本来就是最新。有新版本时，`start` 和 `status` 会顺带提醒你一行。
+
+连接异常时，插件会在限额和退避控制下自动重建 WebSocket，避免进程仍在但机器人已经静默离线。
+
+### 添加更多 Agent
+
+给第二个飞书应用添加一套独立的 Agent：
+
+```sh
+dsh-lark-channel add reviewer
+```
+
+命令会写入新实例、重启服务并显示二维码。扫码后，这个机器人拥有自己的设置、App Secret 和 session，不会与第一个机器人共享上下文。
+
+把两个机器人加入同一个群后，它们可以通过 @ 把回合交给对方。例如，让一个 Agent 完成修改后 @ 另一个 Agent 复核，后者也可以 @ 回去要求调整。默认最多连续进行 6 个机器人轮次；任何人发言都会恢复额度。需要移除时：
+
+```sh
+dsh-lark-channel remove reviewer
+```
+
+移除会保留该实例的凭据和设置，之后用同一个名字重新添加即可恢复。
+
+如果希望飞书和 `dsh web` 共用同一个 profile：
 
 ```sh
 dsh plugin --profile web add dsh-lark-channel@latest
 dsh web
 ```
 
-The same command upgrades; restart `dsh web` after.
-
-The model key comes from the Settings → Models page under `web`, and from `DEEPSEEK_API_KEY` or the managed `$DSH_HOME/.credentials.yaml` anywhere else.
-
 <details>
-<summary>Composition details, the QR window, and the invariant row</summary>
+<summary>权限与高级选项</summary>
 
-The package manifest declares `dsh.bundle.patch: ./cordis.patch.yml`; installing it into a profile applies the patch rows over the profile composition. Credentials may use `!!js process.env.…` in the patch.
-
-A code expires after the window the platform states, and an unscanned one is replaced automatically, so coming back later still finds a usable code; a refusal or a rejected request stops the flow with its reason and needs a restart to try again. To reset stored credentials, remove the `lark-channel` section from the settings document, whose path prints via the host settings surface; the settings layer overrides entry-config values while present.
-
-The invariant companion row is not part of the default patch: the shipped `web` profile composes no `invariants` service, and a row waiting on an absent service fails the whole tree at boot. `cordis.patch.yml` documents the diagnostic-composition row.
+- 飞书应用的可用范围决定谁能找到机器人；`senderAllowlist`、`groupAllowlist` 和 `approvers` 可以进一步收窄权限。
+- `workspaceRoots` 可以限制聊天中允许切换到的目录。
+- `sessionScope` 支持 `chat`、`chat-thread` 和 `chat-sender` 三种会话粒度。
+- `instance` 用于命名额外的机器人实例；第一个机器人保持未命名，以兼容已有设置和会话。
+- `botPeers` 可以限制允许对话的机器人，`botHops` 控制连续机器人轮次，默认是 6。
+- 会改变状态的卡片绑定原聊天，转发到其他聊天后不能操作原会话。
+- 部署提供 credentials 服务时，扫码得到的 App Secret 会存入其中；旧版本写在 settings 中的 secret 会在下次启动时自动迁移。
+- 图片附件默认关闭；只有确认当前模型支持视觉时，才应开启 `attachImages`。
+- 配置在启动时读取，修改后需要重启服务。
 
 </details>
 
-## Configuration
+## 环境要求
 
-| Field | Default | Meaning |
-|---|---|---|
-| `appId`, `appSecret` | first-boot QR onboarding | Lark/Feishu app credentials. Layering below. |
-| `domain` | Feishu | Open-platform domain; set `https://open.larksuite.com` for Lark. |
-| `cwd` | host process cwd | Absolute workspace directory for chat-driven agents; the default a `/cd` can always return to. |
-| `workspaceRoots` | `[]` | Directory prefixes `/cd` may point a conversation at; empty allows any existing directory. The deployment default is always reachable. |
-| `chatWorkspaces` | `{}` | Managed state, not configuration: the directory each conversation was `/cd`-ed to, written back through the settings service. |
-| `chatModels` | `{}` | Managed state, not configuration: the `provider/model` route each conversation asked for via `/model use`. |
-| `provider`, `model` | host `agentDefaultModel` | Model route for chat agents. |
-| `preset` | roster default | Agent preset chat agents join, when the deployment composes a roster. |
-| `sessionScope` | `chat` | Which conversation facet owns one agent session: `chat` (one shared agent per chat), `chat-thread` (one per topic thread, so parallel topics stop overwriting each other's context), `chat-sender` (one per person in a shared chat). |
-| `output` | `cot` | `cot` (native thinking process + markdown answer) or `stream` (typewriter card per turn). |
-| `showProcess` | `true` | Show the agent's reasoning and tool calls; off sends the answer alone. |
-| `hideProcessWhenDone` | `false` | Let the platform drop the process once its run finishes (`cot` only). |
-| `attachImages` | `false` | Pass images on to the model. Only for a route that accepts them: one rejected image ends the conversation. |
-| `syncSlashCommands` | `true` | Register the chat's commands on the bot so Feishu offers them when a user types `/`. |
-| `instance` | — | Names this row when a deployment composes more than one bot, keying its settings, its app-secret credential, and its session ids apart. Leave it unset on the first row: an unnamed row keeps the original identifiers. |
-| `denyTools` | `[]` | Tools chat agents may not call, denied per agent at execution. Empty by default: the human-interaction tools are shadowed and answered here rather than denied. A name added here still wins over its shadow. |
-| `botPeers` | `[]` | Restrict which bots this channel answers, so two agents in one room can talk. Empty narrows nothing, like every other list here; each bot that speaks is named once per chat on the console. |
-| `botHops` | `6` | Consecutive bot-sourced turns one conversation may run before the channel stops answering. A human message refills it. |
-| `requireMention` | `true` | In group chats, only respond when @-mentioned. |
-| `senderAllowlist` | `[]` | Open ids allowed to send direct messages; empty serves anyone the app is visible to. |
-| `groupAllowlist` | `[]` | When non-empty, only these `oc_…` group chats are served; empty serves any group. |
-| `approvers` | `[]` | Open ids allowed to answer approvals; empty lets whoever may drive that chat answer. |
+- Node.js `^22.19.0 || >=24`
+- DeepSeek Harness `0.1.0-rc.6` 或更新版本
+- 飞书或 Lark 租户
 
-With nothing configured the channel serves any room the bot is added to and anyone the app is visible to. Restricting further is the deployment's call: the platform already decides who can reach the bot, and this plugin only narrows what that admits.
+原生思考过程需要飞书 PC 7.70、移动端 7.74 或更新版本；旧客户端可以使用 `output: 'stream'`。
 
-Credentials resolve in three layers, each overriding the one before it: entry config in the composition patch, typically `!!js process.env.LARK_APP_ID`; the `lark-channel` section of the settings document, which wins while present; and first-boot QR onboarding when neither carries one, whose result persists through the host `settings` service.
-
-Configuration is read once at startup, see [Limitations](#limitations).
-
-## Behavior
-
-The repository is self-contained: it builds against the published `@deepseek-ai/cordis` and `@deepseek-ai/schemastery` packages, never a host source checkout, and reaches host services (`agents`, `agentPresets`, `agentDefaultModel`, `settings`, `invariants`, `loader`) through narrow local contracts in `src/host.ts`. Every registration is owned by the plugin fiber; disposal disconnects the transport, disposes every chat agent, and settles open approval cards as `cancelled`.
-
-<details>
-<summary>Inbound</summary>
-
-Each `message` event is routed to the conversation `sessionScope` selects — the chat, one topic thread, or one sender within a chat. The session id is derived from that key (`lark-<key>`), so it is stable across restarts: the channel adopts a live agent, resumes a stored session, or creates one, in that order. Later messages become `agent.followup()` turns.
-
-Group messages are prefixed with the sender name so the model can tell voices apart. Messages a bot authored, and mentions carrying no text, are skipped after the authorization check.
-
-</details>
-
-<details>
-<summary>Outbound</summary>
-
-`cot` (default) shows the process the way the platform's own agents do — a native thinking-process message carrying reasoning, each tool call with an icon from its kind, and each result as a code block — while the answer is sent as an ordinary markdown message, which is where the platform says a final answer belongs. It needs a client new enough to render one (PC 7.70, mobile 7.74); `stream` keeps the whole turn in one typewriter card for older clients. `showProcess` turns the process off in either mode, leaving the answer alone, and `hideProcessWhenDone` lets the platform drop a finished process. When the platform refuses to open one, the answer still arrives.
-
-Tool activity is labelled from each tool's own `presentCall` title, the label the host's own surfaces show, falling back to the model's `description` argument and then the bare name; its declared kind picks the icon.
-
-</details>
-
-<details>
-<summary>Slash commands</summary>
-
-A line beginning with `/` is a control, not a prompt — the host runs it without a model turn, so whatever commands the deployment composed — `/compact`, `/plan`, `/permission`, `/export` and the rest — reach the runtime instead of the model reading them as prose. `/stop` cancels the running turn (cancellation is an agent method, not a registered command) and `/help` lists what the chat accepts. `/cd` and `/ws` are also the channel's own and need no agent at all, so a `/cd` in a fresh chat switches the directory without first spending a session on the one it is leaving. An unresolved name is named as unknown with that listing rather than handed to the model.
-
-On first use the channel also registers those commands on the bot itself (`syncSlashCommands`), so Feishu offers them when a user types `/`. The sync reconciles: it adds what the panel is missing and removes what the channel no longer offers, so the menu never offers a command that answers "unknown". A deployment that curates its own menu turns the sync off.
-
-</details>
-
-<details>
-<summary>Images</summary>
-
-A screenshot is how someone shows a problem, so with `attachImages` on, images are downloaded and committed to the host attachment store and ride the user message as opaque references. Bounds come from that store: count, per-image and per-message bytes, accepted media types.
-
-It is off by default because a route that cannot take images rejects the whole request, the image is in the session log by then, and every later request resends it — compaction included — so one screenshot ends that conversation for good. The host exposes no way to ask a route whether it accepts images, so a deployment on a vision route turns this on. An image that cannot be attached leaves a note in the text rather than vanishing — otherwise the model answers as though it had seen one.
-
-</details>
-
-<details>
-<summary>Approvals</summary>
-
-`approval/request` questions for agents owned by this plugin become an interactive card with 允许一次 / 拒绝 buttons; the click settles the host outcome (`allowed-once` / `rejected`), the card is rewritten with the decision, and a withdrawn question settles `cancelled`. Questions about other agents delegate to the next composed answerer.
-
-The listener is registered **prepended**, which is load-bearing when the Web app is composed alongside: its BFF claims every audited approval and never delegates, so in arrival order a chat-driven approval would surface in a browser nobody is watching while the chat waited forever.
-
-The card shows the exact arguments the call would run, bounded, and renders every model-authored value (that command, the justification) as `plain_text` so neither can pose as the card's own markup. Whoever may drive a chat may answer its approvals — in a group, the room — and the settled card names who decided. Set `approvers` when an escalation should need a named human; a click from another chat never counts.
-
-</details>
-
-<details>
-<summary>Authorization</summary>
-
-The platform owns the outer boundary, and this plugin narrows rather than gates. Who in the tenant can open a conversation with the bot at all is the app's **visibility scope**, set in the developer console — that is the authorization decision for direct messages, and duplicating it here would only add friction. A group is a room someone deliberately put the bot in, so the gate there is which rooms.
-
-Every list is empty by default: `senderAllowlist` narrows direct senders, `groupAllowlist` narrows rooms, `approvers` narrows who may answer an escalation. A refused message is ignored silently in the chat and named on the operator console — answering would make the bot an oracle for who is allowed. The transport policy is narrowed to match whatever is configured, so restricted traffic stops before reaching this process.
-
-</details>
-
-<details>
-<summary>Human interaction</summary>
-
-`ctx.userQuestions` takes exactly ONE provider per context, and a composed Web app's BFF claims it for every agent-owned question.
-
-`ask_user_question` therefore does not go through that seam: this channel registers a tool of the same name in each chat agent's OWN layer, shadowing it. The host's layered registry resolves the nearest one, and reserves exactly one name (`run_code`) from being shadowed — so overriding this one is a first-class capability rather than a trick. The question becomes a card: the model's options render as buttons, a click answers it, and when none of them fit an ordinary reply is the answer and does not start another turn. A turn cancelled by `/stop`, a released session, or thirty minutes without an answer settles the question empty and repaints the card as cancelled, so a turn is never hung on one. A registry too old to expose `register` falls back to denying the tool.
-
-`exit_plan_mode` is shadowed on the same terms, wherever a plan service exists to leave plan mode afterwards. The plan itself is sent as an ordinary chat message rather than card content — it is markdown a model wrote, and model text inside a card renders literally, which would strip a plan of the headings and lists that make it readable — and the card that follows carries only the decision. Approval calls the plan service's own public switch, so the state transition stays the host's rather than a copy of it. Answering with words instead returns them to the model as feedback to revise against; dismissing the review tells the model to stop and wait rather than present again.
-
-Neither shadow silences the fallback: a registry too old to take a per-agent registration re-denies the tool, and the prompt sentence naming what is unavailable appears only when something actually is.
-
-</details>
-
-<details>
-<summary>Composition and workspace grouping</summary>
-
-Each chat agent joins an agent preset (`preset`, default the roster's own default) inside creation `setup`. A deployment with a preset roster keeps every model-facing row on the agent plane, so an agent that joins nothing would reach the model with NO tools — and a model with no tools emits its native tool-call markup as plain text instead of calling anything. An unknown preset fails the creation and is reported to the chat rather than running a toolless session.
-
-Chat sessions are accounted under the workspace record for their directory, registering it when none exists, because host grouping is an account rather than a cwd derivation — an unattached session shows under the GUI's Ungrouped bucket however its cwd reads. The session's cwd is the workspace's own canonical path, which is the value `attachSession` validates against. A registry that refuses the directory only costs grouping; the chat still runs.
-
-</details>
-
-## Limitations
-
-- Configuration is read once at startup. Both layers work, the composition patch and the `lark-channel` section of the settings document, the latter winning, but neither is watched, so a change to `output`, `showProcess`, or the authorization fields applies on the next start.
-- Chat agents live until plugin disposal; idle eviction is deferred, so a long-running channel holds one agent per conversation it has served.
-- A restart resumes a stored conversation, but nothing that arrived while the process was down is replayed: the transport offers no cursor.
-- Files and audio are passed through as the SDK's normalized text only; a file's right home is usually the workspace an agent can already read, not the request. Images are the exception: they are downloaded and attached.
-- The model sees group messages as `sender: text` single-user turns; there is no per-sender identity beyond the prefix.
-- Human-interaction tools are answered by shadowing them per agent, not by owning the `userQuestions` seam: a deployment whose tool registry cannot take a per-agent registration denies them instead, and a plan review needs a composed plan service to leave plan mode afterwards.
-
-## Development
+## 开发
 
 ```sh
 pnpm install
-pnpm run typecheck
 pnpm test
-pnpm run build
+pnpm build
 ```
-
-Tests run against a fake transport port and a fake `agents` registry (`tests/harness.ts`); no Lark credentials are needed. The production transport is substituted through `internals.createPort` in `src/runtime.ts`. Contributor constraints are in [AGENTS.md](AGENTS.md).
 
 ## License
 
 [BSD-3-Clause](LICENSE)
+
+本项目是非官方社区插件，与 DeepSeek、飞书或 Lark 不存在隶属、授权或背书关系。

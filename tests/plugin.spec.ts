@@ -710,10 +710,10 @@ describe('dsh-lark-channel', () => {
       const harness = await mountChannel({}, { commands: createFakeCommands().service })
       // A command dropped from the channel used to stay in the menu and answer
       // "unknown command" for everyone who picked it.
-      harness.fake.panelCommands.push('new')
+      harness.fake.panelCommands.push('retired')
       await harness.fake.emitMessage(fakeMessage())
-      await vi.waitFor(() => { expect(harness.fake.panelDeleted).toContain('new') })
-      expect(harness.fake.panelCreated).not.toContain('new')
+      await vi.waitFor(() => { expect(harness.fake.panelDeleted).toContain('retired') })
+      expect(harness.fake.panelCreated).not.toContain('retired')
       await harness.dispose()
     })
 
@@ -1817,6 +1817,27 @@ describe('dsh-lark-channel', () => {
       const painted = (response as { card: { data: object } }).card
       // Repainted from live state, not from what the card said when it was sent.
       expect(cardTexts(painted.data).some((text) => text.content.includes('尚未创建'))).toBe(false)
+      await harness.dispose()
+    })
+
+    it('runs /new: a fresh session id, the old agent released, settings kept', async () => {
+      const store = createFakeSettings()
+      const harness = await mountChannel({}, { settings: store.settings })
+      await harness.fake.emitMessage(fakeMessage({ content: 'first' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      expect(harness.agents.created[0]!.sessionId).toBe('lark-oc_chat_1')
+
+      await harness.fake.emitMessage(fakeMessage({ content: '/new' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已开新会话') })
+      // No agent is built to answer the command itself.
+      expect(harness.agents.created).toHaveLength(1)
+      expect(store.updates).toContainEqual({ chatEpochs: { 'lark-oc_chat_1': '1' } })
+
+      await harness.fake.emitMessage(fakeMessage({ content: 'second' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(2) })
+      // A different session, so the context starts empty — and the first one
+      // is still on disk, merely not what this conversation resolves to.
+      expect(harness.agents.created[1]!.sessionId).toBe('lark-oc_chat_1--e1')
       await harness.dispose()
     })
 

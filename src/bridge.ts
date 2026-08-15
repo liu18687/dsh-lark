@@ -55,6 +55,7 @@ import { refuseApprovalClick, refuseMessage } from './authorization.ts'
 import type { Authorization } from './authorization.ts'
 import { commandName, HELP_COMMAND, isCommandLine, runCommandLine, STOP_COMMAND } from './commands.ts'
 import { CD_COMMAND, ChatWorkspaces, runWorkspaceCommand, WS_COMMAND } from './workspace.ts'
+import { ChatEpochs, NEW_COMMAND, runNewCommand } from './epoch.ts'
 import {
   ChatModels,
   formatRoute,
@@ -490,6 +491,12 @@ export function installBridge(
   const defaultCwd = resolve(config.cwd ?? process.cwd())
 
   /** Which directory each conversation runs in, and the session id that pair owns. */
+  const chatEpochs = new ChatEpochs({
+    entries: config.chatEpochs,
+    persist: persistState,
+    report: notify,
+  })
+
   const chatWorkspaces = new ChatWorkspaces({
     defaultPath: defaultCwd,
     entries: config.chatWorkspaces,
@@ -499,6 +506,9 @@ export function installBridge(
     // Every session id this row derives carries its own prefix, so two bots
     // invited to one group drive two agents rather than fighting over one.
     sessionPrefix: instanceIdentity(config.instance).sessionPrefix,
+    // A conversation that started over derives a further id; one that never
+    // did derives exactly what it always did.
+    epochOf: baseId => chatEpochs.epochOf(baseId),
     // The host registry's listing, read fresh per use: every workspace this
     // human already uses with the host is a `/cd` destination worth offering.
     known: () => {
@@ -895,6 +905,7 @@ export function installBridge(
       { name: WS_COMMAND, description: '查看可用工作区' },
       { name: MODEL_COMMAND, description: '查看或切换本会话模型' },
       { name: STATUS_COMMAND, description: '查看本会话状态' },
+      { name: NEW_COMMAND, description: '开一个新会话，清空上下文' },
       { name: HELP_COMMAND, description: '显示可用命令' },
     ]
     void syncSlashPanel(port, desired, notify).then(({ added, removed }) => {
@@ -1087,6 +1098,7 @@ export function installBridge(
     if (
       channelCommand === CD_COMMAND || channelCommand === WS_COMMAND
       || channelCommand === MODEL_COMMAND || channelCommand === STATUS_COMMAND
+      || channelCommand === NEW_COMMAND
     ) {
       try {
         const key = conversation
@@ -1104,6 +1116,8 @@ export function installBridge(
         let reply: { markdown: string } | { card: object }
         if (channelCommand === CD_COMMAND || channelCommand === WS_COMMAND) {
           reply = { markdown: await runWorkspaceCommand(channelCommand, msg.content, key, chatWorkspaces, release) }
+        } else if (channelCommand === NEW_COMMAND) {
+          reply = { markdown: await runNewCommand(chatWorkspaces.baseSessionIdFor(key), chatEpochs, release) }
         } else if (channelCommand === MODEL_COMMAND) {
           reply = await runModelCommand(msg.content, subject, chatModels, {
             catalog: modelCatalog,

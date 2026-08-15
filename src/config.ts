@@ -72,6 +72,12 @@ export interface Config {
    * the same empty-string default marker as {@link chatWorkspaces}.
    */
   chatModels?: Record<string, string>
+  /**
+   * Managed state, not configuration: how many times each conversation has
+   * started over with `/new`, keyed by the session id it derives at epoch
+   * zero. Absent is the first session, whose id is unchanged.
+   */
+  chatEpochs?: Record<string, string>
   /** Provider route override for chat agents; defaults to the host `agentDefaultModel` selection. */
   provider?: string
   /** Model id override for chat agents; defaults to the host `agentDefaultModel` selection. */
@@ -193,6 +199,7 @@ export interface ResolvedConfig {
   workspaceRoots: string[]
   chatWorkspaces: Record<string, string>
   chatModels: Record<string, string>
+  chatEpochs: Record<string, string>
   provider?: string | undefined
   model?: string | undefined
   preset?: string | undefined
@@ -222,6 +229,7 @@ export const Config: z<Config> = z.object({
   workspaceRoots: z.array(String),
   chatWorkspaces: z.dict(String).default({}),
   chatModels: z.dict(String).default({}),
+  chatEpochs: z.dict(String).default({}),
   provider: z.string(),
   model: z.string(),
   preset: z.string(),
@@ -251,6 +259,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
     workspaceRoots: config.workspaceRoots ?? [],
     chatWorkspaces: config.chatWorkspaces ?? {},
     chatModels: config.chatModels ?? {},
+    chatEpochs: config.chatEpochs ?? {},
     sessionScope: config.sessionScope ?? 'chat',
     output: config.output ?? 'cot',
     showProcess: config.showProcess ?? true,

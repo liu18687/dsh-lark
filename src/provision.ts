@@ -29,7 +29,7 @@ import { spawnSync } from 'node:child_process'
 import { accessSync, chmodSync, constants, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { open } from 'node:fs/promises'
 import { homedir, userInfo } from 'node:os'
-import { delimiter, dirname, join, resolve } from 'node:path'
+import { delimiter, dirname, join, resolve, sep } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { ownVersion } from './version.ts'
 import { instanceIdentity, refuseInstanceName } from './instance.ts'
@@ -53,6 +53,7 @@ export const LOG_TRUNCATE_BYTES = 10 * 1024 * 1024
 export type Command =
   | { readonly kind: 'start'; readonly profile: string; readonly workspace: string }
   | { readonly kind: 'add' | 'remove'; readonly profile: string; readonly name: string }
+  | { readonly kind: 'upgrade'; readonly profile: string; readonly workspace: string }
   | { readonly kind: 'stop' | 'restart' | 'status' }
   | { readonly kind: 'logs'; readonly follow: boolean }
   | { readonly kind: 'help' }
@@ -78,7 +79,30 @@ export interface ServiceSpec {
 }
 
 /** Usage text, printed for `help`. */
-export const USAGE = `dsh-lark-channel — Lark/Feishu IM bot channel for DeepSeek Harness
+/**
+ * How to spell this command back to the person running it.
+ *
+ * Run through `npx`, the binary lives in a throwaway cache and no bare
+ * `dsh-lark-channel` exists on the PATH — so telling that person to run one is
+ * telling them to run something that does not work. Told the form they
+ * actually used, both kinds of user can copy what they read.
+ *
+ * The alternative — installing ourselves globally so the bare name always
+ * works — is a machine-wide change nobody asked for, with its own permission
+ * and version-manager failures, made in service of a shorter string.
+ * @param scriptPath - the running script; defaults to this process's.
+ * @returns the command prefix to print.
+ */
+export function invocation(scriptPath: string = process.argv[1] ?? ''): string {
+  return scriptPath.includes(`${sep}_npx${sep}`) ? 'npx dsh-lark-channel@latest' : 'dsh-lark-channel'
+}
+
+/** Usage text, spelled for the way this process was started. */
+export function usage(self: string = invocation()): string {
+  return USAGE.replaceAll('dsh-lark-channel ', `${self} `)
+}
+
+const USAGE = `dsh-lark-channel — Lark/Feishu IM bot channel for DeepSeek Harness
 
   dsh-lark-channel start [--profile <name>] [--workspace <dir>]
       Provision a profile, run it in the background under launchd or
@@ -93,6 +117,10 @@ export const USAGE = `dsh-lark-channel — Lark/Feishu IM bot channel for DeepSe
   dsh-lark-channel remove <name>
       Take that bot out again. Its credential and settings stay, so adding
       the same name back reaches the same bot.
+
+  dsh-lark-channel upgrade
+      Install the newest CLI globally and restart the bot on it. Through
+      npx there is nothing to install: start already runs the newest.
 
   dsh-lark-channel stop        Stop the bot and remove it from the supervisor;
                                the profile and its credentials stay.
@@ -121,6 +149,27 @@ export { ownVersion }
 export function parseArguments(argv: readonly string[]): Command {
   const verb = argv[0]
   if (verb === 'help' || verb === '--help' || verb === '-h') return { kind: 'help' }
+  if (verb === 'upgrade') {
+    const rest = argv.slice(1)
+    let profile = DEFAULT_PROFILE
+    let workspace = process.cwd()
+    for (let index = 0; index < rest.length; index += 1) {
+      const flag = rest[index]
+      const value = rest[index + 1]
+      if (flag === '--profile') {
+        if (value === undefined) throw new Error('--profile needs a name')
+        profile = value
+        index += 1
+      } else if (flag === '--workspace') {
+        if (value === undefined) throw new Error('--workspace needs a directory')
+        workspace = resolve(value)
+        index += 1
+      } else if (flag !== undefined) {
+        throw new Error(`unknown option ${flag}`)
+      }
+    }
+    return { kind: 'upgrade', profile, workspace }
+  }
   if (verb === 'stop' || verb === 'restart' || verb === 'status') {
     if (argv.length > 1) throw new Error(`${verb} takes no options`)
     return { kind: verb }
@@ -143,7 +192,7 @@ export function parseArguments(argv: readonly string[]): Command {
       }
     }
     const name = names[0]
-    if (name === undefined || names.length > 1) throw new Error(`${verb} takes one bot name, e.g. \`dsh-lark-channel ${verb} support\``)
+    if (name === undefined || names.length > 1) throw new Error(`${verb} takes one bot name, e.g. \`${invocation()} ${verb} support\``)
     return { kind: verb, profile, name }
   }
   if (verb === 'logs') {
@@ -410,7 +459,7 @@ function guiDomain(): string {
 function requireSupervisor(): 'launchd' | 'systemd' {
   const kind = supervisorKind()
   if (kind === undefined) {
-    throw new Error('no launchd or systemd on this system — the bot runs in the foreground via `dsh-lark-channel start`')
+    throw new Error(`no launchd or systemd on this system — the bot runs in the foreground via \`${invocation()} start\``)
   }
   return kind
 }
@@ -672,7 +721,7 @@ async function addBot(profile: string, name: string): Promise<void> {
   if (refusal !== undefined) throw new Error(refusal)
   const path = patchPath(profile)
   if (!existsSync(path)) {
-    throw new Error(`no profile at ${dirname(path)} — run \`dsh-lark-channel start\` first`)
+    throw new Error(`no profile at ${dirname(path)} — run \`${invocation()} start\` first`)
   }
   const added = withInstanceRow(readFileSync(path, 'utf8'), name)
   if (added === undefined) process.stderr.write(`dsh-lark-channel: bot ${name} is already configured — restarting to finish it\n`)
@@ -707,6 +756,91 @@ async function removeBot(profile: string, name: string): Promise<void> {
   process.stderr.write(`dsh-lark-channel: bot ${name} removed — its credential and settings stay, so adding it back reaches the same bot\n`)
 }
 
+/** How long a version check may hold up a command before it is abandoned. */
+const VERSION_CHECK_MS = 2500
+
+/**
+ * The newest published version, or undefined when the check cannot answer.
+ *
+ * Deliberately toothless: a registry that is slow, offline, or unreachable
+ * must cost this command nothing, because every caller is doing something
+ * else — starting a bot, reading a log — and a version notice is a courtesy.
+ * @param timeoutMs - how long to wait before giving up.
+ * @returns the version string, or undefined.
+ */
+export async function latestVersion(timeoutMs: number = VERSION_CHECK_MS): Promise<string | undefined> {
+  try {
+    const response = await fetch('https://registry.npmjs.org/dsh-lark-channel/latest', {
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: { accept: 'application/vnd.npm.install-v1+json' },
+    })
+    if (!response.ok) return undefined
+    const body = await response.json() as { version?: unknown }
+    return typeof body.version === 'string' ? body.version : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Compare two `major.minor.patch` versions, ignoring anything after them.
+ * @param left - the version to judge.
+ * @param right - the version to judge it against.
+ * @returns true when `left` is strictly newer.
+ */
+export function isNewer(left: string, right: string): boolean {
+  const parts = (version: string): number[] =>
+    version.split('-')[0]?.split('.').map(part => Number.parseInt(part, 10) || 0) ?? []
+  const [a, b] = [parts(left), parts(right)]
+  for (let index = 0; index < 3; index += 1) {
+    const [one, two] = [a[index] ?? 0, b[index] ?? 0]
+    if (one !== two) return one > two
+  }
+  return false
+}
+
+/**
+ * Tell the operator a newer release exists, once, without getting in the way.
+ *
+ * The trap this exists for is specific to a globally installed CLI: `start`
+ * pins the plugin to the CLI's OWN version, so someone who upgrades by
+ * re-running `start` alone re-pins the version they already had and sees
+ * nothing to tell them so.
+ * @param self - how this command spells itself.
+ */
+async function noteNewerRelease(self: string = invocation()): Promise<void> {
+  const latest = await latestVersion()
+  if (latest === undefined || !isNewer(latest, ownVersion())) return
+  process.stderr.write(
+    `dsh-lark-channel: ${latest} is out (running ${ownVersion()}) — upgrade with \`${self} upgrade\`\n`,
+  )
+}
+
+/**
+ * Upgrade the CLI and the plugin together, in one command.
+ *
+ * Explicitly, never as a side effect: installing globally touches a
+ * machine-wide namespace, which is the caller's decision to make. Through
+ * npx there is nothing to install — the next `start` already resolves the
+ * newest — so it says that instead of pretending to work.
+ */
+async function upgrade(profile: string, workspace: string): Promise<void> {
+  if (invocation() !== 'dsh-lark-channel') {
+    process.stderr.write(
+      'dsh-lark-channel: nothing to upgrade through npx — `npx dsh-lark-channel@latest start`'
+      + ' already runs the newest, plugin included\n',
+    )
+    return
+  }
+  process.stderr.write('dsh-lark-channel: installing the newest CLI globally\n')
+  must(['npm', 'install', '-g', 'dsh-lark-channel@latest'])
+  // Re-exec rather than continue: the version that provisions the profile has
+  // to be the version just installed, and this process is still the old one.
+  process.stderr.write('dsh-lark-channel: restarting the bot on the new version\n')
+  const code = passthrough(['dsh-lark-channel', 'start', '--profile', profile, '--workspace', workspace])
+  process.exitCode = code
+}
+
 /** Provision, supervise, and stay attached for the first-run scan. */
 async function start(profile: string, workspace: string): Promise<void> {
   const dsh = requireDsh()
@@ -728,6 +862,9 @@ async function start(profile: string, workspace: string): Promise<void> {
 
   if (onboarded) {
     process.stderr.write('dsh-lark-channel: already onboarded — DM the bot or @-mention it in a group\n')
+    // Last, and only for a bot that is already up: a version notice must
+    // never stand between someone and their QR code.
+    await noteNewerRelease()
     return
   }
 
@@ -750,7 +887,7 @@ function stop(): void {
   else quiet(['systemctl', '--user', 'disable', '--now', 'dsh-lark.service'])
   rmSync(unitPath(), { force: true })
   if (kind === 'systemd') quiet(['systemctl', '--user', 'daemon-reload'])
-  process.stderr.write('dsh-lark-channel: stopped — `dsh-lark-channel start` brings it back\n')
+  process.stderr.write(`dsh-lark-channel: stopped — \`${invocation()} start\` brings it back\n`)
 }
 
 /**
@@ -762,7 +899,7 @@ function stop(): void {
 async function restart(): Promise<void> {
   const kind = requireSupervisor()
   if (!existsSync(unitPath())) {
-    throw new Error('nothing is installed — run `dsh-lark-channel start` first')
+    throw new Error(`nothing is installed — run \`${invocation()} start\` first`)
   }
   if (kind === 'launchd') {
     const kicked = spawnSync('launchctl', ['kickstart', '-k', `${guiDomain()}/${SERVICE_LABEL}`], { stdio: 'ignore' })
@@ -783,7 +920,7 @@ async function restart(): Promise<void> {
  */
 async function logs(follow: boolean): Promise<void> {
   if (!existsSync(logPath())) {
-    process.stderr.write(`dsh-lark-channel: no log yet at ${logPath()} — has \`dsh-lark-channel start\` run?\n`)
+    process.stderr.write(`dsh-lark-channel: no log yet at ${logPath()} — has \`${invocation()} start\` run?\n`)
     process.exitCode = 1
     return
   }
@@ -805,7 +942,7 @@ function status(): void {
   const kind = requireSupervisor()
   if (kind === 'launchd') {
     if (!isLoaded()) {
-      process.stderr.write('dsh-lark-channel: not running — `dsh-lark-channel start` brings it up\n')
+      process.stderr.write(`dsh-lark-channel: not running — \`${invocation()} start\` brings it up\n`)
       process.exitCode = 3
       return
     }
@@ -820,14 +957,18 @@ function status(): void {
  * @param command - what the operator asked for.
  */
 export async function execute(command: Command): Promise<void> {
-  if (command.kind === 'help') process.stdout.write(USAGE)
+  if (command.kind === 'help') process.stdout.write(usage())
   else if (command.kind === 'start') await start(command.profile, command.workspace)
+  else if (command.kind === 'upgrade') await upgrade(command.profile, command.workspace)
   else if (command.kind === 'add') await addBot(command.profile, command.name)
   else if (command.kind === 'remove') await removeBot(command.profile, command.name)
   else if (command.kind === 'stop') stop()
   else if (command.kind === 'restart') await restart()
   else if (command.kind === 'logs') await logs(command.follow)
-  else status()
+  else {
+    status()
+    await noteNewerRelease()
+  }
 }
 
 /**

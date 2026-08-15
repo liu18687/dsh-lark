@@ -6,5 +6,5 @@
 - Keep host-provided runtime APIs as peer dependencies and resolve development imports from this repository's declared dependencies.
 - Do not add source, configuration, documentation, project-reference, `link:`, or `file:` paths that leave this repository.
 - Describe repository files with project-root paths; never use parent-directory navigation in documentation.
-- Update `README.md`, `README.zh.md`, configuration JSDoc, tests, and `cordis.patch.yml` together when behavior changes.
+- Update `README.md`（中文，默认展示）、`README.en.md`, configuration JSDoc, tests, and `cordis.patch.yml` together when behavior changes.
 - Run `pnpm run typecheck`, `pnpm test`, `pnpm run build`, and `pnpm run prepare` before publishing changes.

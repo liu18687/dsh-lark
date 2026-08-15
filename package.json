@@ -47,9 +47,10 @@
     "./package.json": "./package.json"
   },
   "files": [
+    "README.en.md",
+    "cordis.patch.yml",
     "lib",
-    "src",
-    "cordis.patch.yml"
+    "src"
   ],
   "license": "BSD-3-Clause",
   "repository": {
