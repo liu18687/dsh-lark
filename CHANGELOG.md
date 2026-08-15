@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.6 — 2026-08-15
 
 ### Added
 - `dsh-lark-channel upgrade` installs the newest CLI and restarts the bot on it, in one command. `start` pins the plugin to the CLI's OWN version, so a globally installed CLI upgraded by re-running `start` alone would silently re-pin the version it already had; `start` and `status` now also mention a newer release when one exists. Through npx there is nothing to install and the command says so instead of pretending.
@@ -15,6 +15,7 @@
 - The app secret is stored through the host `credentials` seam instead of the user settings document. Onboarding writes the scanned secret to the credential `LARK_APP_SECRET` and keeps only a reference in settings; a secret already sitting in the settings document moves behind that reference on the next boot, so an existing deployment is repaired by restarting rather than by scanning again. A deployment that injects `appSecret` in its composition still owns it, and one with no credentials provider composed keeps working exactly as before.
 
 ### Fixed
+- A profile is never pushed back to an older plugin. `start` pinned the profile to the CLI's own version unconditionally, so installing an older CLI and running it downgraded a working bot — and a bot downgraded past the credential migration finds a settings section it cannot read, connects to nothing, and quietly asks to be set up again. Both `start` and `add` now refuse, naming the two versions and the upgrade.
 - `upgrade`, `add`, and `remove` act on the service that is installed rather than on a default. Each read the profile from a constant and the workspace from the current directory, so `upgrade` run in `/tmp` rewrote a `--profile web --workspace /repo` service into `lark` and `/tmp`, and `add` edited a profile nobody was running. The installed unit already records both, so it is read back from there, and an explicit `--profile` / `--workspace` still wins.
 - `add` brings the profile's plugin to the CLI's exact version before writing a row. The row names an `instance`, an option only a new enough plugin has; an older one rejects the whole row and takes the bot down with it — so a new CLI could break a profile it had not updated.
 - A question the model marked `multi_select` can now be answered with more than one option. Its card was built from single-choice controls, so the first press settled a question that may take three answers; it now renders a form whose multi-select submits the chosen set in one action, carrying option positions rather than labels. A submission that names nothing leaves the card live, and typing an answer still works as it does for every other question.

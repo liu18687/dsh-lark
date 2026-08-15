@@ -486,6 +486,13 @@ function requireDsh(): string {
 
 /** Create the profile when absent, then install the matching plugin version into it. */
 function provision(dsh: string, profile: string, workspace: string): void {
+  const installed = installedPluginVersion(profile)
+  if (installed !== undefined && isNewer(installed, ownVersion())) {
+    throw new Error(
+      `profile ${profile} runs ${installed}, newer than this CLI (${ownVersion()}) — `
+      + 'upgrade the CLI first (`npm i -g dsh-lark-channel@latest`) rather than downgrading the bot',
+    )
+  }
   process.stderr.write(`dsh-lark-channel: provisioning profile ${profile}\n`)
   must([dsh, 'plugin', '--profile', profile, 'add', `dsh-lark-channel@${ownVersion()}`], workspace)
 }
@@ -782,6 +789,16 @@ function alignPluginVersion(profile: string): void {
   const version = ownVersion()
   const installed = installedPluginVersion(profile)
   if (installed === version) return
+  // Never backwards. A profile ahead of this CLI is a profile whose settings
+  // may already be written in a shape this build cannot read — the credential
+  // reference is exactly that — and installing over it produces a bot that
+  // runs, finds no credentials, and quietly asks to be set up again.
+  if (installed !== undefined && isNewer(installed, version)) {
+    throw new Error(
+      `profile ${profile} runs ${installed}, newer than this CLI (${version}) — `
+      + 'upgrade the CLI first (`npm i -g dsh-lark-channel@latest`), or pass --profile for another one',
+    )
+  }
   process.stderr.write(
     installed === undefined
       ? `dsh-lark-channel: installing the plugin ${version} into profile ${profile}\n`

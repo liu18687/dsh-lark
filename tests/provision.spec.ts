@@ -18,6 +18,7 @@ import {
   systemdUnit,
   whichSync,
   filterConsole,
+  installedPluginVersion,
   invocation,
   isNewer,
   latestVersion,
@@ -440,5 +441,21 @@ describe('acting on the service that is installed', () => {
     // falls back deliberately rather than silently moving the service.
     expect(readInstalledService('not a unit file', 'darwin')).toEqual({})
     expect(readInstalledService('[Service]\nExecStart=/bin/true\n', 'linux')).toEqual({})
+  })
+})
+
+describe('never downgrading a profile', () => {
+  it('reads the version a profile has installed', () => {
+    // Absent for a profile that has no plugin yet, which is the ordinary
+    // first-run state rather than a fault.
+    expect(installedPluginVersion('a-profile-that-does-not-exist')).toBeUndefined()
+  })
+
+  it('treats a profile ahead of the CLI as newer', () => {
+    // The comparison the guard makes: a bot already running 0.0.6 must not be
+    // pushed back to 0.0.5, whose settings shape predates the credential
+    // reference — it would run, find no credentials, and ask to be set up again.
+    expect(isNewer('0.0.6', ownVersion().replace(/^0\.0\.\d+/, '0.0.5'))).toBe(true)
+    expect(isNewer('0.0.5', '0.0.6')).toBe(false)
   })
 })
