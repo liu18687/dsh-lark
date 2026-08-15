@@ -14,6 +14,12 @@ import type { Context } from '@deepseek-ai/cordis'
 export interface HostSession {
   /** The session id shared by the agent registry and session log. */
   readonly id: string
+  /**
+   * The session log, which several host services fold their own state out of
+   * rather than mirroring it. Read-only here: this plugin folds plan mode from
+   * it to know whether a plan review is even meaningful.
+   */
+  readonly events?: readonly HostSessionEvent[]
 }
 
 /** Durable metadata for one stored image, from {@link HostAttachments.saveImage}. */
@@ -134,6 +140,17 @@ export interface HostTools {
    * with that reason, and no other guard can force-allow what one denied.
    */
   guard(guard: (execution: { readonly name: string }) => string | undefined): () => void
+  /**
+   * Register a tool definition, returning its disposer. Through an agent's
+   * scoped context the registration is that agent's alone, and a name already
+   * present in an outer layer is SHADOWED rather than rejected — the registry
+   * reserves exactly one name from shadowing (`run_code`), which makes
+   * overriding any other an intended capability rather than a trick.
+   *
+   * Optional in this narrow contract so a deployment composing a registry
+   * without it still boots; questions then fall back to being denied.
+   */
+  register?(definition: object): () => void
   /**
    * One visible tool definition in a viewing scope. The scope is an opaque
    * `ScopeKey`; omitted views the global layer, which a deployment with a
@@ -330,6 +347,21 @@ export interface StepStartData {
   readonly step: number
 }
 
+/** The `turn/start` payload fields this plugin uses. */
+export interface TurnStartData {
+  readonly turn: number
+}
+
+/**
+ * The `user/message` payload: the message object a turn consumed, carrying the
+ * id its producer stamped on it. One turn may consume SEVERAL queued messages,
+ * so this event — not turn order — is what correlates a turn with the inbound
+ * message(s) it answers.
+ */
+export interface UserMessageEventData {
+  readonly id?: string
+}
+
 /** The `assistant/chunk` payload fields this plugin streams. */
 export interface AssistantChunkData {
   readonly turn: number
@@ -398,6 +430,28 @@ export function isStepStartEvent(
   event: HostSessionEvent,
 ): event is HostSessionEvent & { readonly data: StepStartData } {
   return event.type === 'step/start'
+}
+
+/**
+ * Narrow a session event to the opening of one turn.
+ * @param event - any session event.
+ * @returns whether `event.data` carries {@link TurnStartData}.
+ */
+export function isTurnStartEvent(
+  event: HostSessionEvent,
+): event is HostSessionEvent & { readonly data: TurnStartData } {
+  return event.type === 'turn/start'
+}
+
+/**
+ * Narrow a session event to a user message a turn consumed.
+ * @param event - any session event.
+ * @returns whether `event.data` carries {@link UserMessageEventData}.
+ */
+export function isUserMessageEvent(
+  event: HostSessionEvent,
+): event is HostSessionEvent & { readonly data: UserMessageEventData } {
+  return event.type === 'user/message'
 }
 
 /**

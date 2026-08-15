@@ -31,6 +31,10 @@ Transport is `@larksuite/channel` over a WebSocket long connection, so no public
 - Two output modes: `cot` uses the platform's native thinking process, `stream` keeps a turn in one typewriter card for older clients.
 - A line starting with `/` runs as a host command without a model turn. `/stop` cancels the running turn, `/help` lists what the chat accepts.
 - Host approval questions become cards with 允许一次 / 拒绝 buttons; a click settles the outcome and rewrites the card with the decision.
+- Model questions (`ask_user_question`) become cards too: the tool is shadowed in each chat agent's own layer, its options render as buttons, and an ordinary reply answers it when none of them fit.
+- Plan review (`exit_plan_mode`) lands in the chat: the plan arrives as an ordinary message so its markdown renders, and the decision follows as a card that approves or sends feedback back to the model.
+- `/model` answers with a picker over the advertised routes, `/status` with a readout of what the next message will do. Both stay typeable: `/model use <provider/model>` switches without reading a card.
+- Every card speaks one visual language, in the reader's own language: this channel's own copy ships bilingual (zh/en) and the platform renders each viewer's, while model-authored text is shown literally and never as card markup.
 - Images can be turned on: they are downloaded, committed to the host attachment store, and ride the message to the model.
 - Every reply is aimed at the message that asked for it, and stays inside that message's topic thread when it had one.
 - Authorization narrows within the app's visibility scope; every allowlist is empty by default.
@@ -93,7 +97,7 @@ The invariant companion row is not part of the default patch: the shipped `web` 
 | `hideProcessWhenDone` | `false` | Let the platform drop the process once its run finishes (`cot` only). |
 | `attachImages` | `false` | Pass images on to the model. Only for a route that accepts them: one rejected image ends the conversation. |
 | `syncSlashCommands` | `true` | Register the chat's commands on the bot so Feishu offers them when a user types `/`. |
-| `denyTools` | `['ask_user_question', 'exit_plan_mode']` | Tools chat agents may not call, denied per agent at execution. The default names the human-interaction tools whose answers cannot reach this channel. |
+| `denyTools` | `[]` | Tools chat agents may not call, denied per agent at execution. Empty by default: the human-interaction tools are shadowed and answered here rather than denied. A name added here still wins over its shadow. |
 | `requireMention` | `true` | In group chats, only respond when @-mentioned. |
 | `senderAllowlist` | `[]` | Open ids allowed to send direct messages; empty serves anyone the app is visible to. |
 | `groupAllowlist` | `[]` | When non-empty, only these `oc_…` group chats are served; empty serves any group. |
@@ -168,7 +172,13 @@ Every list is empty by default: `senderAllowlist` narrows direct senders, `group
 <details>
 <summary>Human interaction</summary>
 
-`ctx.userQuestions` admits ONE provider per context, and with the Web app composed its BFF owns it and claims every agent-owned question — so `ask_user_question` and `exit_plan_mode` are denied per chat agent (`denyTools`) with a reason that redirects the model, plus a prompt sentence saying a question belongs in its reply. A chat reply already becomes the next turn, which is the native equivalent.
+`ctx.userQuestions` takes exactly ONE provider per context, and a composed Web app's BFF claims it for every agent-owned question.
+
+`ask_user_question` therefore does not go through that seam: this channel registers a tool of the same name in each chat agent's OWN layer, shadowing it. The host's layered registry resolves the nearest one, and reserves exactly one name (`run_code`) from being shadowed — so overriding this one is a first-class capability rather than a trick. The question becomes a card: the model's options render as buttons, a click answers it, and when none of them fit an ordinary reply is the answer and does not start another turn. A turn cancelled by `/stop`, a released session, or thirty minutes without an answer settles the question empty and repaints the card as cancelled, so a turn is never hung on one. A registry too old to expose `register` falls back to denying the tool.
+
+`exit_plan_mode` is shadowed on the same terms, wherever a plan service exists to leave plan mode afterwards. The plan itself is sent as an ordinary chat message rather than card content — it is markdown a model wrote, and model text inside a card renders literally, which would strip a plan of the headings and lists that make it readable — and the card that follows carries only the decision. Approval calls the plan service's own public switch, so the state transition stays the host's rather than a copy of it. Answering with words instead returns them to the model as feedback to revise against; dismissing the review tells the model to stop and wait rather than present again.
+
+Neither shadow silences the fallback: a registry too old to take a per-agent registration re-denies the tool, and the prompt sentence naming what is unavailable appears only when something actually is.
 
 </details>
 
@@ -188,7 +198,7 @@ Chat sessions are accounted under the workspace record for their directory, regi
 - A restart resumes a stored conversation, but nothing that arrived while the process was down is replayed: the transport offers no cursor.
 - Files and audio are passed through as the SDK's normalized text only; a file's right home is usually the workspace an agent can already read, not the request. Images are the exception: they are downloaded and attached.
 - The model sees group messages as `sender: text` single-user turns; there is no per-sender identity beyond the prefix.
-- Question tools are denied rather than answered: the `userQuestions` seam takes one provider per context, so a second UI channel cannot participate. Answering questions as chat cards needs either that seam to route by session owner or a deployment with no other provider.
+- Human-interaction tools are answered by shadowing them per agent, not by owning the `userQuestions` seam: a deployment whose tool registry cannot take a per-agent registration denies them instead, and a plan review needs a composed plan service to leave plan mode afterwards.
 
 ## Development
 

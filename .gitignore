@@ -8,3 +8,7 @@ coverage/
 # Editor and OS metadata
 .idea/
 .DS_Store
+
+# Locally installed agent skills; not part of the package.
+.agents/
+.claude/

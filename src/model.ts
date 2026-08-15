@@ -15,16 +15,51 @@
  * @module dsh-lark-channel/model
  */
 
+import { modelCard } from './cards.ts'
 import type { HostAgentOptions } from './host.ts'
+import type { ConversationSubject } from './session.ts'
 
 /** Show or switch this conversation's model route. Channel-owned: needs no agent. */
 export const MODEL_COMMAND = 'model'
 
+/** Marks this plugin's model buttons apart from other card actions. */
+export const MODEL_ACTION = 'dsh-lark-channel/model'
+
+/** How many routes the picker offers before it defers to the typed form. */
+const PICKER_ROWS = 10
+
+/** Card payload carried by one model pick. */
+export interface ModelActionValue extends ConversationSubject {
+  readonly kind: typeof MODEL_ACTION
+  /** The route to switch to; absent means "back to the deployment default". */
+  readonly route?: string | undefined
+}
+
+/**
+ * Narrow an arbitrary card-action value to this module's pick payload.
+ * @param value - raw button value from a card action event.
+ * @returns the typed payload, or undefined for foreign card actions.
+ */
+export function modelActionValue(value: unknown): ModelActionValue | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const record = value as Record<string, unknown>
+  if (record.kind !== MODEL_ACTION) return undefined
+  if (typeof record.key !== 'string' || typeof record.chatId !== 'string') return undefined
+  if (typeof record.chatType !== 'string') return undefined
+  if (record.owner !== undefined && typeof record.owner !== 'string') return undefined
+  if (record.route !== undefined && typeof record.route !== 'string') return undefined
+  return {
+    kind: MODEL_ACTION,
+    key: record.key,
+    chatId: record.chatId,
+    chatType: record.chatType,
+    ...record.owner === undefined ? {} : { owner: record.owner },
+    ...record.route === undefined ? {} : { route: record.route },
+  }
+}
+
 /** Entry value marking "explicitly the default": deep-merge persistence cannot delete a key. */
 const DEFAULT_MARKER = ''
-
-/** Longest catalog the chat listing renders before summarizing the rest. */
-const CATALOG_ROWS = 25
 
 /** One provider/model pair, both halves known. */
 export interface ModelRoute {
@@ -147,6 +182,48 @@ export class ChatModels {
   }
 }
 
+/**
+ * Build the picker for one conversation.
+ *
+ * The catalog is advertised rather than exhaustive, so the picker offers the
+ * first {@link PICKER_ROWS} routes and says how many it left out — the typed
+ * form reaches any of them, including routes the registry never listed.
+ * @param subject - the conversation the card governs and the chat it lives in.
+ * @param catalog - advertised routes.
+ * @param current - the route this conversation asked for, if any.
+ * @param deploymentRoute - the default's display form.
+ * @returns a card object for `send({ card })`.
+ */
+export function modelPickerCard(
+  subject: ConversationSubject,
+  catalog: readonly CatalogEntry[],
+  current: ModelRoute | undefined,
+  deploymentRoute: string,
+): object {
+  const shown = catalog.slice(0, PICKER_ROWS)
+  const pick = (route?: string): ModelActionValue => ({
+    kind: MODEL_ACTION,
+    key: subject.key,
+    chatId: subject.chatId,
+    chatType: subject.chatType,
+    ...subject.owner === undefined ? {} : { owner: subject.owner },
+    ...route === undefined ? {} : { route },
+  })
+  return modelCard({
+    current: current === undefined ? deploymentRoute : formatRoute(current),
+    isDefault: current === undefined,
+    entries: shown.map(entry => ({
+      label: `${entry.provider}/${entry.id}`,
+      detail: entry.name === entry.id ? undefined : entry.name,
+      current: current !== undefined && entry.provider === current.provider && entry.id === current.model,
+      value: pick(serializeRoute({ provider: entry.provider, model: entry.id })),
+    })),
+    hidden: catalog.length - shown.length,
+    // Nothing to reset to when the conversation is already on the default.
+    ...current === undefined ? {} : { reset: pick() },
+  })
+}
+
 /** What {@link runModelCommand} needs from the bridge. */
 export interface ModelCommandPorts {
   /** The host llm registry's advertised routes; empty when none is composed. */
@@ -191,65 +268,61 @@ export function resolveRouteInput(
   }
 }
 
+/** What one `/model` line produced: a card to send, or a line of markdown. */
+export type ModelReply = { readonly card: object } | { readonly markdown: string }
+
 /**
  * Run one `/model` command line and produce the chat reply.
+ *
+ * The bare form answers with the picker card; every other form answers in
+ * text, because `/model use x` is what someone types when they already know
+ * the route and want it applied without reading a card.
  * @param line - the complete line, slash included.
- * @param key - the conversation the command is about.
+ * @param subject - the conversation the command is about, and where it lives.
  * @param store - the model route state.
  * @param ports - catalog, default display, and the release hook.
- * @returns markdown for the chat.
+ * @returns the card or the markdown for the chat.
  */
 export async function runModelCommand(
   line: string,
-  key: string,
+  subject: ConversationSubject,
   store: ChatModels,
   ports: ModelCommandPorts,
-): Promise<string> {
+): Promise<ModelReply> {
+  const key = subject.key
   const argument = line.trimStart().slice(1 + MODEL_COMMAND.length).trim()
   const [verb, ...rest] = argument.split(/\s+/).filter(part => part !== '')
   const currentRoute = store.routeFor(key)
-  const current = currentRoute === undefined
-    ? `${ports.deploymentRoute()}（默认）`
-    : formatRoute(currentRoute)
 
   if (verb === undefined) {
     const catalog = await ports.catalog()
-    const lines = [`**模型**：\`${current}\``]
-    if (catalog.length > 0) {
-      const shown = catalog.slice(0, CATALOG_ROWS)
-      lines.push('', '**可用路由**')
-      for (const entry of shown) {
-        const mark = currentRoute !== undefined
-          && entry.provider === currentRoute.provider && entry.id === currentRoute.model
-          ? '（当前）'
-          : ''
-        lines.push(`- \`${entry.provider}/${entry.id}\` ${entry.name}${mark}`)
-      }
-      if (catalog.length > shown.length) lines.push(`…还有 ${catalog.length - shown.length} 个。`)
-    }
-    lines.push('', `用 \`/${MODEL_COMMAND} use <provider/model 或模型名>\` 切换本会话，\`/${MODEL_COMMAND} reset\` 回默认。`)
-    return lines.join('\n')
+    return { card: modelPickerCard(subject, catalog, currentRoute, ports.deploymentRoute()) }
   }
 
   if (verb === 'reset') {
     const result = await store.reset(key)
-    if (!result.changed) return `🤖 本会话已在使用默认模型 \`${ports.deploymentRoute()}\`。`
+    if (!result.changed) return { markdown: `🤖 本会话已在使用默认模型 \`${ports.deploymentRoute()}\`。` }
     await ports.release()
-    return `🤖 已切回默认模型 \`${ports.deploymentRoute()}\`\n下一条消息起生效，上下文保留。${result.durable ? '' : '\n（本部署未组合 settings，这次切换在重启后会丢失。）'}`
+    const durability = result.durable ? '' : '\n（本部署未组合 settings，这次切换在重启后会丢失。）'
+    return { markdown: `🤖 已切回默认模型 \`${ports.deploymentRoute()}\`\n下一条消息起生效，上下文保留。${durability}` }
   }
 
   if (verb === 'use') {
     const target = rest.join(' ').trim()
-    if (target === '') return `用法：\`/${MODEL_COMMAND} use <provider/model 或模型名>\``
+    if (target === '') return { markdown: `用法：\`/${MODEL_COMMAND} use <provider/model 或模型名>\`` }
     const resolved = resolveRouteInput(target, await ports.catalog())
-    if ('reason' in resolved) return `⚠️ ${resolved.reason}`
+    if ('reason' in resolved) return { markdown: `⚠️ ${resolved.reason}` }
     const result = await store.set(key, resolved.route)
-    if (!result.changed) return `🤖 本会话已在使用 \`${formatRoute(resolved.route)}\`。`
+    if (!result.changed) return { markdown: `🤖 本会话已在使用 \`${formatRoute(resolved.route)}\`。` }
     await ports.release()
     const advisory = resolved.listed ? '' : '\n（目录未列出该路由；宿主目录是建议性的，仍按你给的设置。）'
     const durability = result.durable ? '' : '\n（本部署未组合 settings，这次切换在重启后会丢失。）'
-    return `🤖 已切换到 \`${formatRoute(resolved.route)}\`\n下一条消息起生效，上下文保留。${advisory}${durability}`
+    return {
+      markdown: `🤖 已切换到 \`${formatRoute(resolved.route)}\`\n下一条消息起生效，上下文保留。${advisory}${durability}`,
+    }
   }
 
-  return `用法：\`/${MODEL_COMMAND}\`、\`/${MODEL_COMMAND} use <provider/model>\`、\`/${MODEL_COMMAND} reset\``
+  return {
+    markdown: `用法：\`/${MODEL_COMMAND}\`、\`/${MODEL_COMMAND} use <provider/model>\`、\`/${MODEL_COMMAND} reset\``,
+  }
 }

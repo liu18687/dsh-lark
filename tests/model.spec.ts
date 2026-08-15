@@ -2,12 +2,14 @@ import { describe, expect, it } from 'vitest'
 import {
   ChatModels,
   formatRoute,
+  MODEL_ACTION,
   parseRoute,
   resolveRouteInput,
   runModelCommand,
 } from '../src/model.ts'
 import type { CatalogEntry } from '../src/model.ts'
-import { renderStatus } from '../src/status.ts'
+import { renderStatusCard, STATUS_ACTION } from '../src/status.ts'
+import { cardControls, cardTexts } from './harness.ts'
 
 const catalog: CatalogEntry[] = [
   { provider: 'deepseek', id: 'deepseek-chat', name: 'DeepSeek Chat' },
@@ -106,20 +108,61 @@ describe('ChatModels', () => {
   })
 })
 
+/** The conversation a command line is about, as the bridge resolves it. */
+const SUBJECT = { key: 'chat', chatId: 'oc_1', chatType: 'p2p' }
+
+/** The markdown one reply carries, for the text forms. */
+function markdownOf(reply: { markdown: string } | { card: object }): string {
+  if (!('markdown' in reply)) throw new Error('expected a text reply, got a card')
+  return reply.markdown
+}
+
+/** The card one reply carries, for the picker form. */
+function cardOf(reply: { markdown: string } | { card: object }): object {
+  if (!('card' in reply)) throw new Error('expected a card reply, got text')
+  return reply.card
+}
+
 describe('runModelCommand', () => {
-  it('shows the current route and the catalog for a bare /model', async () => {
+  it('answers a bare /model with a picker over the catalog', async () => {
     const { store } = createStore()
     const { ports } = createPorts()
-    const reply = await runModelCommand('/model', 'chat', store, ports)
-    expect(reply).toContain('deepseek/deepseek-chat（默认）')
-    expect(reply).toContain('deepseek/deepseek-reasoner')
-    expect(reply).toContain('DeepSeek Reasoner')
+    const card = cardOf(await runModelCommand('/model', SUBJECT, store, ports))
+    const texts = cardTexts(card).map((text) => text.content)
+    expect(texts).toContain('deepseek/deepseek-reasoner')
+    expect(texts).toContain('DeepSeek Reasoner')
+    // Every advertised route is one press away, carrying the conversation it
+    // switches; on the default there is nothing to reset to.
+    expect(cardControls(card).map((control) => control.value)).toContainEqual(
+      { kind: MODEL_ACTION, key: 'chat', chatId: 'oc_1', chatType: 'p2p', route: 'deepseek/deepseek-reasoner' },
+    )
+    expect(cardControls(card).every((control) => (control.value as { route?: string }).route !== undefined)).toBe(true)
+  })
+
+  it('offers a way back once a conversation left the default', async () => {
+    const { store } = createStore({ entries: { chat: 'deepseek/deepseek-reasoner' } })
+    const { ports } = createPorts()
+    const card = cardOf(await runModelCommand('/model', SUBJECT, store, ports))
+    const controls = cardControls(card)
+    expect(controls.some((control) => (control.value as { route?: string }).route === undefined)).toBe(true)
+    // The current route is shown without a button: re-picking it does nothing.
+    expect(controls.some((control) => (control.value as { route?: string }).route === 'deepseek/deepseek-reasoner'))
+      .toBe(false)
+  })
+
+  it('carries the clicking rules of a per-sender conversation into its card', async () => {
+    const { store } = createStore()
+    const { ports } = createPorts()
+    const card = cardOf(
+      await runModelCommand('/model', { ...SUBJECT, owner: 'ou_owner' }, store, ports),
+    )
+    expect((cardControls(card)[0]!.value as { owner?: string }).owner).toBe('ou_owner')
   })
 
   it('switches on use, releasing so the same session resumes on the new route', async () => {
     const { store, patches } = createStore()
     const { ports, state } = createPorts()
-    const reply = await runModelCommand('/model use deepseek-reasoner', 'chat', store, ports)
+    const reply = markdownOf(await runModelCommand('/model use deepseek-reasoner', SUBJECT, store, ports))
     expect(reply).toContain('已切换到 `deepseek/deepseek-reasoner`')
     expect(reply).toContain('上下文保留')
     expect(state.releases).toBe(1)
@@ -129,15 +172,15 @@ describe('runModelCommand', () => {
   it('does not release when nothing changed or the input failed to resolve', async () => {
     const { store } = createStore({ entries: { chat: 'deepseek/deepseek-reasoner' } })
     const { ports, state } = createPorts()
-    await runModelCommand('/model use deepseek/deepseek-reasoner', 'chat', store, ports)
-    await runModelCommand('/model use nowhere', 'chat', store, ports)
+    await runModelCommand('/model use deepseek/deepseek-reasoner', SUBJECT, store, ports)
+    await runModelCommand('/model use nowhere', SUBJECT, store, ports)
     expect(state.releases).toBe(0)
   })
 
   it('notes an unlisted route instead of rejecting it, per the advisory contract', async () => {
     const { store } = createStore()
     const { ports } = createPorts()
-    const reply = await runModelCommand('/model use deepseek/brand-new', 'chat', store, ports)
+    const reply = markdownOf(await runModelCommand('/model use deepseek/brand-new', SUBJECT, store, ports))
     expect(reply).toContain('已切换到')
     expect(reply).toContain('目录未列出该路由')
   })
@@ -145,17 +188,21 @@ describe('runModelCommand', () => {
   it('resets to the deployment default, and reports usage for anything else', async () => {
     const { store } = createStore({ entries: { chat: 'deepseek/deepseek-reasoner' } })
     const { ports, state } = createPorts()
-    const reply = await runModelCommand('/model reset', 'chat', store, ports)
+    const reply = markdownOf(await runModelCommand('/model reset', SUBJECT, store, ports))
     expect(reply).toContain('已切回默认模型')
     expect(state.releases).toBe(1)
-    expect(await runModelCommand('/model reset', 'chat', store, ports)).toContain('已在使用默认模型')
-    expect(await runModelCommand('/model frobnicate', 'chat', store, ports)).toContain('用法')
+    expect(markdownOf(await runModelCommand('/model reset', SUBJECT, store, ports)))
+      .toContain('已在使用默认模型')
+    expect(markdownOf(await runModelCommand('/model frobnicate', SUBJECT, store, ports))).toContain('用法')
   })
 })
 
-describe('renderStatus', () => {
+describe('renderStatusCard', () => {
+  /** Every string one status card renders. */
+  const shown = (card: object): string[] => cardTexts(card).map((text) => text.content)
+
   it('states routing, activity, and approvals only when pending', () => {
-    const idle = renderStatus({
+    const idle = renderStatusCard({
       workspace: '/srv/work',
       workspaceIsDefault: true,
       route: 'deepseek/deepseek-chat',
@@ -165,13 +212,16 @@ describe('renderStatus', () => {
       running: false,
       pendingApprovals: 0,
       version: '0.0.3',
-    })
-    expect(idle).toContain('`/srv/work`（默认）')
-    expect(idle).toContain('版本：`0.0.3`')
-    expect(idle).toContain('空闲')
-    expect(idle).not.toContain('待审批')
+    }, SUBJECT)
+    expect(shown(idle)).toContain('/srv/work')
+    expect(shown(idle)).toContain('0.0.3')
+    expect(shown(idle)).toContain('空闲')
+    expect(shown(idle)).not.toContain('待审批')
+    // The refresh button re-reads the same conversation it was built for.
+    expect(cardControls(idle).map((control) => control.value))
+      .toEqual([{ kind: STATUS_ACTION, key: 'chat', chatId: 'oc_1', chatType: 'p2p' }])
 
-    const busy = renderStatus({
+    const busy = renderStatusCard({
       workspace: '/srv/other',
       workspaceIsDefault: false,
       route: 'pi/org/shared-model',
@@ -181,11 +231,11 @@ describe('renderStatus', () => {
       running: true,
       pendingApprovals: 2,
       version: '0.0.3',
-    })
-    expect(busy).toContain('运行中')
-    expect(busy).toContain('待审批：2 个')
+    }, SUBJECT)
+    expect(shown(busy)).toContain('正在跑一轮任务')
+    expect(shown(busy)).toContain('2 个审批卡片等待处理')
 
-    const fresh = renderStatus({
+    const fresh = renderStatusCard({
       workspace: '/srv/work',
       workspaceIsDefault: true,
       route: 'deepseek/deepseek-chat',
@@ -195,9 +245,9 @@ describe('renderStatus', () => {
       running: false,
       pendingApprovals: 0,
       version: '',
-    })
-    expect(fresh).toContain('尚未创建')
+    }, SUBJECT)
+    expect(shown(fresh).some((text) => text.includes('尚未创建'))).toBe(true)
     // An unknown version hides the row rather than printing an empty claim.
-    expect(fresh).not.toContain('版本')
+    expect(shown(fresh)).not.toContain('版本')
   })
 })

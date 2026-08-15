@@ -89,6 +89,8 @@ export function createFakePort() {
   }[] = []
   /** Downloadable resources, by file key, as the transport would serve them. */
   const resourceBytes = new Map<string, { buffer: Uint8Array; contentType?: string }>()
+  /** Optional holds a test injects into port operations to stage races. */
+  const gates: { beforeSend?: () => Promise<void> } = {}
   const state = {
     connects: 0,
     disconnects: 0,
@@ -142,6 +144,8 @@ export function createFakePort() {
     async disconnect() { state.disconnects += 1 },
     on: subscribe as ChannelPort['on'],
     async send(to, input, opts): Promise<SendResult> {
+      // A test may hold the send in flight to exercise what races it.
+      if (gates.beforeSend !== undefined) await gates.beforeSend()
       if (state.failNextSend) {
         state.failNextSend = false
         throw new Error('send failed (fake)')
@@ -232,6 +236,7 @@ export function createFakePort() {
     resourceBytes,
     cots,
     state,
+    gates,
     /** Deliver one inbound chat message to every subscribed handler. */
     async emitMessage(msg: NormalizedMessage): Promise<void> {
       for (const handler of [...messageHandlers]) await handler(msg)
@@ -281,6 +286,70 @@ export function fakeMessage(overrides: Partial<NormalizedMessage> = {}): Normali
   }
 }
 
+/**
+ * Keywords the host's schema validator accepts, quoted from the diagnostic it
+ * raises for anything else: "subset: type/oneOf/properties/required/
+ * additionalProperties/items/enum/const + annotations".
+ */
+const SUPPORTED_SCHEMA_KEYWORDS = new Set([
+  'type', 'oneOf', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'const',
+  'description', 'title', 'default', 'examples',
+])
+
+/**
+ * Walk one schema the way the host's `assertSupportedJsonSchema` does, and
+ * throw what it would throw. The rule that actually bit: `required` is an
+ * ARRAY on the object, never a flag on a property — the per-property form
+ * belongs to the spec that `defineTool` compiles, not to a registrable
+ * definition.
+ * @param schema - the schema to check.
+ * @param path - diagnostic path, as the host builds it.
+ */
+export function assertSupportedSchema(schema: unknown, path = 'schema'): void {
+  if (typeof schema !== 'object' || schema === null || Array.isArray(schema)) {
+    throw new Error(`${path} must be a schema object`)
+  }
+  const node = schema as Record<string, unknown>
+  for (const key of Object.keys(node)) {
+    if (!SUPPORTED_SCHEMA_KEYWORDS.has(key)) {
+      throw new Error(`unsupported JSON schema: ${path}.${key} is not a supported keyword`)
+    }
+  }
+  if ('required' in node) {
+    if (!Array.isArray(node.required)) {
+      throw new Error(
+        `unsupported JSON schema: ${path}.required must be an array of property names, `
+        + `not ${JSON.stringify(node.required)} — the per-property form is the uncompiled spec`,
+      )
+    }
+    if (node.type !== 'object') throw new Error(`unsupported JSON schema: ${path}.required needs type "object"`)
+  }
+  if (node.properties !== undefined) {
+    for (const [key, child] of Object.entries(node.properties as Record<string, unknown>)) {
+      assertSupportedSchema(child, `${path}.properties.${key}`)
+    }
+  }
+  if (node.items !== undefined) assertSupportedSchema(node.items, `${path}.items`)
+  for (const variant of (node.oneOf ?? []) as unknown[]) assertSupportedSchema(variant, `${path}.oneOf`)
+}
+
+/**
+ * Reject a tool definition the real registry would reject: it demands an
+ * output schema with a `render`, validates that schema, and reserves one name.
+ * @param definition - the definition being registered.
+ */
+export function assertRegistrableTool(definition: { name: string; parameters?: unknown; output?: unknown }): void {
+  if (definition.name === 'run_code') throw new Error('tool name "run_code" is reserved and cannot be shadowed')
+  const output = definition.output as { schema?: unknown; render?: unknown } | undefined
+  if (output === undefined || typeof output.render !== 'function') {
+    throw new Error(`tool "${definition.name}" must declare output { schema, render }`)
+  }
+  assertSupportedSchema(output.schema)
+  // Not validated by the registry, but the model reads it: a spec-form
+  // parameter schema reaches the model as nonsense.
+  if (definition.parameters !== undefined) assertSupportedSchema(definition.parameters, 'parameters')
+}
+
 /** One agent creation recorded by the fake registry. */
 export interface CreatedAgent {
   sessionId: string
@@ -292,6 +361,8 @@ export interface CreatedAgent {
   denyReason: (name: string) => string | undefined
   /** Prompt sections setup registered on this agent's scope. */
   promptSections: { name: string; order: number; text: string }[]
+  /** Tool definitions the composition registered in this agent's own layer. */
+  registeredTools: { name: string }[]
   agent: {
     id: string
     session: { id: string }
@@ -302,7 +373,7 @@ export interface CreatedAgent {
 }
 
 /** An in-memory `agents` registry capturing every agent it produced. */
-export function createFakeAgents() {
+export function createFakeAgents(options: { readonly canRegister?: boolean } = {}) {
   const created: CreatedAgent[] = []
   /** Session ids a test declared stored, so `resume` loads them instead of rejecting. */
   const resumable = new Set<string>()
@@ -326,12 +397,30 @@ export function createFakeAgents() {
   const compose = async (setup?: (agentCtx: Context) => Promise<void>) => {
     const guards: ((execution: { name: string }) => string | undefined)[] = []
     const sections: { name: string; order: number; text: string }[] = []
+    /** Tool definitions this agent's composition registered in its own layer. */
+    const registered: { name: string }[] = []
     if (setup !== undefined) {
       const agentCtx = new Context()
-      agentCtx.provide('tools', { guard: (g: (e: { name: string }) => string | undefined) => {
-        guards.push(g)
-        return () => { guards.splice(guards.indexOf(g), 1) }
-      } })
+      agentCtx.provide('tools', {
+        guard: (g: (e: { name: string }) => string | undefined) => {
+          guards.push(g)
+          return () => { guards.splice(guards.indexOf(g), 1) }
+        },
+        // A registry too old for per-agent registrations, which is what the
+        // deny fallbacks exist for.
+        ...options.canRegister === false ? {} : {
+        // The real registry shadows an outer name in an agent's own layer,
+        // and validates the definition before accepting it — a definition it
+        // rejects fails agent creation, which is how a malformed schema first
+        // reached production. The fake enforces the same contract so that
+        // class of defect fails here instead.
+        register: (definition: { name: string; parameters?: unknown; output?: unknown }) => {
+          assertRegistrableTool(definition)
+          registered.push(definition)
+          return () => { registered.splice(registered.indexOf(definition), 1) }
+        },
+        },
+      })
       agentCtx.provide('systemPrompt', { section: (s: { name: string; order: number; text: string }) => {
         sections.push(s)
         return () => undefined
@@ -343,6 +432,7 @@ export function createFakeAgents() {
       /** Deny reason the composed guards give a tool, or undefined when allowed. */
       denyReason: (name: string) => guards.map(g => g({ name })).find(r => r !== undefined),
       promptSections: sections,
+      registeredTools: registered,
     }
   }
 
@@ -449,6 +539,10 @@ export async function mountChannel(
     attachments?: object
     /** The `llm` registry `/model` lists routes from. */
     llm?: object
+    /** The `planMode` service a shadowed plan review switches through. */
+    planMode?: object
+    /** False models a tool registry too old to take per-agent registrations. */
+    agentsCanRegisterTools?: boolean
   } = {},
 ) {
   const ctx = new Context()
@@ -462,7 +556,7 @@ export async function mountChannel(
       logs.push({ type: message.type, text: (message.args as unknown[]).map(part => String(part)).join(' ') })
     },
   })
-  const agents = createFakeAgents()
+  const agents = createFakeAgents(services.agentsCanRegisterTools === false ? { canRegister: false } : {})
   const competing = services.competingAnswerer
   if (competing !== undefined) {
     ctx.on('approval/request', (request) => {
@@ -478,6 +572,7 @@ export async function mountChannel(
   if (services.tools !== undefined) ctx.provide('tools', services.tools)
   if (services.workspaces !== undefined) ctx.provide('workspaceRegistry', services.workspaces)
   if (services.llm !== undefined) ctx.provide('llm', services.llm)
+  if (services.planMode !== undefined) ctx.provide('planMode', services.planMode)
   if (services.commands !== undefined) ctx.provide('commands', services.commands)
   if (services.attachments !== undefined) ctx.provide('attachments', services.attachments)
   const fake = createFakePort()
@@ -681,9 +776,82 @@ export function createFakeSettings(stored: Record<string, unknown> = {}) {
   return { settings, updates, registered }
 }
 
+/** One node of a card, as the tests need to see it. */
+interface CardNode {
+  readonly tag?: string
+  readonly content?: string
+  readonly i18n?: Record<string, string>
+  readonly text?: { readonly tag?: string; readonly content?: string; readonly i18n?: Record<string, string> }
+  readonly behaviors?: { readonly type?: string; readonly value?: unknown }[]
+  readonly elements?: CardNode[]
+  readonly columns?: CardNode[]
+  readonly body?: CardNode
+}
+
+/**
+ * Every node of a card, at any depth.
+ *
+ * The tests walk rather than index because layout is the card module's
+ * business: nesting a control inside a column or a container must not be able
+ * to quietly drop it from a safety assertion.
+ * @param card - a built card object.
+ * @returns every node, parents before children.
+ */
+export function cardNodes(card: object): CardNode[] {
+  const found: CardNode[] = []
+  const walk = (node: CardNode | undefined): void => {
+    if (node === undefined || node === null || typeof node !== 'object') return
+    found.push(node)
+    for (const child of [...node.elements ?? [], ...node.columns ?? []]) walk(child)
+    walk(node.body)
+  }
+  walk(card as CardNode)
+  return found
+}
+
+/**
+ * Every string a card renders, paired with the tag that renders it and the
+ * translations it carries. A tag of `markdown` or `lark_md` means the string
+ * is interpreted as markup; an `i18n` map means the card authored the string
+ * itself rather than borrowing it.
+ * @param card - a built card object.
+ * @returns one entry per rendered string.
+ */
+export function cardTexts(card: object): { tag: string; content: string; i18n?: Record<string, string> }[] {
+  return cardNodes(card).flatMap((node) => {
+    if (node.text?.content !== undefined) {
+      return [{
+        tag: node.text.tag ?? 'plain_text',
+        content: node.text.content,
+        ...node.text.i18n === undefined ? {} : { i18n: node.text.i18n },
+      }]
+    }
+    if (node.tag === 'markdown' && node.content !== undefined) return [{ tag: 'markdown', content: node.content }]
+    if (node.tag === 'plain_text' && node.content !== undefined) {
+      return [{ tag: 'plain_text', content: node.content, ...node.i18n === undefined ? {} : { i18n: node.i18n } }]
+    }
+    return []
+  })
+}
+
+/**
+ * Every clickable thing a card carries, whatever shape it takes: a button, or
+ * a whole container row that answers when pressed.
+ * @param card - a built card object.
+ * @returns each control's visible label and its callback payload.
+ */
+export function cardControls(card: object): { label: string; value: unknown }[] {
+  return cardNodes(card).flatMap((node) => {
+    const callback = (node.behaviors ?? []).find((behavior) => behavior.type === 'callback')
+    if (callback === undefined) return []
+    const label = node.text?.content
+      ?? cardTexts(node as object).find((text) => text.content !== '')?.content
+      ?? ''
+    return [{ label, value: callback.value }]
+  })
+}
+
 /** Extract the approval correlation payload from a sent card's buttons. */
 export function approvalValueFromCard(card: object): { kind: string; id: string; decision: string }[] {
-  const elements = (card as { elements: { tag: string; actions?: { value: { kind: string; id: string; decision: string } }[] }[] }).elements
-  const action = elements.find((element) => element.tag === 'action')
-  return (action?.actions ?? []).map((button) => button.value)
+  return cardControls(card).map((control) => control.value as { kind: string; id: string; decision: string })
 }

@@ -136,10 +136,14 @@ export const internals: {
   notify: (line: string) => void
   /** Shortest gap between two issued QR codes; absent keeps the onboarding default. */
   reissueFloorMs?: number
+  /** Reconnect-watchdog deadline override; absent keeps the bridge default. */
+  reconnectDeadlineMs?: number
 } = {
   createPort: createLarkChannelPort,
   registerApp,
-  notify: (line) => void process.stderr.write(`${line}\n`),
+  // Stamped because the incident this console exists for was dated off a file
+  // mtime: the log itself could not answer WHEN its last line was written.
+  notify: (line) => void process.stderr.write(`[${new Date().toLocaleString('sv-SE')}] ${line}\n`),
 }
 
 /**
@@ -170,7 +174,15 @@ export function apply(ctx: Context, config: Config): void {
     started = true
     const authorization = resolveAuthorization(resolved)
     internals.notify(describeAuthorization(authorization))
-    installBridge(ctx, resolved, internals.createPort(resolved, authorization), internals.notify, authorization, persistState)
+    installBridge(
+      ctx,
+      resolved,
+      internals.createPort(resolved, authorization),
+      internals.notify,
+      authorization,
+      persistState,
+      internals.reconnectDeadlineMs === undefined ? undefined : { deadlineMs: internals.reconnectDeadlineMs },
+    )
   }
 
   const bootstrap = async (): Promise<void> => {

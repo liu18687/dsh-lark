@@ -7,11 +7,17 @@ import z from '@deepseek-ai/schemastery'
 import type { SessionScope } from './session.ts'
 
 /**
- * Human-interaction tools whose answer cannot reach a chat: both ask through
- * `ctx.userQuestions`, whose single provider belongs to whichever UI registered
- * it first. Denied per chat agent so the model asks in the chat instead.
+ * Tools whose answer cannot reach a chat.
+ *
+ * Empty now. Both tools that used to sit here — `ask_user_question` and
+ * `exit_plan_mode` — ask through `ctx.userQuestions`, whose single provider
+ * belongs to whichever UI registered it first, so their answers would surface
+ * where nobody in this chat is watching. Each is shadowed per agent instead
+ * and asks here, as a card. A deployment may still name either one, and that
+ * denial wins; so does the fallback, which re-denies a tool whose shadow could
+ * not be registered.
  */
-const DEFAULT_DENY_TOOLS = ['ask_user_question', 'exit_plan_mode'] as const
+const DEFAULT_DENY_TOOLS = [] as const
 
 /** Plugin configuration supplied by the profile composition. */
 export interface Config {

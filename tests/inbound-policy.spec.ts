@@ -168,7 +168,9 @@ describe('durable sessions', () => {
       const opened = harness.agents.created[0]!
       expect(opened.meta).toBeUndefined()
       expect(opened.setupRan).toBe(true)
-      expect(opened.denyReason('ask_user_question')).toBeDefined()
+      // The shadow tool is re-registered on a RESUMED agent too; without it a
+      // recovered conversation would silently lose its ability to ask.
+      expect(opened.registeredTools.map((tool) => tool.name)).toContain('ask_user_question')
       expect(opened.agent.followup).toHaveBeenCalledTimes(1)
     } finally {
       await harness.dispose()
@@ -264,6 +266,9 @@ describe('durable sessions', () => {
       await harness.fake.emitMessage(fakeMessage({ messageId: 'om_ask', threadId: 'omt_1' }))
       await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
       const session = harness.agents.created[0]!.agent.session
+      // The host names the consumed message; that claim is what aims the turn.
+      const consumed = harness.agents.created[0]!.agent.followup.mock.calls[0]![0]
+      harness.ctx.emit('session/event', session, { type: 'user/message', data: { id: consumed.id } })
       harness.ctx.emit('session/event', session, {
         type: 'assistant/message',
         data: { turn: 1, message: { content: [{ type: 'text', text: 'answer' }] } },
@@ -288,6 +293,9 @@ describe('durable sessions', () => {
       await harness.fake.emitMessage(fakeMessage({ messageId: 'om_ask' }))
       await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
       const session = harness.agents.created[0]!.agent.session
+      // The host names the consumed message; that claim is what aims the turn.
+      const consumed = harness.agents.created[0]!.agent.followup.mock.calls[0]![0]
+      harness.ctx.emit('session/event', session, { type: 'user/message', data: { id: consumed.id } })
       harness.ctx.emit('session/event', session, {
         type: 'assistant/message',
         data: { turn: 1, message: { content: [{ type: 'text', text: 'answer' }] } },

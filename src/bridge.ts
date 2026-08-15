@@ -16,6 +16,12 @@ import type {
   RejectEvent,
   SendResult,
 } from '@larksuite/channel'
+import {
+  approvalCard as buildApprovalCard,
+  settledApprovalCard as buildSettledApprovalCard,
+  toast,
+  TOAST,
+} from './cards.ts'
 import type { ResolvedConfig } from './config.ts'
 import type {
   HostAgent,
@@ -38,7 +44,7 @@ import type {
   HostWorkspace,
   HostWorkspaceRegistry,
 } from './host.ts'
-import { isStepStartEvent, isToolCallEvent, isTurnEndEvent } from './host.ts'
+import { isStepStartEvent, isToolCallEvent, isTurnEndEvent, isTurnStartEvent, isUserMessageEvent } from './host.ts'
 import { createCotRenderer } from './cot.ts'
 import type { CotPort } from './cot.ts'
 import { createMessageRenderer, createStreamRenderer } from './outbound.ts'
@@ -47,16 +53,30 @@ import { refuseApprovalClick, refuseMessage } from './authorization.ts'
 import type { Authorization } from './authorization.ts'
 import { commandName, HELP_COMMAND, isCommandLine, runCommandLine, STOP_COMMAND } from './commands.ts'
 import { CD_COMMAND, ChatWorkspaces, runWorkspaceCommand, WS_COMMAND } from './workspace.ts'
-import { ChatModels, formatRoute, MODEL_COMMAND, runModelCommand } from './model.ts'
-import type { CatalogEntry } from './model.ts'
-import { renderStatus, STATUS_COMMAND } from './status.ts'
+import {
+  ChatModels,
+  formatRoute,
+  MODEL_COMMAND,
+  modelActionValue,
+  modelPickerCard,
+  parseRoute,
+  runModelCommand,
+} from './model.ts'
+import type { CatalogEntry, ModelActionValue } from './model.ts'
+import { renderStatusCard, STATUS_COMMAND, statusActionValue } from './status.ts'
+import type { StatusFields } from './status.ts'
+import { ChatQuestions, questionActionValue, shadowQuestionTool } from './questions.ts'
+import { PLAN_TOOL, planReviewQuestion, shadowPlanTool } from './plan.ts'
+import type { HostPlanMode, PlanReviewPorts } from './plan.ts'
+import type { AskedQuestion, QuestionAnswer } from './questions.ts'
 import { ownVersion } from './version.ts'
 import { collectImages } from './images.ts'
 import type { CollectedImages, ImagePort } from './images.ts'
 import { syncSlashPanel } from './slash-panel.ts'
 import type { SlashPanelPort } from './slash-panel.ts'
 import { ConversationSessions, conversationKey } from './session.ts'
-import type { SessionLadder } from './session.ts'
+import type { ConversationSubject, SessionLadder } from './session.ts'
+import { createAttemptQuota, createReconnectWatchdog } from './liveness.ts'
 
 /**
  * The transport surface the bridge drives. `LarkChannel` from
@@ -67,6 +87,12 @@ export interface ChannelPort extends OutboundPort, SlashPanelPort, ImagePort, Co
   connect(): Promise<void>
   /** Close the transport and release its resources. */
   disconnect(): Promise<void>
+  /**
+   * The transport's own account of its connection, when it offers one. The
+   * SDK reports `failed` for its terminal give-up state, which is exactly the
+   * state the reconnect watchdog exists to catch.
+   */
+  getConnectionStatus?(): { readonly state?: string } | undefined
   /** Subscribe one normalized inbound event; returns the unsubscriber. */
   on(name: 'message', handler: (msg: NormalizedMessage) => void | Promise<void>): () => void
   on(
@@ -140,17 +166,42 @@ interface DurableAgentRegistry extends HostAgentRegistry {
   }): Promise<HostAgentHandle>
 }
 
-/** One approval card waiting for a button click. */
+/**
+ * The immutable facts of one tool call, copied at ask time. An approval is
+ * decided by a human reading these; they must never be re-read from a mutable
+ * map after the card exists, or a concurrent turn's write shows one command
+ * while another is approved.
+ */
+interface CallSnapshot {
+  readonly sessionId: string
+  readonly turn: number
+  readonly callId: string
+  readonly arguments: string
+}
+
+/**
+ * One approval question, from before its card is sent until it settles.
+ *
+ * `sending` — the card send is in flight; a settlement (abort, disposal)
+ * resolves the asker immediately and the send's return path paints the card.
+ * `open` — the card exists and a click may decide it.
+ * `settled` — decided; kept only until the card is painted.
+ */
 interface PendingApproval {
   readonly chatId: string
   readonly chatType: string
-  readonly messageId: string
   readonly toolName: string
+  /** Captured call facts; undefined when the asker named no call. */
+  readonly call?: CallSnapshot | undefined
+  /** Set once the platform accepted the card. */
+  messageId?: string | undefined
+  state: 'sending' | 'open' | 'settled'
+  outcome?: HostApprovalOutcome | undefined
+  decidedBy?: string | undefined
   settle(outcome: HostApprovalOutcome): void
+  /** Detaches the abort listener, so a settled question leaks no handler. */
+  removeAbort?: (() => void) | undefined
 }
-
-/** How much of a pending call's arguments the approval card shows. */
-const CARD_ARGUMENTS_MAX_CHARS = 600
 
 /** Marker distinguishing this plugin's approval buttons from other card actions. */
 const APPROVAL_ACTION = 'dsh-lark-channel/approval'
@@ -189,75 +240,59 @@ function approvalCard(
   command: string | undefined,
   id: string,
 ): object {
-  // Only this plugin's own labels use `lark_md`. Every untrusted value — the
-  // model's justification and the exact arguments it wants to run — rides a
-  // `plain_text` element, which the platform renders literally, so neither can
-  // inject card markup or disguise itself as the card's own text.
-  const untrusted = (label: string, value: string): object[] => [
-    { tag: 'div', text: { tag: 'lark_md', content: `**${label}**` } },
-    { tag: 'div', text: { tag: 'plain_text', content: value } },
-  ]
-  return {
-    config: { wide_screen_mode: true },
-    header: { template: 'orange', title: { tag: 'plain_text', content: 'DSH 操作审批' } },
-    elements: [
-      { tag: 'div', text: { tag: 'lark_md', content: `**工具**：\`${toolName}\`` } },
-      ...command === undefined ? [] : untrusted('将执行', command),
-      ...reason === undefined || reason === '' ? [] : untrusted('模型说明', reason),
-      { tag: 'note', elements: [{ tag: 'plain_text', content: '批准前请确认上面的内容确实是你要执行的。' }] },
-      {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: '允许一次' },
-            type: 'primary',
-            value: { kind: APPROVAL_ACTION, id, decision: 'allow' },
-          },
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: '拒绝' },
-            type: 'danger',
-            value: { kind: APPROVAL_ACTION, id, decision: 'reject' },
-          },
-        ],
-      },
-    ],
-  }
-}
-
-/** Card headline and color for each settled approval outcome. */
-const SETTLED_CARD: Record<HostApprovalOutcome, { template: string; text: string }> = {
-  'allowed-once': { template: 'green', text: '✅ 已允许执行一次' },
-  'rejected': { template: 'red', text: '⛔ 已拒绝' },
-  'cancelled': { template: 'grey', text: '⏹ 请求已撤回' },
-  'unavailable': { template: 'grey', text: '⏹ 无法作答' },
+  return buildApprovalCard({
+    toolName,
+    reason,
+    command,
+    allow: { kind: APPROVAL_ACTION, id, decision: 'allow' },
+    reject: { kind: APPROVAL_ACTION, id, decision: 'reject' },
+  })
 }
 
 /**
  * Build the static replacement card shown after an approval settles.
  * @param toolName - the tool the question was about.
  * @param outcome - the closed decision.
+ * @param decidedBy - who pressed, when a person did. Named rather than
+ * withheld: with approvals open to a room, the room should see whose press
+ * granted the escalation.
  * @returns a Feishu card object for `updateCard`.
  */
 function settledCard(toolName: string, outcome: HostApprovalOutcome, decidedBy?: string): object {
-  const look = SETTLED_CARD[outcome]
-  return {
-    config: { wide_screen_mode: true },
-    header: { template: look.template, title: { tag: 'plain_text', content: 'DSH 操作审批' } },
-    elements: [
-      { tag: 'div', text: { tag: 'lark_md', content: `**工具**：\`${toolName}\`\n${look.text}` } },
-      // Who decided, named rather than restricted: with approvals open to a
-      // room, the room should see whose press granted the escalation.
-      ...decidedBy === undefined
-        ? []
-        : [{ tag: 'note', elements: [{ tag: 'plain_text', content: `操作人：${decidedBy}` }] }],
-    ],
-  }
+  return buildSettledApprovalCard({ toolName, outcome, decidedBy })
 }
 
 /** How long one tool-activity label may be before it is ellipsized. */
 const ACTIVITY_LABEL_MAX_CHARS = 90
+
+/**
+ * How long a `reconnecting` may stand before the watchdog presumes the SDK's
+ * recovery dead. Generous on purpose: the SDK's own flapping cycles recover in
+ * seconds, and a false rebuild bounces a connection that was about to live.
+ */
+const RECONNECT_DEADLINE_MS = 3 * 60 * 1000
+
+/** Rebuild retry delays; the last entry repeats forever. */
+const RECONNECT_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000] as const
+
+/**
+ * Rebuild budget. The platform meters connection attempts, so an outage that
+ * never resolves must not have this watchdog hammering it: under the backoff
+ * above a genuinely degraded link uses roughly eight attempts an hour, which
+ * this admits, while a tight rebuild-drop loop trips it and pauses.
+ */
+const RECONNECT_QUOTA_WINDOW_MS = 30 * 60 * 1000
+const RECONNECT_QUOTA_LIMIT = 10
+
+/** The host tool this channel shadows so questions become chat cards. */
+const QUESTION_TOOL = 'ask_user_question'
+
+/**
+ * How many unclaimed reply targets may wait for their `user/message` event. A
+ * target is claimed within one turn ordinarily; the cap only matters when an
+ * agent dies between accepting a followup and starting its turn.
+ */
+const MAX_PENDING_TARGETS = 500
 
 /**
  * Reduce one presentation title to a single safe card line: the value is
@@ -317,31 +352,53 @@ function createCallPresenter(tools: HostTools | undefined, scope: unknown): Tool
 }
 
 /**
- * Bound one untrusted value to what an approval card may carry.
- * @param text - raw tool arguments as the model produced them.
- * @returns the value, ellipsized when it exceeds the card's budget.
- */
-function boundCardText(text: string): string {
-  return text.length <= CARD_ARGUMENTS_MAX_CHARS
-    ? text
-    : `${text.slice(0, CARD_ARGUMENTS_MAX_CHARS - 1)}…`
-}
-
-/**
  * Compose the parts of a chat agent's world this channel owns: the tools it
  * must not call, and the prompt sentence that tells the model what to do
  * instead. Both registrations are scoped to this one agent.
  * @param agentCtx - the agent's scope context, inside creation `setup`.
  * @param config - resolved plugin configuration.
  */
-function composeChatAgent(agentCtx: Context, config: ResolvedConfig): void {
-  if (config.denyTools.length === 0) return
+function composeChatAgent(
+  agentCtx: Context,
+  config: ResolvedConfig,
+  askQuestions: ((questions: readonly AskedQuestion[], sessionId: string | undefined) => Promise<QuestionAnswer[]>) | undefined,
+  planReview: PlanReviewPorts | undefined,
+): void {
+  const tools = agentCtx.get('tools') as HostTools | undefined
   const denied = new Set(config.denyTools)
+
+  // Shadow the host's question tool for THIS agent: its answer would otherwise
+  // surface on whichever UI claimed the single `userQuestions` provider, while
+  // the person who asked is here. Registered before the guard so a deployment
+  // that also denies the name still denies it — configuration wins.
+  const shadowed = askQuestions !== undefined
+    && !denied.has(QUESTION_TOOL)
+    && tools?.register !== undefined
+  if (shadowed) tools?.register?.(shadowQuestionTool(askQuestions))
+  // A registry too old to shadow leaves the host's GUI-only tool in place;
+  // denying it keeps the model from asking where no one is watching.
+  if (!shadowed && askQuestions !== undefined) denied.add(QUESTION_TOOL)
+
+  // The plan tool is shadowed for the same reason and on the same terms: its
+  // review reaches for that same single-provider seam. Only worth registering
+  // where a plan service exists to leave plan mode afterwards — without one
+  // the host tool is not composed either, so there is nothing to shadow.
+  const shadowedPlan = planReview !== undefined
+    && planReview.planMode() !== undefined
+    && !denied.has(PLAN_TOOL)
+    && tools?.register !== undefined
+  if (shadowedPlan) tools?.register?.(shadowPlanTool(planReview!))
+  if (!shadowedPlan && planReview?.planMode() !== undefined) denied.add(PLAN_TOOL)
+
+  // Emptied by a shadow that registered, so the guard and the prompt sentence
+  // are both keyed on what is ACTUALLY denied — a configured list is not the
+  // only way a name lands here, and neither is it a way one leaves.
+  if (denied.size === 0) return
   // A guard rather than `tools.restrict()`: restrict validates its names
   // against the inherited registry and THROWS for one this composition does
   // not have, which would fail every chat agent's creation over a tool the
   // deployment simply never composed.
-  ;(agentCtx.get('tools') as HostTools | undefined)?.guard(execution =>
+  tools?.guard(execution =>
     denied.has(execution.name)
       ? `${execution.name} is unavailable in this chat channel: its answer would surface on a `
         + 'different interface. Ask the user directly in your reply instead, and continue when they answer.'
@@ -351,9 +408,9 @@ function composeChatAgent(agentCtx: Context, config: ResolvedConfig): void {
   prompt?.section({
     name: 'lark-channel:interaction',
     order: 150,
-    text: 'You are talking to the user in a chat. To ask a question or seek approval for a plan, '
-      + 'write it in your reply — their next message is the answer. '
-      + `These tools are unavailable here: ${[...denied].join(', ')}.`,
+    text: 'You are talking to the user in a chat. '
+      + `These tools are unavailable here: ${[...denied].join(', ')}. `
+      + 'Ask in your reply instead — their next message is the answer.',
   })
 }
 
@@ -397,15 +454,25 @@ export function installBridge(
   notify: (line: string) => void,
   authorization: Authorization,
   persistState: (patch: object) => Promise<boolean> = async () => false,
+  liveness?: {
+    readonly deadlineMs?: number
+    readonly backoffMs?: readonly number[]
+    readonly quotaWindowMs?: number
+    readonly quotaLimit?: number
+  },
 ): void {
   const bySession = new Map<string, ChatBinding>()
   const pendingApprovals = new Map<string, PendingApproval>()
   /**
-   * Arguments of tool calls this turn requested, by call id. An approval names
-   * the call it decides but not what that call does, and the human cannot judge
-   * an escalation without seeing the command; the log already published these.
+   * Tool-call arguments by session, then call id, with the turn that made the
+   * call. An approval names the call it decides but not what that call does,
+   * and the human cannot judge an escalation without seeing the command. Keyed
+   * per session because call ids are only unique within a producer — one flat
+   * map let concurrent sessions overwrite each other's entries, showing one
+   * session's command on another session's card — and cleaned per (session,
+   * turn) because within a session an id is only known unique per turn.
    */
-  const pendingCallArguments = new Map<string, string>()
+  const callSnapshots = new Map<string, Map<string, { readonly turn: number; readonly arguments: string }>>()
   const defaultCwd = resolve(config.cwd ?? process.cwd())
 
   /** Which directory each conversation runs in, and the session id that pair owns. */
@@ -536,6 +603,67 @@ export function installBridge(
   /** Whether each live session is inside a turn right now, for `/status`. */
   const runningBySession = new Map<string, boolean>()
 
+  /**
+   * Reply targets by the UUID this bridge stamps on each followup, claimed
+   * when the host's `user/message` event echoes that id back inside a turn.
+   */
+  const targetByMessageId = new Map<string, ReplyTarget>()
+
+  /** Open intent-confirmation questions, and the two ways they get answered. */
+  const questions = new ChatQuestions({
+    send: async (chatId, card) => (await port.send(chatId, { card })).messageId,
+    update: async (messageId, card) => { await port.updateCard(messageId, card) },
+    report: notify,
+  })
+
+  /**
+   * Ask this agent's chat, one question at a time. Sequential on purpose: two
+   * open cards in one conversation would leave a typed answer ambiguous.
+   */
+  const askQuestions = async (
+    asked: readonly AskedQuestion[],
+    sessionId: string | undefined,
+  ): Promise<QuestionAnswer[]> => {
+    const binding = sessionId === undefined ? undefined : bySession.get(sessionId)
+    if (binding === undefined || sessionId === undefined) {
+      // No chat to ask in — answer empty rather than hang the turn.
+      return asked.map(question => ({ id: question.id, selected: [] }))
+    }
+    const answers: QuestionAnswer[] = []
+    for (const question of asked) {
+      answers.push(await questions.ask({ sessionId, chatId: binding.chatId, question }))
+    }
+    return answers
+  }
+
+  /**
+   * Review one plan in its own chat: the plan as an ordinary message, then the
+   * decision as a card.
+   *
+   * The message goes first so the card lands under the thing it is about, and
+   * a failed send throws before the card exists — a decision card above a plan
+   * nobody can read is worse than a tool error the model can act on.
+   */
+  const planReview: PlanReviewPorts = {
+    publish: async (sessionId, plan) => {
+      const binding = bySession.get(sessionId)
+      if (binding === undefined) throw new Error('this plan has no chat to present in')
+      await port.send(binding.chatId, { markdown: plan })
+    },
+    review: async (sessionId, heading, signal) => {
+      const binding = bySession.get(sessionId)
+      if (binding === undefined) throw new Error('this plan has no chat to review it')
+      const answer = await questions.ask({
+        sessionId,
+        chatId: binding.chatId,
+        question: planReviewQuestion(heading),
+        ...signal === undefined ? {} : { signal },
+      })
+      return { selected: answer.selected, ...answer.custom === undefined ? {} : { custom: answer.custom } }
+    },
+    planMode: () => ctx.get('planMode') as HostPlanMode | undefined,
+  }
+
   /** Resolved once; a display nicety must not be able to break activation. */
   let pluginVersion = ''
   try {
@@ -570,7 +698,7 @@ export function installBridge(
       presentCall: createCallPresenter(ctx.get('tools') as HostTools | undefined, toolScope),
       setup: async (agentCtx: Context) => {
         if (presets !== undefined && presetId !== undefined) await presets.mount(agentCtx, presetId)
-        composeChatAgent(agentCtx, config)
+        composeChatAgent(agentCtx, config, askQuestions, planReview)
       },
     }
   }
@@ -604,11 +732,18 @@ export function installBridge(
     },
     resume: async (sessionId) => {
       const composition = await compositionFor(sessionId)
-      return agents.resume({
+      const handle = await agents.resume({
         resumeSessionId: sessionId,
         agentOptions: routeBySession.get(sessionId) ?? modelSelection(),
         setup: composition.setup,
       })
+      // Resuming publishes too. A chat that already has a durable session
+      // NEVER takes the create rung again, so publishing only from there froze
+      // the panel at whatever this channel offered the day that session began:
+      // every command added afterwards existed, worked when typed, and was
+      // invisible to everyone who reached for `/`.
+      publishSlashPanel(handle.agent)
+      return handle
     },
     create: async (sessionId) => {
       const composition = await compositionFor(sessionId)
@@ -651,20 +786,48 @@ export function installBridge(
    * @returns the binding, the same object for every later message of the session.
    * @throws when the session's composition cannot be resolved.
    */
-  const bindingFor = async (sessionId: string, msg: NormalizedMessage): Promise<ChatBinding> => {
-    const existing = bySession.get(sessionId)
-    if (existing !== undefined) return existing
-    const { presentCall } = await compositionFor(sessionId)
-    // The renderer is the composition's last reader; dropping it here leaves the
-    // next conversation bound on this id to read the roster fresh.
-    compositions.delete(sessionId)
-    const binding: ChatBinding = {
-      chatId: msg.chatId,
-      chatType: msg.chatType,
-      renderer: renderFor(msg.chatId, presentCall),
+  /** Set by the disposal sweep, so a binding resolving late closes itself. */
+  let unwound = false
+
+  /**
+   * In-flight and settled binding creations, one per session id. A plain
+   * check-then-create raced two concurrent callers into two renderers, one of
+   * them orphaned but still aimed at — the same promise-cache pattern the
+   * compositions use makes creation single-flight. A model switch resumes the
+   * same session id and REUSES its binding on purpose: the renderer presents
+   * calls through the preset's view, which a model change does not alter.
+   */
+  const bindings = new Map<string, Promise<ChatBinding>>()
+  const bindingFor = (sessionId: string, msg: NormalizedMessage): Promise<ChatBinding> => {
+    let pending = bindings.get(sessionId)
+    if (pending === undefined) {
+      pending = (async (): Promise<ChatBinding> => {
+        const { presentCall } = await compositionFor(sessionId)
+        // The renderer is the composition's last reader; dropping it here leaves
+        // the next conversation bound on this id to read the roster fresh.
+        compositions.delete(sessionId)
+        const binding: ChatBinding = {
+          chatId: msg.chatId,
+          chatType: msg.chatType,
+          renderer: renderFor(msg.chatId, presentCall),
+        }
+        if (unwound) {
+          // The fiber unwound while this was composing; nothing will ever
+          // dispatch to this renderer, so it must not hold an open card.
+          void binding.renderer.close()
+          throw new Error('lark-channel: bridge unwound while binding')
+        }
+        bySession.set(sessionId, binding)
+        return binding
+      })()
+      bindings.set(sessionId, pending)
+      pending.catch(() => {
+        // Only the failure that still owns the slot clears it: a stale
+        // rejection must not evict a successor's live promise.
+        if (bindings.get(sessionId) === pending) bindings.delete(sessionId)
+      })
     }
-    bySession.set(sessionId, binding)
-    return binding
+    return pending
   }
 
   /**
@@ -728,6 +891,83 @@ export function installBridge(
   ctx.effect(() => () => { commands.abort() }, 'lark:commands')
   const commandSignal = (): AbortSignal => commands.signal
 
+  /**
+   * Which conversation a control card governs, and where it was published.
+   * Only a per-sender scope makes a conversation one person's; under the other
+   * scopes the room owns it, exactly as the room owns its approvals.
+   */
+  const subjectOf = (msg: NormalizedMessage): ConversationSubject => ({
+    key: conversationKey(config.sessionScope, msg),
+    chatId: msg.chatId,
+    chatType: msg.chatType,
+    ...config.sessionScope === 'chat-sender' ? { owner: msg.senderId } : {},
+  })
+
+  /**
+   * Dispose one conversation's agent so the next message walks the ladder
+   * again — under a new id after `/cd`, or resuming the same session under a
+   * new route after a model switch.
+   *
+   * The session id is captured HERE, before the caller mutates any mapping:
+   * `/cd` re-derives to the new id by release time, and the activity mark to
+   * clear belongs to the OLD one. Clearing it now rather than waiting for a
+   * `turn/end` is deliberate — this side disposed the agent, so "nothing is
+   * running" is a synchronous fact, and the closing event of an aborted turn is
+   * not guaranteed to arrive.
+   */
+  const releaseFor = (key: string): (() => Promise<void>) => {
+    const releasedId = chatWorkspaces.sessionIdFor(key)
+    return async () => {
+      await sessions.release(key)
+      runningBySession.delete(releasedId)
+      callSnapshots.delete(releasedId)
+      questions.cancelSession(releasedId)
+    }
+  }
+
+  /** Everything `/status` reports, read fresh from channel state. */
+  const statusFieldsFor = (subject: ConversationSubject): StatusFields => {
+    const sessionId = chatWorkspaces.sessionIdFor(subject.key)
+    const override = chatModels.routeFor(subject.key)
+    return {
+      workspace: chatWorkspaces.pathFor(subject.key),
+      workspaceIsDefault: chatWorkspaces.isDefault(subject.key),
+      route: override === undefined ? deploymentRoute() : formatRoute(override),
+      routeIsDefault: override === undefined,
+      sessionId,
+      bound: sessions.keyOf(sessionId) !== undefined,
+      running: runningBySession.get(sessionId) === true,
+      pendingApprovals: [...pendingApprovals.values()]
+        .filter(pending => pending.chatId === subject.chatId).length,
+      version: pluginVersion,
+    }
+  }
+
+  /**
+   * Whether one click may change the conversation its card names.
+   *
+   * A control card can be forwarded — the platform allows it and the payload
+   * travels with it — so the chat is checked first: the same buttons pressed
+   * in another room govern nothing. Beyond that a click is authorized exactly
+   * as a message would be, since it changes what the next message does.
+   * @param subject - the conversation the card was built for.
+   * @param evt - the click.
+   * @returns the refusal reason for the operator log, or undefined when allowed.
+   */
+  const refuseControlClick = (subject: ConversationSubject, evt: CardActionEvent): string | undefined => {
+    if (evt.chatId !== subject.chatId) {
+      return `click from chat ${evt.chatId} does not match the card's chat ${subject.chatId}`
+    }
+    if (subject.owner !== undefined && evt.operator.openId !== subject.owner) {
+      return `operator ${evt.operator.openId} does not own conversation ${subject.key}`
+    }
+    return refuseMessage(authorization, {
+      senderId: evt.operator.openId,
+      chatId: subject.chatId,
+      chatType: subject.chatType,
+    })
+  }
+
 
   const handleMessage = async (msg: NormalizedMessage): Promise<void> => {
     // Authorization before anything else: a message here starts a
@@ -768,37 +1008,21 @@ export function installBridge(
         // deliberate — this side disposed the agent, so "nothing is running"
         // is a synchronous fact, and the closing event of an aborted turn is
         // not guaranteed to arrive.
-        const releasedId = chatWorkspaces.sessionIdFor(key)
-        const release = async (): Promise<void> => {
-          await sessions.release(key)
-          runningBySession.delete(releasedId)
-        }
-        let reply: string
+        const release = releaseFor(key)
+        const subject = subjectOf(msg)
+        let reply: { markdown: string } | { card: object }
         if (channelCommand === CD_COMMAND || channelCommand === WS_COMMAND) {
-          reply = await runWorkspaceCommand(channelCommand, msg.content, key, chatWorkspaces, release)
+          reply = { markdown: await runWorkspaceCommand(channelCommand, msg.content, key, chatWorkspaces, release) }
         } else if (channelCommand === MODEL_COMMAND) {
-          reply = await runModelCommand(msg.content, key, chatModels, {
+          reply = await runModelCommand(msg.content, subject, chatModels, {
             catalog: modelCatalog,
             deploymentRoute,
             release,
           })
         } else {
-          const sessionId = chatWorkspaces.sessionIdFor(key)
-          const override = chatModels.routeFor(key)
-          reply = renderStatus({
-            workspace: chatWorkspaces.pathFor(key),
-            workspaceIsDefault: chatWorkspaces.isDefault(key),
-            route: override === undefined ? deploymentRoute() : formatRoute(override),
-            routeIsDefault: override === undefined,
-            sessionId,
-            bound: sessions.keyOf(sessionId) !== undefined,
-            running: runningBySession.get(sessionId) === true,
-            pendingApprovals: [...pendingApprovals.values()]
-              .filter(pending => pending.chatId === msg.chatId).length,
-            version: pluginVersion,
-          })
+          reply = { card: renderStatusCard(statusFieldsFor(subject), subject) }
         }
-        await port.send(msg.chatId, { markdown: reply }).catch(reportSendFailure)
+        await port.send(msg.chatId, reply).catch(reportSendFailure)
       } catch (error) {
         notify(`lark-channel: ${channelCommand} command failed in ${msg.chatId}: ${String(error)}`)
         await port
@@ -825,19 +1049,41 @@ export function installBridge(
         }
         return
       }
-      // Aimed before the turn starts: the reply belongs to the message that
-      // asked for it, and in a topic group an unaimed reply leaves the thread.
-      binding.renderer.aim({
-        messageId: msg.messageId,
-        ...msg.threadId === undefined ? {} : { threadId: msg.threadId },
-      } satisfies ReplyTarget)
+      // A message answering an open question belongs to that question, not to
+      // a new turn: the agent is mid-run waiting for it. Checked AFTER command
+      // dispatch, so `/stop` still interrupts a chat that owes an answer.
+      if (questions.answerByText(opened.handle.agent.session.id, msg.content)) return
+
       const images = await collectImages(
         msg,
         port,
         ctx.get('attachments') as HostAttachments | undefined,
         config.attachImages,
       )
-      opened.handle.agent.followup(chatUserMessage(msg, images))
+      // The reply target is registered by MESSAGE ID and claimed when the
+      // host's `user/message` event names it, because a turn is not one
+      // message: the react loop drains several queued followups into a single
+      // turn, so aiming at arrival — or by turn order — replies to the wrong
+      // message the moment two overlap. When a turn consumes several, the last
+      // claim wins: a batched answer addresses the latest ask.
+      const message = chatUserMessage(msg, images)
+      const target: ReplyTarget = {
+        messageId: msg.messageId,
+        ...msg.threadId === undefined ? {} : { threadId: msg.threadId },
+      }
+      if (targetByMessageId.size >= MAX_PENDING_TARGETS) {
+        const oldest = targetByMessageId.keys().next().value
+        if (oldest !== undefined) targetByMessageId.delete(oldest)
+      }
+      targetByMessageId.set(message.id, target)
+      try {
+        opened.handle.agent.followup(message)
+      } catch (error) {
+        // A rejected followup will never produce the claiming event; its
+        // target must not linger to be claimed by an unrelated turn.
+        targetByMessageId.delete(message.id)
+        throw error
+      }
     } catch (error) {
       notify(`lark-channel: agent creation failed for chat ${msg.chatId}: ${String(error)}`)
       ctx.logger.warn('agent creation failed for chat %s: %s', msg.chatId, error)
@@ -847,14 +1093,36 @@ export function installBridge(
     }
   }
 
-  const settleApproval = (id: string, outcome: HostApprovalOutcome, decidedBy?: string): boolean => {
+  /**
+   * Decide one approval exactly once. The asker is resolved immediately; the
+   * card is painted here when it already exists, and by the send's return path
+   * when the settlement raced the send — either way exactly one of them does.
+   */
+  const settleApproval = (
+    id: string,
+    outcome: HostApprovalOutcome,
+    decidedBy?: string,
+    repaint = true,
+  ): boolean => {
     const pending = pendingApprovals.get(id)
-    if (pending === undefined) return false
-    pendingApprovals.delete(id)
+    if (pending === undefined || pending.state === 'settled') return false
+    pending.state = 'settled'
+    pending.outcome = outcome
+    pending.decidedBy = decidedBy
+    pending.removeAbort?.()
     pending.settle(outcome)
-    void port
-      .updateCard(pending.messageId, settledCard(pending.toolName, outcome, decidedBy))
-      .catch(reportSendFailure)
+    if (!repaint) {
+      // The caller paints it — a click answers with the decided card, which is
+      // the one repaint path that cannot fail unnoticed.
+      pendingApprovals.delete(id)
+      return true
+    }
+    if (pending.messageId !== undefined) {
+      pendingApprovals.delete(id)
+      void port
+        .updateCard(pending.messageId, settledCard(pending.toolName, outcome, decidedBy))
+        .catch(reportSendFailure)
+    }
     return true
   }
 
@@ -863,44 +1131,164 @@ export function installBridge(
     request: HostApprovalRequest,
     next: () => Promise<HostApprovalOutcome>,
   ): Promise<HostApprovalOutcome> => {
+    // A withdrawn question needs no card — and the abort event does not replay
+    // for listeners added late, so the flag is the only signal that survives.
+    // Read through a call: the flag mutates across awaits, which control-flow
+    // narrowing would otherwise reason away.
+    const withdrawn = (): boolean => request.signal?.aborted === true
+    if (withdrawn()) return 'cancelled'
+
+    // The call's facts are copied NOW: the source map is mutable shared state,
+    // and the card must show exactly what the click will approve.
+    const recorded = request.callId === undefined
+      ? undefined
+      : callSnapshots.get(request.agent.session.id)?.get(request.callId)
+    const call: CallSnapshot | undefined = recorded === undefined || request.callId === undefined
+      ? undefined
+      : {
+          sessionId: request.agent.session.id,
+          turn: recorded.turn,
+          callId: request.callId,
+          arguments: recorded.arguments,
+        }
+
+    // Registered BEFORE the send: a click can arrive the moment the card
+    // renders, and an abort can arrive while the send is in flight — both need
+    // the question to already exist here.
     const id = randomUUID()
+    let resolveOutcome!: (outcome: HostApprovalOutcome) => void
+    const settled = new Promise<HostApprovalOutcome>((resolve) => { resolveOutcome = resolve })
+    const onAbort = (): void => { settleApproval(id, 'cancelled') }
+    const pending: PendingApproval = {
+      chatId: binding.chatId,
+      chatType: binding.chatType,
+      toolName: request.toolName,
+      call,
+      state: 'sending',
+      settle: resolveOutcome,
+      removeAbort: () => { request.signal?.removeEventListener('abort', onAbort) },
+    }
+    pendingApprovals.set(id, pending)
+    request.signal?.addEventListener('abort', onAbort, { once: true })
+
     let sent: SendResult
     try {
-      const command = request.callId === undefined ? undefined : pendingCallArguments.get(request.callId)
       sent = await port.send(binding.chatId, {
         card: approvalCard(
           request.toolName,
           request.reason,
-          command === undefined ? undefined : boundCardText(command),
+          call?.arguments,
           id,
         ),
       })
     } catch (error) {
-      // With no card in front of a human, let the next composed answerer decide.
       reportSendFailure(error)
-      return next()
+      if (settleApproval(id, 'cancelled') && !withdrawn()) {
+        // Nothing reached a human and nothing was withdrawn: let the next
+        // composed answerer decide instead of silently cancelling the ask.
+        pendingApprovals.delete(id)
+        return next()
+      }
+      pendingApprovals.delete(id)
+      return settled
     }
-    return new Promise<HostApprovalOutcome>((resolveOutcome) => {
-      pendingApprovals.set(id, {
-        chatId: binding.chatId,
-        chatType: binding.chatType,
-        messageId: sent.messageId,
-        toolName: request.toolName,
-        settle: resolveOutcome,
-      })
-      request.signal?.addEventListener(
-        'abort',
-        () => { settleApproval(id, 'cancelled') },
-        { once: true },
-      )
-    })
+
+    pending.messageId = sent.messageId
+    if (pending.state === 'settled') {
+      // Settled while the send was in flight: the asker is long answered, but
+      // the platform just rendered a live card — paint it settled here.
+      pendingApprovals.delete(id)
+      void port
+        .updateCard(sent.messageId, settledCard(pending.toolName, pending.outcome ?? 'cancelled', pending.decidedBy))
+        .catch(reportSendFailure)
+    } else {
+      pending.state = 'open'
+    }
+    return settled
   }
 
-  const handleCardAction = (evt: CardActionEvent): CardActionResponse | undefined => {
+  const handleCardAction = async (evt: CardActionEvent): Promise<CardActionResponse | undefined> => {
+    const choice = questionActionValue(evt.action.value)
+    if (choice !== undefined) {
+      // A question is a choice, not an escalation: anyone the chat serves may
+      // answer it, exactly as they could by typing the answer instead.
+      const settled = questions.answerByClick(choice)
+      return settled === undefined
+        ? { toast: toast('info', TOAST.questionGone) }
+        : { toast: toast('success', TOAST.answered), card: { type: 'raw', data: settled } }
+    }
+    const pick = modelActionValue(evt.action.value)
+    if (pick !== undefined) return switchModel(pick, evt)
+    const refresh = statusActionValue(evt.action.value)
+    if (refresh !== undefined) {
+      const refusal = refuseControlClick(refresh, evt)
+      if (refusal !== undefined) {
+        notify(`lark-channel: rejected a status refresh: ${refusal}`)
+        return { toast: toast('error', TOAST.notYours) }
+      }
+      return {
+        toast: toast('success', TOAST.refreshed),
+        card: { type: 'raw', data: renderStatusCard(statusFieldsFor(refresh), refresh) },
+      }
+    }
     const value = approvalActionValue(evt.action.value)
     if (value === undefined) return undefined
+    return decideApproval(value, evt)
+  }
+
+  /**
+   * Apply one model pick and hand back the repainted picker.
+   *
+   * The switch runs the same steps the typed `/model use` runs — record, then
+   * release so the next message resumes on the new route — because a click and
+   * a typed line must not leave the conversation in two different states.
+   * @param pick - the payload the pressed row carried.
+   * @param evt - the click, for authorization and the operator log.
+   * @returns the toast and the card to paint over the pressed one.
+   */
+  const switchModel = async (
+    pick: ModelActionValue,
+    evt: CardActionEvent,
+  ): Promise<CardActionResponse> => {
+    const refusal = refuseControlClick(pick, evt)
+    if (refusal !== undefined) {
+      notify(`lark-channel: rejected a model switch: ${refusal}`)
+      return { toast: toast('error', TOAST.notYours) }
+    }
+    const route = pick.route === undefined ? undefined : parseRoute(pick.route)
+    if (pick.route !== undefined && route === undefined) {
+      notify(`lark-channel: a model card carried an unreadable route: ${pick.route}`)
+      return { toast: toast('error', TOAST.modelUnreadable) }
+    }
+    const release = releaseFor(pick.key)
+    const result = route === undefined
+      ? await chatModels.reset(pick.key)
+      : await chatModels.set(pick.key, route)
+    if (result.changed) await release()
+    const painted = modelPickerCard(pick, await modelCatalog(), chatModels.routeFor(pick.key), deploymentRoute())
+    return {
+      toast: toast(
+        result.changed ? 'success' : 'info',
+        !result.changed ? TOAST.modelUnchanged : route === undefined ? TOAST.modelReset : TOAST.modelSwitched,
+      ),
+      card: { type: 'raw', data: painted },
+    }
+  }
+
+  /**
+   * Settle one approval from its card's buttons.
+   * @param value - the payload the pressed button carried.
+   * @param evt - the click, for authorization and the decider's name.
+   * @returns the toast and the settled card to paint over the live one.
+   */
+  const decideApproval = (value: ApprovalActionValue, evt: CardActionEvent): CardActionResponse => {
     const pending = pendingApprovals.get(value.id)
-    if (pending === undefined) return { toast: { type: 'info', content: '该审批已失效' } }
+    // Only an OPEN question takes a click: `sending` has no real card yet (a
+    // click claiming otherwise is forged or duplicated), and `settled` is
+    // merely waiting for its card to be painted.
+    if (pending === undefined || pending.state !== 'open') {
+      return { toast: toast('info', TOAST.approvalGone) }
+    }
     // Anyone who can see the card can press its button — a group may hold
     // people who are not authorized to run anything here, and one press grants
     // the escalation. The decision counts only from an authorized human, in
@@ -912,23 +1300,33 @@ export function installBridge(
     )
     if (clickRefusal !== undefined) {
       notify(`lark-channel: rejected an approval click: ${clickRefusal}`)
-      return { toast: { type: 'error', content: '你无权批准此操作' } }
+      return { toast: toast('error', TOAST.notApprover) }
     }
     const outcome: HostApprovalOutcome = value.decision === 'allow' ? 'allowed-once' : 'rejected'
     const decidedBy = evt.operator.name ?? evt.operator.openId
-    if (!settleApproval(value.id, outcome, decidedBy)) {
-      return { toast: { type: 'info', content: '该审批已失效' } }
+    const toolName = pending.toolName
+    if (!settleApproval(value.id, outcome, decidedBy, false)) {
+      return { toast: toast('info', TOAST.approvalGone) }
     }
     return {
-      toast: {
-        type: value.decision === 'allow' ? 'success' : 'info',
-        content: value.decision === 'allow' ? '已允许执行一次' : '已拒绝',
-      },
+      toast: value.decision === 'allow' ? toast('success', TOAST.allowed) : toast('info', TOAST.rejected),
+      // The decided card rides the click's own response. The patch API this
+      // otherwise relies on reports refusals in a body the SDK discards, so a
+      // failed repaint is invisible — a card left showing live buttons after
+      // its decision is worse than any toast.
+      card: { type: 'raw', data: settledCard(toolName, outcome, decidedBy) },
     }
   }
 
   // Inbound events. Registered before connect so no early event is dropped.
-  ctx.effect(() => port.on('message', (msg) => { void handleMessage(msg) }), 'lark:on(message)')
+  //
+  // The handler's promise is returned to the transport, never voided: the SDK
+  // serializes delivery per chat by awaiting it, so voiding the promise was
+  // discarding that guarantee — intake for a chat's messages (acquire, image
+  // downloads, workspace/model switches) could interleave freely. Serialized
+  // intake covers up to `followup()` returning; the turn itself still runs in
+  // the background, which is why reply targets bind to turns, not to arrival.
+  ctx.effect(() => port.on('message', handleMessage), 'lark:on(message)')
   ctx.effect(() => port.on('cardAction', handleCardAction), 'lark:on(cardAction)')
 
   // Observability. Without these, the failure modes an operator actually hits —
@@ -956,12 +1354,36 @@ export function installBridge(
 
   // A gap in the long connection is a gap in delivery: the transport has no
   // replay and no cursor, so events arriving while it is down are simply lost.
+  //
+  // The SDK's reconnect promise is supervised rather than trusted: its
+  // recovery loop has terminal states (verified give-up paths, and a hang
+  // that schedules nothing at all), and a bot whose job is to be reachable
+  // owns its own liveness. Rebuilding goes through the transport's public
+  // lifecycle, which the SDK documents as clearing terminal state.
+  const watchdog = createReconnectWatchdog({
+    deadlineMs: liveness?.deadlineMs ?? RECONNECT_DEADLINE_MS,
+    backoffMs: liveness?.backoffMs ?? RECONNECT_BACKOFF_MS,
+    quota: createAttemptQuota({
+      windowMs: liveness?.quotaWindowMs ?? RECONNECT_QUOTA_WINDOW_MS,
+      limit: liveness?.quotaLimit ?? RECONNECT_QUOTA_LIMIT,
+    }),
+    status: () => port.getConnectionStatus?.()?.state,
+    rebuild: async () => {
+      await port.disconnect().catch(() => {})
+      await port.connect()
+    },
+    report: notify,
+  })
+  ctx.effect(() => () => { watchdog.dispose() }, 'lark:watchdog')
+
   ctx.effect(() => port.on('reconnecting', () => {
+    watchdog.onReconnecting()
     notify('lark-channel: connection lost, reconnecting — events arriving now are not replayed')
     ctx.logger.warn('connection lost, reconnecting')
   }), 'lark:on(reconnecting)')
 
   ctx.effect(() => port.on('reconnected', () => {
+    watchdog.onReconnected()
     notify('lark-channel: connection restored')
     ctx.logger.info('connection restored')
   }), 'lark:on(reconnected)')
@@ -972,15 +1394,43 @@ export function installBridge(
   ctx.on('session/event', (session, event: HostSessionEvent) => {
     const binding = bySession.get(session.id)
     if (binding === undefined) return
-    if (isToolCallEvent(event)) {
-      pendingCallArguments.set(event.data.callId, event.data.arguments)
+    if (isTurnStartEvent(event)) {
+      // Fail closed: a turn that never names one of our messages sends its
+      // answer unaimed to the chat. Guessing — reusing the previous target —
+      // is how an injected turn's output lands on an unrelated thread.
+      binding.renderer.aim(undefined)
+    } else if (isUserMessageEvent(event)) {
+      const target = event.data.id === undefined ? undefined : targetByMessageId.get(event.data.id)
+      if (target !== undefined && event.data.id !== undefined) {
+        targetByMessageId.delete(event.data.id)
+        binding.renderer.aim(target)
+      }
+    } else if (isToolCallEvent(event)) {
+      let calls = callSnapshots.get(session.id)
+      if (calls === undefined) {
+        calls = new Map()
+        callSnapshots.set(session.id, calls)
+      }
+      calls.set(event.data.callId, { turn: event.data.turn, arguments: event.data.arguments })
     } else if (isTurnEndEvent(event)) {
-      pendingCallArguments.clear()
+      // Only THIS session's THIS turn: call ids are known unique per turn, so
+      // keeping exactly the live turn's entries is what makes an id lookup
+      // unambiguous — and other sessions' in-flight turns are none of ours.
+      const calls = callSnapshots.get(session.id)
+      if (calls !== undefined) {
+        for (const [callId, record] of calls) {
+          if (record.turn === event.data.turn) calls.delete(callId)
+        }
+        if (calls.size === 0) callSnapshots.delete(session.id)
+      }
       runningBySession.set(session.id, false)
     } else if (isStepStartEvent(event)) {
       runningBySession.set(session.id, true)
     }
     binding.renderer.handle(event)
+    // AFTER the renderer: the turn's own closing output (the answer, a failure
+    // line) still deserves its target; only what comes later must not.
+    if (isTurnEndEvent(event)) binding.renderer.aim(undefined)
   })
 
   // Approval questions for owned agents become cards; everything else delegates.
@@ -1004,18 +1454,19 @@ export function installBridge(
   // closed, open streaming cards settled. The session store owns the agents, so
   // it does the disposing — and it leaves an adopted one running for its owner.
   ctx.effect(() => () => {
-    for (const [id, pending] of [...pendingApprovals]) {
-      pendingApprovals.delete(id)
-      pending.settle('cancelled')
-    }
-    const bindings = [...bySession.values()]
+    unwound = true
+    for (const id of [...pendingApprovals.keys()]) settleApproval(id, 'cancelled')
+    pendingApprovals.clear()
+    for (const sessionId of [...bySession.keys()]) questions.cancelSession(sessionId)
+    const open = [...bySession.values()]
     bySession.clear()
+    bindings.clear()
     compositions.clear()
-    pendingCallArguments.clear()
+    callSnapshots.clear()
     runningBySession.clear()
     return Promise.allSettled([
       sessions.close(),
-      ...bindings.map((binding) => binding.renderer.close()),
+      ...open.map((binding) => binding.renderer.close()),
     ]).then(() => undefined)
   }, 'lark:agents')
 

@@ -6,6 +6,7 @@ import Loader from '@deepseek-ai/cordis-plugin-loader'
 import { Context } from '@deepseek-ai/cordis'
 import type { CardActionEvent } from '@larksuite/channel'
 import * as plugin from '../src/index.ts'
+import { parseRoute } from '../src/model.ts'
 import * as invariant from '../src/invariant.ts'
 import type { HostApprovalOutcome, HostApprovalRequest } from '../src/host.ts'
 import type { RegisterAppPort, RegisterAppRequest } from '../src/onboarding.ts'
@@ -13,6 +14,8 @@ import { stripToolCallMarkup } from '../src/outbound.ts'
 import { workspaceSessionId } from '../src/workspace.ts'
 import {
   approvalValueFromCard,
+  cardControls,
+  cardTexts,
   createFakeAttachments,
   createFakeCommands,
   createFakePresets,
@@ -205,9 +208,15 @@ describe('dsh-lark-channel', () => {
       const { outcome, values } = await boundApproval(harness)
       const allow = values.find((value) => value.decision === 'allow')!
       const response = await harness.fake.emitCardAction(clickAction(allow))
-      expect(response).toEqual({ toast: { type: 'success', content: '已允许执行一次' } })
+      expect(response).toMatchObject({ toast: { type: 'success', content: '已允许执行一次' } })
       expect(await outcome).toBe('allowed-once')
-      await vi.waitFor(() => { expect(harness.fake.updated).toHaveLength(1) })
+      // The decided card rides the click's own response rather than a patch,
+      // whose refusals the SDK discards — an unrepainted card would keep
+      // offering live buttons for a decision already made.
+      const painted = (response as { card?: { type: string; data: unknown } }).card
+      expect(painted?.type).toBe('raw')
+      expect(JSON.stringify(painted?.data)).toContain('已允许执行一次')
+      expect(harness.fake.updated).toHaveLength(0)
       await harness.dispose()
     })
 
@@ -229,7 +238,7 @@ describe('dsh-lark-channel', () => {
       expect(await outcome).toBe('allowed-once')
       // The question is already settled; a second click gets the stale toast.
       const stale = await harness.fake.emitCardAction(clickAction(allow))
-      expect(stale).toEqual({ toast: { type: 'info', content: '该审批已失效' } })
+      expect(stale).toMatchObject({ toast: { type: 'info', content: '该审批已失效' } })
       await harness.dispose()
     })
 
@@ -332,20 +341,44 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
-    it('denies the human-interaction tools whose answers cannot reach the chat', async () => {
+    it('shadows the question tool and denies only what it cannot answer here', async () => {
       const harness = await mountChannel()
       const created = await firstAgent(harness)
 
-      // Both ask through the single-provider userQuestions seam, which belongs
-      // to whichever UI registered it first — a chat agent would wait forever.
-      for (const name of ['ask_user_question', 'exit_plan_mode']) {
-        const reason = created.denyReason(name)
-        expect(reason).toBeDefined()
-        expect(reason).toContain('Ask the user directly in your reply')
-      }
-      expect(created.denyReason('bash')).toBeUndefined()
+      // Questions are answerable here — as a card — so the tool is shadowed in
+      // this agent's own layer rather than denied.
+      expect(created.registeredTools.map((tool) => tool.name)).toContain('ask_user_question')
+      expect(created.denyReason('ask_user_question')).toBeUndefined()
 
-      // The model is told up front, so it asks in prose instead of spending a call.
+      // With no plan service composed there is no host plan tool to shadow,
+      // and nothing else this channel cannot answer — so nothing is denied and
+      // no prompt section claims otherwise.
+      expect(created.denyReason('exit_plan_mode')).toBeUndefined()
+      expect(created.denyReason('bash')).toBeUndefined()
+      expect(created.promptSections.find((s) => s.name === 'lark-channel:interaction')).toBeUndefined()
+      await harness.dispose()
+    })
+
+    it('shadows the plan tool where a plan service exists to leave plan mode', async () => {
+      const harness = await mountChannel({}, { planMode: { set: () => 'queued' } })
+      const created = await firstAgent(harness)
+      expect(created.registeredTools.map((tool) => tool.name)).toContain('exit_plan_mode')
+      expect(created.denyReason('exit_plan_mode')).toBeUndefined()
+      await harness.dispose()
+    })
+
+    it('re-denies a tool whose shadow could not be registered', async () => {
+      // A registry too old to take a per-agent registration leaves the host's
+      // GUI-only tools in place; denying them keeps the model from asking
+      // where nobody is watching.
+      const harness = await mountChannel(
+        {},
+        { planMode: { set: () => 'queued' }, agentsCanRegisterTools: false },
+      )
+      const created = await firstAgent(harness)
+      expect(created.denyReason('exit_plan_mode')).toContain('Ask the user directly in your reply')
+      expect(created.denyReason('ask_user_question')).toBeDefined()
+      // And the model is told up front, so it asks in prose instead.
       const section = created.promptSections.find((s) => s.name === 'lark-channel:interaction')
       expect(section?.text).toContain('their next message is the answer')
       await harness.dispose()
@@ -374,7 +407,7 @@ describe('dsh-lark-channel', () => {
       // Setup still runs: this channel composes its own per-agent world
       // (denied interaction tools, prompt guidance) with or without a roster.
       expect(created.setupRan).toBe(true)
-      expect(created.denyReason('ask_user_question')).toBeDefined()
+      expect(created.registeredTools.map((tool) => tool.name)).toContain('ask_user_question')
       await harness.dispose()
     })
   })
@@ -649,6 +682,21 @@ describe('dsh-lark-channel', () => {
       expect(harness.fake.panelCreated).toEqual(
         expect.arrayContaining(['clear', 'compact', 'stop', 'help']),
       )
+      await harness.dispose()
+    })
+
+    it('publishes from a resumed session too, not just a fresh one', async () => {
+      const harness = await mountChannel({}, { commands: createFakeCommands().service })
+      // The chat has been talked to before, so this process resumes rather
+      // than creates — the path every long-lived deployment is always on.
+      harness.agents.resumable.add('lark-oc_chat_1')
+      await harness.fake.emitMessage(fakeMessage())
+      await vi.waitFor(() => { expect(harness.agents.resumed).toContain('lark-oc_chat_1') })
+      await vi.waitFor(() => {
+        expect(harness.fake.panelCreated).toEqual(
+          expect.arrayContaining(['stop', 'help', 'cd', 'ws', 'model', 'status']),
+        )
+      })
       await harness.dispose()
     })
 
@@ -1228,32 +1276,30 @@ describe('dsh-lark-channel', () => {
       return { outcome, card: card.card, values: approvalValueFromCard(card.card) }
     }
 
-    /** Every element of a card, flattened for content assertions. */
-    function elementsOf(card: object): { tag: string; text?: { tag: string; content: string } }[] {
-      return (card as { elements: { tag: string; text?: { tag: string; content: string } }[] }).elements
-    }
-
     it('shows the exact command, as literal text', async () => {
       const harness = await mountChannel()
       const { card } = await escalation(harness, '{"command":"rm -rf important-data"}')
-      const elements = elementsOf(card)
+      const texts = cardTexts(card)
 
-      const shown = elements.find((e) => e.text?.content.includes('rm -rf important-data'))
+      const shown = texts.find((text) => text.content.includes('rm -rf important-data'))
       expect(shown).toBeDefined()
       // Model-authored values render literally, so neither the command nor the
       // justification can pose as the card's own markup.
-      expect(shown!.text!.tag).toBe('plain_text')
-      const justification = elements.find((e) => e.text?.content.includes('看起来无害'))
-      expect(justification!.text!.tag).toBe('plain_text')
+      expect(shown!.tag).toBe('plain_text')
+      const justification = texts.find((text) => text.content.includes('看起来无害'))
+      expect(justification!.tag).toBe('plain_text')
       await harness.dispose()
     })
 
     it('bounds an oversized command', async () => {
       const harness = await mountChannel()
       const { card } = await escalation(harness, `{"command":"${'x'.repeat(2000)}"}`)
-      const shown = elementsOf(card).find((e) => e.text?.content.startsWith('{"command":"xxx'))
-      expect(shown!.text!.content.length).toBeLessThanOrEqual(600)
-      expect(shown!.text!.content.endsWith('…')).toBe(true)
+      const texts = cardTexts(card)
+      const shown = texts.find((text) => text.content.startsWith('{"command":"xxx'))
+      // Bounded, and the clip says so: a silently truncated command is one a
+      // reader can approve believing they saw all of it.
+      expect(shown!.content.length).toBeLessThanOrEqual(600)
+      expect(texts.some((text) => text.content.includes('已截断'))).toBe(true)
       await harness.dispose()
     })
 
@@ -1263,10 +1309,12 @@ describe('dsh-lark-channel', () => {
       const allow = values.find((v) => v.decision === 'allow')!
 
       // No approvers configured: the room decides, as it drives.
-      await harness.fake.emitCardAction(clickAction(allow, { openId: 'ou_colleague', name: '同事' }))
+      const response = await harness.fake.emitCardAction(
+        clickAction(allow, { openId: 'ou_colleague', name: '同事' }),
+      )
       expect(await outcome).toBe('allowed-once')
-      await vi.waitFor(() => { expect(harness.fake.updated).toHaveLength(1) })
-      const settled = JSON.stringify(harness.fake.updated[0]!.card)
+      // The card the click paints names who decided, so the room can see it.
+      const settled = JSON.stringify((response as { card?: { data: unknown } }).card?.data)
       expect(settled).toContain('同事')
       await harness.dispose()
     })
@@ -1277,7 +1325,7 @@ describe('dsh-lark-channel', () => {
       const allow = values.find((v) => v.decision === 'allow')!
 
       const response = await harness.fake.emitCardAction(clickAction(allow, { openId: 'ou_bystander' }))
-      expect(response).toEqual({ toast: { type: 'error', content: '你无权批准此操作' } })
+      expect(response).toMatchObject({ toast: { type: 'error', content: '你无权批准此操作' } })
       expect(harness.notices.some((line) => line.includes('ou_bystander is not in approvers'))).toBe(true)
 
       // Still pending until the named human presses it.
@@ -1293,7 +1341,7 @@ describe('dsh-lark-channel', () => {
 
       // A direct chat is judged by its sender rule, so a narrowed-out id cannot answer.
       const response = await harness.fake.emitCardAction(clickAction(allow, { openId: 'ou_stranger' }))
-      expect(response).toEqual({ toast: { type: 'error', content: '你无权批准此操作' } })
+      expect(response).toMatchObject({ toast: { type: 'error', content: '你无权批准此操作' } })
       await harness.fake.emitCardAction(clickAction(allow))
       expect(await outcome).toBe('allowed-once')
       await harness.dispose()
@@ -1305,7 +1353,7 @@ describe('dsh-lark-channel', () => {
       const allow = values.find((v) => v.decision === 'allow')!
 
       const response = await harness.fake.emitCardAction(clickAction(allow, { chatId: 'oc_elsewhere' }))
-      expect(response).toEqual({ toast: { type: 'error', content: '你无权批准此操作' } })
+      expect(response).toMatchObject({ toast: { type: 'error', content: '你无权批准此操作' } })
       await harness.fake.emitCardAction(clickAction(allow))
       expect(await outcome).toBe('allowed-once')
       await harness.dispose()
@@ -1615,13 +1663,89 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
+    /** Mount a channel whose llm registry advertises two routes. */
+    const withCatalog = async (): Promise<Awaited<ReturnType<typeof mountChannel>>> => mountChannel({}, {
+      llm: {
+        listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
+        listModels: async () => [
+          { provider: 'deepseek', id: 'deepseek-chat', name: 'DeepSeek Chat' },
+          { provider: 'deepseek', id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
+        ],
+      },
+    })
+
+    /** The picker card `/model` last sent to the chat. */
+    const pickerCard = (harness: { fake: { sent: { input: unknown }[] } }): object => {
+      const sent = harness.fake.sent.filter((m) => 'card' in (m.input as object))
+      return (sent.at(-1)!.input as { card: object }).card
+    }
+
+    it('switches the conversation from the picker, and repaints it', async () => {
+      const harness = await withCatalog()
+      await harness.fake.emitMessage(fakeMessage({ content: '/model' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('deepseek/deepseek-reasoner') })
+      const reasoner = cardControls(pickerCard(harness))
+        .find((control) => (control.value as { route?: string }).route === 'deepseek/deepseek-reasoner')!
+
+      const response = await harness.fake.emitCardAction(clickAction(reasoner.value))
+      expect(response).toMatchObject({ toast: { type: 'success' } })
+      // The repainted card comes back on the click, like every other decision
+      // this channel paints: the patch API's refusals are invisible.
+      const painted = (response as { card: { type: string; data: object } }).card
+      expect(painted.type).toBe('raw')
+      // The chosen route now states itself instead of offering a press.
+      expect(cardControls(painted.data).some((c) => (c.value as { route?: string }).route === 'deepseek/deepseek-reasoner'))
+        .toBe(false)
+
+      // And it is the route the next message actually runs on.
+      await harness.fake.emitMessage(fakeMessage({ content: 'hello' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      expect(harness.agents.created[0]!.agentOptions)
+        .toEqual({ provider: 'deepseek', model: 'deepseek-reasoner' })
+      await harness.dispose()
+    })
+
+    it('refuses a pick forwarded into another chat', async () => {
+      const harness = await withCatalog()
+      await harness.fake.emitMessage(fakeMessage({ content: '/model' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('deepseek/deepseek-reasoner') })
+      const pick = cardControls(pickerCard(harness))[0]!
+
+      const response = await harness.fake.emitCardAction(clickAction(pick.value, { chatId: 'oc_elsewhere' }))
+      expect(response).toMatchObject({ toast: { type: 'error' } })
+      await harness.fake.emitMessage(fakeMessage({ content: 'hello' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      // Unchanged: a forwarded card governs nothing, so the conversation is
+      // still on whatever the deployment gave it.
+      const route = parseRoute((pick.value as { route: string }).route)!
+      expect(harness.agents.created[0]!.agentOptions)
+        .not.toEqual({ provider: route.provider, model: route.model })
+      await harness.dispose()
+    })
+
+    it('refreshes the status card in place', async () => {
+      const harness = await mountChannel()
+      await harness.fake.emitMessage(fakeMessage({ content: '/status' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('尚未创建') })
+      const refresh = cardControls(pickerCard(harness))[0]!
+
+      await harness.fake.emitMessage(fakeMessage({ content: 'work on something' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const response = await harness.fake.emitCardAction(clickAction(refresh.value))
+      const painted = (response as { card: { data: object } }).card
+      // Repainted from live state, not from what the card said when it was sent.
+      expect(cardTexts(painted.data).some((text) => text.content.includes('尚未创建'))).toBe(false)
+      await harness.dispose()
+    })
+
     it('reports status without creating a session, and tracks turn activity', async () => {
       const harness = await mountChannel()
       await harness.fake.emitMessage(fakeMessage({ content: '/status' }))
       await vi.waitFor(() => { expect(sentText(harness)).toContain('尚未创建') })
       expect(sentText(harness)).toContain('lark-oc_chat_1')
       // The running plugin names its own version, read from this package's manifest.
-      expect(sentText(harness)).toMatch(/版本：`\d+\.\d+\.\d+/)
+      expect(sentText(harness)).toContain('版本')
+      expect(sentText(harness)).toMatch(/\d+\.\d+\.\d+/)
       expect(harness.agents.created).toHaveLength(0)
 
       await harness.fake.emitMessage(fakeMessage({ content: 'work on something' }))
@@ -1629,7 +1753,7 @@ describe('dsh-lark-channel', () => {
       const session = harness.agents.created[0]!.agent.session
       harness.ctx.emit('session/event', session, { type: 'step/start', data: { turn: 1, step: 1 } })
       await harness.fake.emitMessage(fakeMessage({ content: '/status' }))
-      await vi.waitFor(() => { expect(sentText(harness)).toContain('运行中') })
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('正在跑一轮任务') })
 
       harness.ctx.emit('session/event', session, {
         type: 'turn/end',
@@ -1671,6 +1795,242 @@ describe('dsh-lark-channel', () => {
       expect(harness.fake.panelCreated).toContain('status')
       await harness.dispose()
     })
+  })
+
+  describe('concurrency hardening', () => {
+    /** Everything sent to the chat, joined for containment checks. */
+    const sentText = (harness: { fake: { sent: { input: unknown }[] } }): string =>
+      harness.fake.sent.map(m => JSON.stringify(m.input)).join('\n')
+
+    it('an approval card shows ITS session\'s command, whatever other sessions do', async () => {
+      const harness = await mountChannel()
+      await harness.fake.emitMessage(fakeMessage({ content: 'a' }))
+      await harness.fake.emitMessage(fakeMessage({ chatId: 'oc_chat_2', content: 'b' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(2) })
+      const [a, b] = [harness.agents.created[0]!, harness.agents.created[1]!]
+
+      // Both sessions issue a call with the SAME id — producers number calls
+      // per turn — and B's turn even ENDS, which used to wipe a flat map.
+      harness.ctx.emit('session/event', a.agent.session, {
+        type: 'tool/call', data: { turn: 1, callId: 'call_1', name: 'bash', arguments: 'rm -rf /A' },
+      })
+      harness.ctx.emit('session/event', b.agent.session, {
+        type: 'tool/call', data: { turn: 1, callId: 'call_1', name: 'bash', arguments: 'ls /B' },
+      })
+      harness.ctx.emit('session/event', b.agent.session, {
+        type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+      })
+
+      void harness.ctx.waterfall('approval/request', {
+        agent: a.agent, toolName: 'bash', callId: 'call_1',
+      } as HostApprovalRequest, async (): Promise<HostApprovalOutcome> => 'unavailable')
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('rm -rf /A') })
+      expect(sentText(harness)).not.toContain('ls /B')
+      await harness.dispose()
+    })
+
+    it('a reused call id across turns resolves to the CURRENT turn\'s command', async () => {
+      const harness = await mountChannel()
+      await harness.fake.emitMessage(fakeMessage())
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const session = harness.agents.created[0]!.agent.session
+      harness.ctx.emit('session/event', session, {
+        type: 'tool/call', data: { turn: 1, callId: 'call_1', name: 'bash', arguments: 'old-turn-command' },
+      })
+      harness.ctx.emit('session/event', session, {
+        type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+      })
+      harness.ctx.emit('session/event', session, {
+        type: 'tool/call', data: { turn: 2, callId: 'call_1', name: 'bash', arguments: 'current-turn-command' },
+      })
+      void harness.ctx.waterfall('approval/request', {
+        agent: harness.agents.created[0]!.agent, toolName: 'bash', callId: 'call_1',
+      } as HostApprovalRequest, async (): Promise<HostApprovalOutcome> => 'unavailable')
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('current-turn-command') })
+      expect(sentText(harness)).not.toContain('old-turn-command')
+      await harness.dispose()
+    })
+
+    it('a question aborted before asking sends no card and settles cancelled', async () => {
+      const harness = await mountChannel()
+      await harness.fake.emitMessage(fakeMessage())
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const controller = new AbortController()
+      controller.abort()
+      const outcome = await harness.ctx.waterfall('approval/request', {
+        agent: harness.agents.created[0]!.agent, toolName: 'bash', signal: controller.signal,
+      } as HostApprovalRequest, async (): Promise<HostApprovalOutcome> => 'unavailable')
+      expect(outcome).toBe('cancelled')
+      expect(harness.fake.sent.some(m => 'card' in (m.input as object))).toBe(false)
+      await harness.dispose()
+    })
+
+    it('a question aborted DURING the card send leaves a settled card, not a live one', async () => {
+      const harness = await mountChannel()
+      await harness.fake.emitMessage(fakeMessage())
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      // Hold the card send in flight, abort while it hangs, then release it.
+      let release!: () => void
+      const held = new Promise<void>((resolve) => { release = resolve })
+      harness.fake.gates.beforeSend = () => held
+      const controller = new AbortController()
+      const outcome = harness.ctx.waterfall('approval/request', {
+        agent: harness.agents.created[0]!.agent, toolName: 'bash', signal: controller.signal,
+      } as HostApprovalRequest, async (): Promise<HostApprovalOutcome> => 'unavailable')
+      controller.abort()
+      delete harness.fake.gates.beforeSend
+      release()
+      // The asker unblocks once the in-flight send settles; the abort had
+      // already decided the outcome while it hung.
+      expect(await outcome).toBe('cancelled')
+      // The card the platform rendered anyway is painted settled — cancelled —
+      // and a click on it is refused.
+      await vi.waitFor(() => { expect(harness.fake.updated).toHaveLength(1) })
+      const card = harness.fake.sent.find(m => 'card' in (m.input as object))!.input as { card: object }
+      const allow = approvalValueFromCard(card.card).find(value => value.decision === 'allow')!
+      const response = await harness.fake.emitCardAction(clickAction(allow))
+      expect(response).toMatchObject({ toast: { type: 'info', content: '该审批已失效' } })
+      await harness.dispose()
+    })
+
+    it('replies target the message the turn CONSUMED, and the last of several', async () => {
+      const harness = await mountChannel({ showProcess: false })
+      await harness.fake.emitMessage(fakeMessage({ messageId: 'om_first', content: 'one' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const created = harness.agents.created[0]!
+      await harness.fake.emitMessage(fakeMessage({ messageId: 'om_second', content: 'two' }))
+      await vi.waitFor(() => { expect(created.agent.followup).toHaveBeenCalledTimes(2) })
+      const session = created.agent.session
+      const ids = created.agent.followup.mock.calls.map(call => call[0]!.id)
+
+      // One turn drains BOTH queued messages — the react loop does this — and
+      // the answer belongs to the latest ask.
+      harness.ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } })
+      harness.ctx.emit('session/event', session, { type: 'user/message', data: { id: ids[0] } })
+      harness.ctx.emit('session/event', session, { type: 'user/message', data: { id: ids[1] } })
+      harness.ctx.emit('session/event', session, {
+        type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: 'both' }] } },
+      })
+      harness.ctx.emit('session/event', session, {
+        type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+      })
+      await vi.waitFor(() => { expect(harness.fake.sent).toHaveLength(1) })
+      expect(harness.fake.sent[0]!.opts?.replyTo).toBe('om_second')
+
+      // A later turn that claims NOTHING — host-injected work — fails closed:
+      // its output reaches the chat unaimed rather than on a guessed target.
+      harness.ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 2 } })
+      harness.ctx.emit('session/event', session, {
+        type: 'assistant/message', data: { turn: 2, message: { content: [{ type: 'text', text: 'later' }] } },
+      })
+      harness.ctx.emit('session/event', session, {
+        type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } },
+      })
+      await vi.waitFor(() => { expect(harness.fake.sent).toHaveLength(2) })
+      expect(harness.fake.sent[1]!.opts).toBeUndefined()
+      await harness.dispose()
+    })
+  })
+
+  it('turns a model question into a chat card, answered by a click or a reply', async () => {
+    const harness = await mountChannel()
+    await harness.fake.emitMessage(fakeMessage({ content: 'ship it?' }))
+    await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+    const created = harness.agents.created[0]!
+
+    // The agent's own layer carries the shadow; running it is what the model does.
+    const shadow = created.registeredTools.find((tool) => tool.name === 'ask_user_question') as unknown as {
+      execute(args: unknown, exec: unknown): Promise<{ answers: { id: string; selected: string[]; custom?: string }[] }>
+    }
+    const answered = shadow.execute(
+      { questions: [{ id: 'q1', question: '部署到生产？', options: [{ label: '部署' }, { label: '取消' }] }] },
+      { agent: created.agent },
+    )
+
+    // It reaches the chat as a card with the model's own options.
+    await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
+    const card = harness.fake.sent.find((m) => 'card' in m.input)!.input as { card: object }
+    expect(JSON.stringify(card)).toContain('部署到生产？')
+
+    // A plain reply answers the question instead of starting another turn.
+    await harness.fake.emitMessage(fakeMessage({ content: '先部署到预发环境' }))
+    expect(await answered).toEqual({
+      answers: [{ id: 'q1', selected: [], custom: '先部署到预发环境' }],
+    })
+    // The answer went to the question, so no second turn was spent on it.
+    expect(created.agent.followup).toHaveBeenCalledTimes(1)
+    await harness.dispose()
+  })
+
+  it('reviews a plan in the chat: the plan as a message, the decision as a card', async () => {
+    const switched: { active: boolean }[] = []
+    const harness = await mountChannel({}, {
+      planMode: { set: (_agent: unknown, active: boolean) => { switched.push({ active }); return 'queued' } },
+    })
+    await harness.fake.emitMessage(fakeMessage({ content: 'plan the migration' }))
+    await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+    const created = harness.agents.created[0]!
+    const shadow = created.registeredTools.find((tool) => tool.name === 'exit_plan_mode') as unknown as {
+      execute(args: unknown, exec: unknown): Promise<{ approved: true }>
+    }
+    const plan = '# 迁移计划\n\n1. 先跑测试\n2. 再发预发'
+
+    const approved = shadow.execute({ plan }, { agent: created.agent })
+    // The plan arrives as an ordinary message, so its markdown renders; the
+    // card that follows carries only the decision.
+    await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
+    const asMessage = harness.fake.sent.find((m) => 'markdown' in m.input)
+    expect((asMessage!.input as { markdown: string }).markdown).toBe(plan)
+    const card = harness.fake.sent.find((m) => 'card' in m.input)!.input as { card: object }
+    expect(cardTexts(card.card).map((text) => text.content)).toContain('迁移计划')
+    expect(JSON.stringify(card.card)).not.toContain('先跑测试')
+
+    const approve = cardControls(card.card)[0]!
+    await harness.fake.emitCardAction(clickAction(approve.value))
+    expect(await approved).toEqual({ approved: true })
+    // Leaving plan mode is the host service's own switch, not a copy of it.
+    expect(switched).toEqual([{ active: false }])
+    await harness.dispose()
+  })
+
+  it('keeps planning when the review is answered with words instead', async () => {
+    const harness = await mountChannel({}, { planMode: { set: () => 'queued' } })
+    await harness.fake.emitMessage(fakeMessage({ content: 'plan it' }))
+    await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+    const created = harness.agents.created[0]!
+    const shadow = created.registeredTools.find((tool) => tool.name === 'exit_plan_mode') as unknown as {
+      execute(args: unknown, exec: unknown): Promise<{ approved: true }>
+    }
+
+    const settled = shadow.execute({ plan: '# 计划\n步骤' }, { agent: created.agent }).catch((e: Error) => e)
+    await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
+    await harness.fake.emitMessage(fakeMessage({ content: '再考虑一下回滚' }))
+
+    // The model gets the words back as a tool failure, which is what makes it
+    // revise and present again rather than proceed.
+    const error = await settled as Error
+    expect(error.message).toContain('keep planning')
+    expect(error.message).toContain('再考虑一下回滚')
+    await harness.dispose()
+  })
+
+  it('watchdog rebuilds the transport when a reconnect stalls past the deadline', async () => {
+    const { internals } = await import('../src/runtime.ts')
+    internals.reconnectDeadlineMs = 25
+    try {
+      const harness = await mountChannel()
+      expect(harness.fake.state.connects).toBe(1)
+      harness.fake.emitConnectionState('reconnecting')
+      // No 'reconnected' ever arrives — the incident this guards against.
+      await vi.waitFor(() => {
+        expect(harness.fake.state.disconnects).toBe(1)
+        expect(harness.fake.state.connects).toBe(2)
+      })
+      expect(harness.notices.join('\n')).toContain('watchdog rebuilt the transport')
+      await harness.dispose()
+    } finally {
+      delete internals.reconnectDeadlineMs
+    }
   })
 
   it('registers the invariant companion through its local host contract', async () => {

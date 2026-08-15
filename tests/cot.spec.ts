@@ -17,6 +17,10 @@ describe('thinking process (CoT)', () => {
     await harness.fake.emitMessage(fakeMessage())
     await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
     const session = harness.agents.created[0]!.agent.session
+    // The host names the consumed message when the turn takes it up; that
+    // claim — not message arrival — is what aims the turn's output.
+    const consumed = harness.agents.created[0]!.agent.followup.mock.calls[0]![0]
+    harness.ctx.emit('session/event', session, { type: 'user/message', data: { id: consumed.id } })
     return (type: string, data: unknown) => { harness.ctx.emit('session/event', session, { type, data }) }
   }
 

@@ -32,6 +32,38 @@ function failureDetail(error: unknown): string {
 }
 
 /**
+ * A walk finished under a generation that a release had already moved past.
+ * Not a failure of the conversation — the waiter simply retries under the new
+ * state — so it must be distinguishable from a real creation error, which is
+ * reported to the chat.
+ */
+class SupersededError extends Error {
+  constructor(key: string) {
+    super(`lark-channel: opening for ${key} was superseded by a release`)
+  }
+}
+
+/**
+ * Which conversation a control card governs, and where it was published.
+ *
+ * A card that changes a conversation's settings has to say which conversation
+ * it means, because a click arrives with only a chat and an operator — not the
+ * thread or the sender facet the key was derived from. The chat is carried so
+ * a FORWARDED card cannot act: the same payload pressed in another room no
+ * longer matches the room the card was published to.
+ */
+export interface ConversationSubject {
+  /** The conversation key, from {@link conversationKey}. */
+  readonly key: string
+  /** The chat the card was published to. */
+  readonly chatId: string
+  /** That chat's kind, so a click is authorized exactly as a message is. */
+  readonly chatType: string
+  /** The only operator the click may come from, when the scope is per-sender. */
+  readonly owner?: string | undefined
+}
+
+/**
  * Derive the stable conversation key one session owns. Pure: the same
  * conversation facet yields the same key in every process.
  * @param scope - the facet a session is bound to.
@@ -124,6 +156,13 @@ export class ConversationSessions {
   private readonly keys = new Map<string, string>()
   /** Acquisitions still walking the ladder, joined by concurrent messages. */
   private readonly opening = new Map<string, Promise<OpenedSession>>()
+  /**
+   * Release epoch per key. A release advances it SYNCHRONOUSLY before any
+   * await, so every walk that started earlier can tell its result is stale —
+   * a waiter that merely joined a shared opening promise would otherwise be
+   * handed the very agent the release is about to dispose.
+   */
+  private readonly generations = new Map<string, number>()
   private closed = false
 
   /**
@@ -160,26 +199,61 @@ export class ConversationSessions {
    * @throws {Error} when this store is closed, or when no ladder rung yielded an agent.
    */
   async acquire(msg: NormalizedMessage): Promise<OpenedSession> {
-    if (this.closed) throw new Error('lark-channel: sessions are closed')
-    const key = conversationKey(this.scope, msg)
-    const bound = this.opened.get(key)
-    if (bound !== undefined) {
-      // The binding is only reusable while it still IS this key's session: a
-      // workspace switch re-derives the id, and a message racing the switch's
-      // release could otherwise be handed an agent mid-disposal. A stale
-      // binding is released here — a second release is a no-op — and the walk
-      // below reaches the session the key derives to now.
-      if (bound.handle.agent.session.id === this.idFor(key)) return bound
-      await this.release(key)
+    return this.acquireKey(conversationKey(this.scope, msg))
+  }
+
+  /**
+   * Resolve the agent for one conversation key. A loop rather than a single
+   * walk: every await is a window for a release or a switch to move the
+   * conversation on, and a result that no longer matches the key's current
+   * state is retried under the new state instead of being handed out stale.
+   * @param key - the conversation key.
+   * @returns the bound session, the same object for every later call of its key.
+   * @throws {Error} when this store is closed, or when creation genuinely fails.
+   */
+  async acquireKey(key: string): Promise<OpenedSession> {
+    for (;;) {
+      if (this.closed) throw new Error('lark-channel: sessions are closed')
+      const generation = this.generation(key)
+      const bound = this.opened.get(key)
+      if (bound !== undefined) {
+        // Reusable only while it still IS this key's session: a workspace
+        // switch re-derives the id, and a stale binding is released — a second
+        // release is a no-op — before walking under the new state.
+        if (bound.handle.agent.session.id === this.idFor(key)) return bound
+        await this.release(key)
+        continue
+      }
+      let opening = this.opening.get(key)
+      if (opening === undefined) {
+        opening = this.bind(key, generation)
+        this.opening.set(key, opening)
+        // Failure clears the slot so the next message retries — but only the
+        // failure that still owns the slot, never a successor's promise.
+        opening.catch(() => {
+          if (this.opening.get(key) === opening) this.opening.delete(key)
+        })
+      }
+      let result: OpenedSession
+      try {
+        result = await opening
+      } catch (error) {
+        if (error instanceof SupersededError) continue
+        throw error
+      }
+      // Joined waiters validate what they were handed: the generation still
+      // current, the binding still published, the id still this key's.
+      if (
+        this.generation(key) === generation
+        && this.opened.get(key) === result
+        && result.handle.agent.session.id === this.idFor(key)
+      ) return result
     }
-    let opening = this.opening.get(key)
-    if (opening === undefined) {
-      opening = this.bind(key)
-      this.opening.set(key, opening)
-      // A failed acquisition clears the slot so the next message retries.
-      opening.catch(() => { this.opening.delete(key) })
-    }
-    return opening
+  }
+
+  /** The release epoch one key is currently in. */
+  private generation(key: string): number {
+    return this.generations.get(key) ?? 0
   }
 
   /**
@@ -191,19 +265,28 @@ export class ConversationSessions {
    * @returns whether a binding existed.
    */
   async release(key: string): Promise<boolean> {
-    // A concurrent acquisition must land before it can be released, or the
-    // released conversation would rebind itself the moment the walk finishes.
-    const opening = this.opening.get(key)
-    if (opening !== undefined) await opening.catch(() => {})
     const bound = this.opened.get(key)
-    if (bound === undefined) return false
+    const opening = this.opening.get(key)
+    if (bound === undefined && opening === undefined) return false
+    // The epoch advances SYNCHRONOUSLY, before any await: from this statement
+    // on, every earlier walk is stale and will retry rather than hand out what
+    // is being torn down here. Detaching the maps in the same breath means a
+    // fresh acquire starts cleanly instead of joining a doomed walk.
+    this.generations.set(key, this.generation(key) + 1)
     this.opened.delete(key)
-    this.keys.delete(bound.handle.agent.session.id)
-    if (bound.owned) {
-      await bound.handle.dispose().catch((error: unknown) => {
-        this.ladder.report(`lark-channel: disposing the released session for ${key} failed: ${failureDetail(error)}`)
-      })
+    if (this.opening.get(key) === opening) this.opening.delete(key)
+    if (bound !== undefined) {
+      this.keys.delete(bound.handle.agent.session.id)
+      if (bound.owned) {
+        await bound.handle.dispose().catch((error: unknown) => {
+          this.ladder.report(`lark-channel: disposing the released session for ${key} failed: ${failureDetail(error)}`)
+        })
+      }
     }
+    // A detached walk cleans up its own product: bind() sees the moved epoch,
+    // disposes what it made, and rejects as superseded. Waiting here is only
+    // so a caller may treat "released" as "quiescent".
+    if (opening !== undefined) await opening.then(() => undefined, () => undefined)
     return true
   }
 
@@ -219,6 +302,7 @@ export class ConversationSessions {
     this.opened.clear()
     this.keys.clear()
     this.opening.clear()
+    this.generations.clear()
     const settled = await Promise.allSettled(owned.map(session => session.handle.dispose()))
     const failures = settled.flatMap(result => result.status === 'rejected' ? [result.reason as unknown] : [])
     if (failures.length > 0) throw new AggregateError(failures, 'lark-channel: session disposal failed')
@@ -232,20 +316,29 @@ export class ConversationSessions {
    * mid-walk — the disposal sweep has already run, so the agent it produced is
    * taken down here instead of outliving its owner.
    */
-  private async bind(key: string): Promise<OpenedSession> {
+  /**
+   * Walk the ladder for one key and publish the result — unless the world
+   * moved while walking. A close or a release during the walk makes the
+   * product stale; the walk owns its own product, so it disposes what it made
+   * and rejects, rather than leaving that to whoever noticed later.
+   * @param key - the conversation key being bound.
+   * @param generation - the release epoch this walk belongs to.
+   */
+  private async bind(key: string, generation: number): Promise<OpenedSession> {
     const opened = await this.reach(key)
-    this.opening.delete(key)
-    if (this.closed) {
-      if (opened.owned) {
-        await opened.handle.dispose().catch((error: unknown) => {
-          this.ladder.report(`lark-channel: disposing the late session for ${key} failed: ${failureDetail(error)}`)
-        })
-      }
-      throw new Error(`lark-channel: sessions closed while opening ${key}`)
+    if (this.opening.get(key) !== undefined && this.generation(key) === generation && !this.closed) {
+      this.opening.delete(key)
+      this.opened.set(key, opened)
+      this.keys.set(opened.handle.agent.session.id, key)
+      return opened
     }
-    this.opened.set(key, opened)
-    this.keys.set(opened.handle.agent.session.id, key)
-    return opened
+    if (opened.owned) {
+      await opened.handle.dispose().catch((error: unknown) => {
+        this.ladder.report(`lark-channel: disposing the late session for ${key} failed: ${failureDetail(error)}`)
+      })
+    }
+    if (this.closed) throw new Error(`lark-channel: sessions closed while opening ${key}`)
+    throw new SupersededError(key)
   }
 
   /**

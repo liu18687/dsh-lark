@@ -357,16 +357,37 @@ describe('conversation sessions', () => {
       expect(host.disposals).toEqual([])
     })
 
-    it('release waits out an in-flight acquisition instead of missing it', async () => {
+    it('a release during an opening never hands that walk\'s product out', async () => {
       const host = createFakeLadder()
       const sessions = new ConversationSessions('chat', host.ladder)
       const opening = sessions.acquire(fakeMessage())
       const released = sessions.release('oc_chat_1')
 
-      await opening
+      // The superseded walk disposed its own product, and the acquire retried
+      // under the new epoch: the caller ends up with a FRESH, live session —
+      // never the one the release tore down.
+      const resolved = await opening
       expect(await released).toBe(true)
       expect(host.disposals).toEqual([sessionIdFor('oc_chat_1')])
-      expect(sessions.sessionIds).toEqual([])
+      expect(host.asked('create')).toHaveLength(2)
+      expect(sessions.sessionIds).toEqual([sessionIdFor('oc_chat_1')])
+      expect(sessions.keyOf(resolved.handle.agent.session.id)).toBe('oc_chat_1')
+    })
+
+    it('a waiter joining an opening that a release supersedes retries, not reuses', async () => {
+      const host = createFakeLadder()
+      const sessions = new ConversationSessions('chat', host.ladder)
+      const first = sessions.acquire(fakeMessage())
+      const released = sessions.release('oc_chat_1')
+      const second = sessions.acquire(fakeMessage())
+
+      const [a, b] = await Promise.all([first, second])
+      await released
+      // Exactly one disposal (the superseded product); both callers share the
+      // retried, live session.
+      expect(host.disposals).toEqual([sessionIdFor('oc_chat_1')])
+      expect(a).toBe(b)
+      expect(sessions.sessionIds).toEqual([sessionIdFor('oc_chat_1')])
     })
   })
 })
