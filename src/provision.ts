@@ -52,8 +52,8 @@ export const LOG_TRUNCATE_BYTES = 10 * 1024 * 1024
 /** What the operator asked for, after argument parsing. */
 export type Command =
   | { readonly kind: 'start'; readonly profile: string; readonly workspace: string }
-  | { readonly kind: 'add' | 'remove'; readonly profile: string; readonly name: string }
-  | { readonly kind: 'upgrade'; readonly profile: string; readonly workspace: string }
+  | { readonly kind: 'add' | 'remove'; readonly profile?: string; readonly name: string }
+  | { readonly kind: 'upgrade'; readonly profile?: string; readonly workspace?: string }
   | { readonly kind: 'stop' | 'restart' | 'status' }
   | { readonly kind: 'logs'; readonly follow: boolean }
   | { readonly kind: 'help' }
@@ -151,8 +151,9 @@ export function parseArguments(argv: readonly string[]): Command {
   if (verb === 'help' || verb === '--help' || verb === '-h') return { kind: 'help' }
   if (verb === 'upgrade') {
     const rest = argv.slice(1)
-    let profile = DEFAULT_PROFILE
-    let workspace = process.cwd()
+    // Absent means "whatever is installed", resolved when the command runs.
+    let profile: string | undefined
+    let workspace: string | undefined
     for (let index = 0; index < rest.length; index += 1) {
       const flag = rest[index]
       const value = rest[index + 1]
@@ -168,7 +169,11 @@ export function parseArguments(argv: readonly string[]): Command {
         throw new Error(`unknown option ${flag}`)
       }
     }
-    return { kind: 'upgrade', profile, workspace }
+    return {
+      kind: 'upgrade',
+      ...profile === undefined ? {} : { profile },
+      ...workspace === undefined ? {} : { workspace },
+    }
   }
   if (verb === 'stop' || verb === 'restart' || verb === 'status') {
     if (argv.length > 1) throw new Error(`${verb} takes no options`)
@@ -176,7 +181,7 @@ export function parseArguments(argv: readonly string[]): Command {
   }
   if (verb === 'add' || verb === 'remove') {
     const rest = argv.slice(1)
-    let profile = DEFAULT_PROFILE
+    let profile: string | undefined
     const names: string[] = []
     for (let index = 0; index < rest.length; index += 1) {
       const argument = rest[index]
@@ -193,7 +198,7 @@ export function parseArguments(argv: readonly string[]): Command {
     }
     const name = names[0]
     if (name === undefined || names.length > 1) throw new Error(`${verb} takes one bot name, e.g. \`${invocation()} ${verb} support\``)
-    return { kind: verb, profile, name }
+    return { kind: verb, name, ...profile === undefined ? {} : { profile } }
   }
   if (verb === 'logs') {
     const follow = argv[1] === '-f' || argv[1] === '--follow'
@@ -716,13 +721,19 @@ export function withoutInstanceRow(document: string, name: string): string | und
  * @param profile - the profile whose patch layer takes the row.
  * @param name - the instance name.
  */
-async function addBot(profile: string, name: string): Promise<void> {
+async function addBot(requested: string | undefined, name: string): Promise<void> {
   const refusal = refuseInstanceName(name)
   if (refusal !== undefined) throw new Error(refusal)
+  const profile = requested ?? installedService().profile ?? DEFAULT_PROFILE
   const path = patchPath(profile)
   if (!existsSync(path)) {
     throw new Error(`no profile at ${dirname(path)} — run \`${invocation()} start\` first`)
   }
+  // The row about to be written names an `instance`, which only a plugin new
+  // enough to have that option understands — an older one rejects the whole
+  // row and takes the bot down with it. So the profile is brought to this
+  // CLI's exact version FIRST, which is what `start` does for the same reason.
+  alignPluginVersion(profile)
   const added = withInstanceRow(readFileSync(path, 'utf8'), name)
   if (added === undefined) process.stderr.write(`dsh-lark-channel: bot ${name} is already configured — restarting to finish it\n`)
   else writeFileSync(path, added)
@@ -746,7 +757,8 @@ async function addBot(profile: string, name: string): Promise<void> {
  * @param profile - the profile whose patch layer holds the row.
  * @param name - the instance name.
  */
-async function removeBot(profile: string, name: string): Promise<void> {
+async function removeBot(requested: string | undefined, name: string): Promise<void> {
+  const profile = requested ?? installedService().profile ?? DEFAULT_PROFILE
   const path = patchPath(profile)
   if (!existsSync(path)) throw new Error(`no profile at ${dirname(path)}`)
   const removed = withoutInstanceRow(readFileSync(path, 'utf8'), name)
@@ -754,6 +766,100 @@ async function removeBot(profile: string, name: string): Promise<void> {
   writeFileSync(path, removed)
   await restart()
   process.stderr.write(`dsh-lark-channel: bot ${name} removed — its credential and settings stay, so adding it back reaches the same bot\n`)
+}
+
+/**
+ * Bring one profile's plugin to this CLI's exact version.
+ *
+ * The two have to agree: the CLI writes configuration the plugin then reads,
+ * and a profile still on an older build reads it with an older schema. Pinning
+ * the exact version rather than a range is what makes "the CLI you just ran"
+ * and "the code that will run" the same thing.
+ * @param profile - the profile to align.
+ */
+function alignPluginVersion(profile: string): void {
+  const dsh = requireDsh()
+  const version = ownVersion()
+  const installed = installedPluginVersion(profile)
+  if (installed === version) return
+  process.stderr.write(
+    installed === undefined
+      ? `dsh-lark-channel: installing the plugin ${version} into profile ${profile}\n`
+      : `dsh-lark-channel: profile ${profile} has ${installed}; bringing it to ${version}\n`,
+  )
+  must([dsh, 'plugin', '--profile', profile, 'add', `dsh-lark-channel@${version}`])
+}
+
+/**
+ * The plugin version a profile currently has installed.
+ * @param profile - the profile to inspect.
+ * @returns the version, or undefined when the profile has no plugin yet.
+ */
+export function installedPluginVersion(profile: string): string | undefined {
+  try {
+    const manifest = join(dshHome(), 'profiles', profile, 'node_modules', 'dsh-lark-channel', 'package.json')
+    const version = (JSON.parse(readFileSync(manifest, 'utf8')) as { version?: unknown }).version
+    return typeof version === 'string' ? version : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** What the installed unit says this bot actually runs as. */
+export interface InstalledService {
+  readonly profile: string
+  readonly workspace: string
+}
+
+/**
+ * Read the profile and workspace out of the unit that is actually installed.
+ *
+ * Every command that touches a running bot has to act on the bot that is
+ * running, not on a default. Guessing the profile from a constant and the
+ * workspace from the current directory is how `upgrade` run in /tmp rewrote a
+ * `--profile web --workspace /repo` service into `lark` and `/tmp` — the unit
+ * file already holds both, so it is the only honest source.
+ * @param document - the unit file's contents.
+ * @param platform - which unit format to read.
+ * @returns what the unit says, or undefined for a field it does not carry.
+ */
+export function readInstalledService(
+  document: string,
+  platform: NodeJS.Platform = process.platform,
+): Partial<InstalledService> {
+  if (platform === 'darwin') {
+    const profile = /<string>--profile<\/string>\s*<string>([^<]*)<\/string>/.exec(document)?.[1]
+    const workspace = /<key>WorkingDirectory<\/key><string>([^<]*)<\/string>/.exec(document)?.[1]
+    return {
+      ...profile === undefined ? {} : { profile: xmlUnescape(profile) },
+      ...workspace === undefined ? {} : { workspace: xmlUnescape(workspace) },
+    }
+  }
+  // The writer quotes each argument, so the quotes come back off here.
+  const profile = /^ExecStart=.*?--profile\s+["']?([^"'\s]+)["']?/m.exec(document)?.[1]
+  const workspace = /^WorkingDirectory=(.*)$/m.exec(document)?.[1]
+  return {
+    ...profile === undefined ? {} : { profile },
+    ...workspace === undefined ? {} : { workspace: workspace.trim() },
+  }
+}
+
+/** Undo the escaping {@link launchdPlist} applies to a value. */
+function xmlUnescape(value: string): string {
+  return value.replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&quot;', '"')
+    .replaceAll('&apos;', "'").replaceAll('&amp;', '&')
+}
+
+/**
+ * What the running bot is, for a command that must not move it.
+ * @returns the installed profile and workspace, each absent when unreadable.
+ */
+export function installedService(): Partial<InstalledService> {
+  try {
+    return readInstalledService(readFileSync(unitPath(), 'utf8'))
+  } catch {
+    return {}
+  }
 }
 
 /** How long a version check may hold up a command before it is abandoned. */
@@ -824,7 +930,14 @@ async function noteNewerRelease(self: string = invocation()): Promise<void> {
  * npx there is nothing to install — the next `start` already resolves the
  * newest — so it says that instead of pretending to work.
  */
-async function upgrade(profile: string, workspace: string): Promise<void> {
+async function upgrade(profile: string | undefined, workspace: string | undefined): Promise<void> {
+  // The installed unit is what this bot IS; a default profile and the current
+  // directory are what it would silently become.
+  const installed = installedService()
+  const target = {
+    profile: profile ?? installed.profile ?? DEFAULT_PROFILE,
+    workspace: workspace ?? installed.workspace ?? process.cwd(),
+  }
   if (invocation() !== 'dsh-lark-channel') {
     process.stderr.write(
       'dsh-lark-channel: nothing to upgrade through npx — `npx dsh-lark-channel@latest start`'
@@ -836,8 +949,10 @@ async function upgrade(profile: string, workspace: string): Promise<void> {
   must(['npm', 'install', '-g', 'dsh-lark-channel@latest'])
   // Re-exec rather than continue: the version that provisions the profile has
   // to be the version just installed, and this process is still the old one.
-  process.stderr.write('dsh-lark-channel: restarting the bot on the new version\n')
-  const code = passthrough(['dsh-lark-channel', 'start', '--profile', profile, '--workspace', workspace])
+  process.stderr.write(
+    `dsh-lark-channel: restarting the bot on the new version (profile ${target.profile}, workspace ${target.workspace})\n`,
+  )
+  const code = passthrough(['dsh-lark-channel', 'start', '--profile', target.profile, '--workspace', target.workspace])
   process.exitCode = code
 }
 

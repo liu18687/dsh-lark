@@ -21,6 +21,7 @@ import {
   invocation,
   isNewer,
   latestVersion,
+  readInstalledService,
   usage,
   newConsoleFilter,
   withInstanceRow,
@@ -272,7 +273,9 @@ describe('extra bots', () => {
   const EMPTY = '# Your patch layer for this dsh profile.\n[]\n'
 
   it('parses one bot name, and refuses anything else', () => {
-    expect(parseArguments(['add', 'support'])).toEqual({ kind: 'add', profile: 'lark', name: 'support' })
+    // No profile parsed means "whatever the installed unit runs", resolved at
+    // execution — a default here would edit a profile nobody is running.
+    expect(parseArguments(['add', 'support'])).toEqual({ kind: 'add', name: 'support' })
     expect(parseArguments(['remove', 'support', '--profile', 'work']))
       .toEqual({ kind: 'remove', profile: 'work', name: 'support' })
     expect(() => parseArguments(['add'])).toThrow('one bot name')
@@ -387,11 +390,9 @@ describe('how the command spells itself', () => {
 
 describe('upgrading', () => {
   it('parses the verb with the same options start takes', () => {
-    expect(parseArguments(['upgrade'])).toEqual({
-      kind: 'upgrade',
-      profile: 'lark',
-      workspace: process.cwd(),
-    })
+    // Bare `upgrade` carries neither: it must not move a service that was
+    // installed with another profile or another workspace.
+    expect(parseArguments(['upgrade'])).toEqual({ kind: 'upgrade' })
     expect(parseArguments(['upgrade', '--profile', 'work'])).toMatchObject({ kind: 'upgrade', profile: 'work' })
     expect(() => parseArguments(['upgrade', '--nope'])).toThrow('unknown option')
   })
@@ -412,5 +413,32 @@ describe('upgrading', () => {
     // The check is a courtesy on top of whatever the caller actually ran, so
     // it must cost that command nothing when it fails.
     await expect(latestVersion(1)).resolves.toBeUndefined()
+  })
+})
+
+describe('acting on the service that is installed', () => {
+  it('reads the profile and workspace back out of a launchd unit', () => {
+    const written = launchdPlist({ ...spec, profile: 'web', workspace: '/repo/with spaces' })
+    expect(readInstalledService(written, 'darwin')).toEqual({
+      profile: 'web',
+      workspace: '/repo/with spaces',
+    })
+  })
+
+  it('reads them back out of a systemd unit too', () => {
+    const written = systemdUnit({ ...spec, profile: 'web', workspace: '/repo' })
+    expect(readInstalledService(written, 'linux')).toEqual({ profile: 'web', workspace: '/repo' })
+  })
+
+  it('undoes the escaping the plist writer applied', () => {
+    const written = launchdPlist({ ...spec, profile: 'a&b', workspace: '/repo/<odd>' })
+    expect(readInstalledService(written, 'darwin')).toEqual({ profile: 'a&b', workspace: '/repo/<odd>' })
+  })
+
+  it('answers nothing for a document it cannot read', () => {
+    // Nothing is guessed from a half-written or foreign unit: the caller then
+    // falls back deliberately rather than silently moving the service.
+    expect(readInstalledService('not a unit file', 'darwin')).toEqual({})
+    expect(readInstalledService('[Service]\nExecStart=/bin/true\n', 'linux')).toEqual({})
   })
 })

@@ -15,6 +15,8 @@
 - The app secret is stored through the host `credentials` seam instead of the user settings document. Onboarding writes the scanned secret to the credential `LARK_APP_SECRET` and keeps only a reference in settings; a secret already sitting in the settings document moves behind that reference on the next boot, so an existing deployment is repaired by restarting rather than by scanning again. A deployment that injects `appSecret` in its composition still owns it, and one with no credentials provider composed keeps working exactly as before.
 
 ### Fixed
+- `upgrade`, `add`, and `remove` act on the service that is installed rather than on a default. Each read the profile from a constant and the workspace from the current directory, so `upgrade` run in `/tmp` rewrote a `--profile web --workspace /repo` service into `lark` and `/tmp`, and `add` edited a profile nobody was running. The installed unit already records both, so it is read back from there, and an explicit `--profile` / `--workspace` still wins.
+- `add` brings the profile's plugin to the CLI's exact version before writing a row. The row names an `instance`, an option only a new enough plugin has; an older one rejects the whole row and takes the bot down with it — so a new CLI could break a profile it had not updated.
 - A question the model marked `multi_select` can now be answered with more than one option. Its card was built from single-choice controls, so the first press settled a question that may take three answers; it now renders a form whose multi-select submits the chosen set in one action, carrying option positions rather than labels. A submission that names nothing leaves the card live, and typing an answer still works as it does for every other question.
 
 ## 0.0.5 — 2026-08-15
