@@ -132,42 +132,174 @@ describe('supervisorKind', () => {
 })
 
 describe('profile build policy', () => {
-  it('pre-seeds a fresh profile before its first pnpm install', () => {
+  /** Seed a profile directory with the workspace document a test starts from. */
+  const seedProfile = (document?: string): string => {
     const home = mkdtempSync(join(tmpdir(), 'dsh-home-'))
+    if (document !== undefined) {
+      mkdirSync(join(home, 'profiles', 'lark'), { recursive: true })
+      writeFileSync(join(home, 'profiles', 'lark', 'pnpm-workspace.yaml'), document)
+    }
+    return home
+  }
+
+  /** The profile's workspace document as it stands on disk. */
+  const readWorkspace = (home: string): string =>
+    readFileSync(join(home, 'profiles', 'lark', 'pnpm-workspace.yaml'), 'utf8')
+
+  /** The template DSH writes when it initializes a profile of its own. */
+  const DSH_TEMPLATE = 'packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n'
+
+  it('pre-seeds a fresh profile before its first pnpm install', () => {
+    const home = seedProfile()
+
     ensureProfileBuildPolicy('lark', home)
-    const document = readFileSync(join(home, 'profiles', 'lark', 'pnpm-workspace.yaml'), 'utf8')
+
+    const document = readWorkspace(home)
     expect(document).toContain('nodeLinker: hoisted')
+    expect(document).toContain('strictDepBuilds: false')
     expect(document).toContain('protobufjs: false')
   })
 
-  it('repairs the placeholder pnpm leaves after ERR_PNPM_IGNORED_BUILDS', () => {
-    const home = mkdtempSync(join(tmpdir(), 'dsh-home-'))
-    const directory = join(home, 'profiles', 'lark')
-    mkdirSync(directory, { recursive: true })
-    writeFileSync(join(directory, 'pnpm-workspace.yaml'), [
-      'packages:',
-      '  - .',
-      'allowBuilds:',
-      '  protobufjs: set this to true or false',
-      '',
-    ].join('\n'))
+  it('adds both halves to a profile built before this policy existed', () => {
+    const home = seedProfile(DSH_TEMPLATE)
 
     ensureProfileBuildPolicy('lark', home)
 
-    expect(readFileSync(join(directory, 'pnpm-workspace.yaml'), 'utf8'))
-      .toContain('protobufjs: false')
+    const document = readWorkspace(home)
+    expect(document).toContain(DSH_TEMPLATE.trimEnd())
+    expect(document).toContain('strictDepBuilds: false')
+    expect(document).toContain('allowBuilds:\n  protobufjs: false')
+  })
+
+  it('repairs the placeholder pnpm leaves after ERR_PNPM_IGNORED_BUILDS', () => {
+    const home = seedProfile('packages:\n  - .\nallowBuilds:\n  protobufjs: set this to true or false\n')
+
+    ensureProfileBuildPolicy('lark', home)
+
+    expect(readWorkspace(home)).toContain('  protobufjs: false')
   })
 
   it('preserves an operator choice to run protobufjs postinstall', () => {
-    const home = mkdtempSync(join(tmpdir(), 'dsh-home-'))
-    const directory = join(home, 'profiles', 'lark')
-    mkdirSync(directory, { recursive: true })
-    writeFileSync(join(directory, 'pnpm-workspace.yaml'), 'allowBuilds:\n  protobufjs: true\n')
+    const home = seedProfile('allowBuilds:\n  protobufjs: true\n')
 
     ensureProfileBuildPolicy('lark', home)
 
-    expect(readFileSync(join(directory, 'pnpm-workspace.yaml'), 'utf8'))
-      .toBe('allowBuilds:\n  protobufjs: true\n')
+    const document = readWorkspace(home)
+    expect(document).toContain('protobufjs: true')
+    expect(document).not.toContain('protobufjs: false')
+    expect(document).toContain('strictDepBuilds: false')
+  })
+
+  it('preserves an operator choice to keep the strict gate on', () => {
+    const home = seedProfile('strictDepBuilds: true\n')
+
+    ensureProfileBuildPolicy('lark', home)
+
+    const document = readWorkspace(home)
+    expect(document).toContain('strictDepBuilds: true')
+    expect(document).not.toContain('strictDepBuilds: false')
+    // The named decision is what carries a profile that keeps the gate on,
+    // since only an undecided build script trips it.
+    expect(document).toContain('  protobufjs: false')
+  })
+
+  it('never writes a second allowBuilds key, whatever shape the first one has', () => {
+    for (const existing of ['allowBuilds: {}\n', 'allowBuilds: # decided per package\n', 'allowBuilds: {esbuild: true}\n']) {
+      const home = seedProfile(`packages:\n  - .\n${existing}`)
+
+      ensureProfileBuildPolicy('lark', home)
+
+      const document = readWorkspace(home)
+      expect(document.match(/^allowBuilds\s*:/gm)).toHaveLength(1)
+      expect(document).toContain('strictDepBuilds: false')
+    }
+  })
+
+  it('leaves a protobufjs entry spelled a way it does not edit', () => {
+    const home = seedProfile('allowBuilds:\n  "protobufjs": false\n')
+
+    ensureProfileBuildPolicy('lark', home)
+
+    const document = readWorkspace(home)
+    expect(document.match(/protobufjs/g)).toHaveLength(1)
+    expect(document).toContain('strictDepBuilds: false')
+  })
+
+  it('keeps a comment on the allowBuilds line it opens up', () => {
+    const home = seedProfile('allowBuilds: {} # decided per package\n')
+
+    ensureProfileBuildPolicy('lark', home)
+
+    expect(readWorkspace(home)).toContain('allowBuilds: # decided per package\n  protobufjs: false')
+  })
+
+  it('leaves an allowBuilds block it cannot extend to the strict gate instead', () => {
+    const home = seedProfile('allowBuilds: {esbuild: true}\n')
+
+    ensureProfileBuildPolicy('lark', home)
+
+    const document = readWorkspace(home)
+    expect(document).toContain('allowBuilds: {esbuild: true}')
+    expect(document).not.toContain('protobufjs')
+  })
+
+  it('keeps other packages\' decisions when it records this one', () => {
+    const home = seedProfile('allowBuilds:\n  esbuild: true\n\nnodeLinker: hoisted\n')
+
+    ensureProfileBuildPolicy('lark', home)
+
+    const document = readWorkspace(home)
+    expect(document).toContain('  esbuild: true')
+    expect(document).toContain('  protobufjs: false')
+    expect(document).toContain('nodeLinker: hoisted')
+  })
+
+  it('indents its entry the way the block it joins is indented', () => {
+    const home = seedProfile('allowBuilds:\n    esbuild: true\n')
+
+    ensureProfileBuildPolicy('lark', home)
+
+    expect(readWorkspace(home)).toContain('allowBuilds:\n    protobufjs: false\n    esbuild: true')
+  })
+
+  it('reads a document written with CRLF endings', () => {
+    const home = seedProfile('packages:\r\n  - .\r\nallowBuilds:\r\n  protobufjs: set this to true or false\r\n')
+
+    ensureProfileBuildPolicy('lark', home)
+
+    const document = readWorkspace(home)
+    expect(document.match(/^allowBuilds\s*:/gm)).toHaveLength(1)
+    expect(document).toContain('  protobufjs: false')
+    expect(document).not.toContain('\r')
+  })
+
+  it('settles in one pass, so a second run rewrites nothing', () => {
+    const seeds = [
+      undefined,
+      DSH_TEMPLATE,
+      'allowBuilds:\n  protobufjs: set this to true or false\n',
+      'allowBuilds: {}\n',
+      'allowBuilds: {esbuild: true}\n',
+      'allowBuilds:\n    esbuild: true\n',
+      'strictDepBuilds: true\n',
+      'packages:\r\n  - .\r\n',
+    ]
+    for (const seed of seeds) {
+      const home = seedProfile(seed)
+      ensureProfileBuildPolicy('lark', home)
+      const settled = readWorkspace(home)
+
+      ensureProfileBuildPolicy('lark', home)
+
+      expect(readWorkspace(home)).toBe(settled)
+    }
+  })
+
+  it('refuses a profile name that would write outside the harness home', () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-home-'))
+    for (const name of ['..', '../escape', 'nested/profile', '']) {
+      expect(() => ensureProfileBuildPolicy(name, home)).toThrow(/invalid profile name/)
+    }
   })
 })
 

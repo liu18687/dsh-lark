@@ -17,7 +17,7 @@ dsh-lark-channel start
 
 终端会显示二维码。用飞书扫码完成应用创建，然后私聊机器人，或在群里 @ 它即可开始。
 
-启动命令会在首次安装依赖前写好 profile 的 pnpm 构建策略；`protobufjs` 不影响运行的提示型 postinstall 会被明确跳过，不需要再手工执行 `pnpm approve-builds`。
+启动命令会在首次安装依赖前写好 profile 的 pnpm 构建策略：未经批准的依赖构建脚本一律警告并跳过，而不是让安装失败；`protobufjs` 那个只打印提示的 postinstall 还会被按名字记为跳过。因此不需要手工执行 `pnpm approve-builds`。
 
 不想装到全局也可以直接跑，只是之后每条命令都要带 `npx`：
 

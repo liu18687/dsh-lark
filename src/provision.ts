@@ -49,16 +49,34 @@ export const ONBOARDING_WATCH_MS = 10 * 60 * 1000
 /** Log size past which `start` truncates it, since no supervisor rotates it. */
 export const LOG_TRUNCATE_BYTES = 10 * 1024 * 1024
 
-/** pnpm policy a standalone profile needs before its first dependency install. */
+/**
+ * pnpm policy a standalone profile needs before its first dependency install.
+ *
+ * The first four lines mirror the profile template DSH itself writes (see
+ * `initProfile` in `@deepseek-ai/dsh-app-boot`); keep them in step when the
+ * host changes its own. Because this file is written first, DSH's writer —
+ * which only fills in an absent file — never runs on these profiles.
+ */
 const PROFILE_PNPM_WORKSPACE = `packages:
   - .
 
 nodeLinker: hoisted
 autoInstallPeers: false
 
+strictDepBuilds: false
+
 allowBuilds:
   protobufjs: false
 `
+
+/** The value pnpm parks under `allowBuilds` for a script nobody has judged yet. */
+const PNPM_BUILD_PLACEHOLDER = 'set this to true or false'
+
+/** A top-level key line, which is also where any `allowBuilds` block ends. */
+const TOP_LEVEL_KEY = /^([A-Za-z_][\w-]*)\s*:(.*)$/
+
+/** One package's decision inside an `allowBuilds` block. */
+const ALLOW_BUILDS_ENTRY = /^(\s+protobufjs\s*:\s*)(.*)$/
 
 /** What the operator asked for, after argument parsing. */
 export type Command =
@@ -496,36 +514,159 @@ function requireDsh(): string {
 }
 
 /**
- * Make protobufjs's optional postinstall an explicit decision before pnpm runs.
+ * Refuse a profile name that would place the workspace file outside the home.
  *
- * DSH creates a profile and installs its first plugin in one command. With
- * pnpm 11, that first install writes a placeholder decision for protobufjs and
- * then exits with ERR_PNPM_IGNORED_BUILDS. Pre-seeding the workspace avoids the
- * failed first pass; repairing the exact placeholder also recovers profiles
- * left behind by an older CLI. An operator's explicit true/false choice wins.
+ * This function writes before any `dsh` process runs, so it is the first thing
+ * to touch disk for a named profile — ahead of the host's own check. The rule
+ * is the host's rule (`resolveProfileDir`), not a stricter one, so a name DSH
+ * accepts is never rejected here.
+ * @param name - the requested profile name.
+ * @returns the refusal to report, or undefined when the name is usable.
+ */
+function refuseProfileName(name: string): string | undefined {
+  const reserved = name === '' || name === '.' || name === '..' || name === 'node_modules'
+  return reserved || name.includes('/') || name.includes('\\')
+    ? `invalid profile name ${JSON.stringify(name)}`
+    : undefined
+}
+
+/** The key a top-level line declares, or undefined when the line declares none. */
+function topLevelKey(line: string): string | undefined {
+  return TOP_LEVEL_KEY.exec(line)?.[1]
+}
+
+/** A line's content with any trailing comment removed. */
+function withoutComment(text: string): string {
+  return text.replace(/#.*$/, '').trim()
+}
+
+/**
+ * The indentation a block already gives its entries, so an added one lines up.
+ * A mapping whose entries disagree on depth is not a document pnpm can read.
+ * @param block - the lines between a top-level key and the next one.
+ * @returns the existing indentation, or the two spaces a new block takes.
+ */
+function blockIndent(block: readonly string[]): string {
+  for (const line of block) {
+    const indent = /^(\s+)[^\s#]/.exec(line)?.[1]
+    if (indent !== undefined) return indent
+  }
+  return '  '
+}
+
+/**
+ * Turn off the strict gate, unless the operator has already ruled on it.
+ *
+ * This is the half that survives the next dependency. pnpm 11 defaults
+ * `strictDepBuilds` to true, which turns any unapproved build script — in a
+ * package nobody here has heard of yet — into a failed install. False returns
+ * pnpm to warning and skipping, which is what an unattended bot needs.
+ * @param lines - the workspace document, split into lines.
+ * @returns the lines, with the setting appended when it was absent.
+ */
+function settleStrictDepBuilds(lines: readonly string[]): readonly string[] {
+  if (lines.some(line => topLevelKey(line) === 'strictDepBuilds')) return lines
+  return [...lines, '', 'strictDepBuilds: false']
+}
+
+/**
+ * Record the protobufjs decision: this build script is skipped on purpose.
+ *
+ * Its postinstall only prints a notice, so the choice is worth naming rather
+ * than leaving to the blanket gate — and an operator who keeps
+ * `strictDepBuilds` on needs the named decision to install at all, since only
+ * an undecided script trips that gate. Editing is best-effort: an `allowBuilds`
+ * block this cannot extend without guessing is left exactly as it is, never
+ * duplicated — a second `allowBuilds` key makes the document unparseable and
+ * takes the profile down harder than the problem being fixed.
+ * {@link settleStrictDepBuilds} keeps the install passing in that case.
+ * @param lines - the workspace document, split into lines.
+ * @returns the lines, with the decision recorded where that was safe.
+ */
+function settleProtobufjs(lines: readonly string[]): readonly string[] {
+  const start = lines.findIndex(line => topLevelKey(line) === 'allowBuilds')
+  if (start === -1) return [...lines, '', 'allowBuilds:', '  protobufjs: false']
+
+  const following = lines.slice(start + 1).findIndex(line => topLevelKey(line) !== undefined)
+  const end = following === -1 ? lines.length : start + 1 + following
+  const block = lines.slice(start + 1, end)
+  const entry = block.findIndex(line => ALLOW_BUILDS_ENTRY.test(line))
+  if (entry !== -1) return replacePlaceholder(lines, start + 1 + entry)
+
+  // Named in a spelling this does not edit — quoted, say. Adding an entry
+  // beside it would be the duplicate key all over again, one level down.
+  if (block.some(line => withoutComment(line).includes('protobufjs'))) return lines
+
+  // A block mapping takes an indented entry; an empty `{}` is emptied into one
+  // first, comment kept. Any other shape is left alone.
+  const declaration = lines[start] ?? ''
+  const value = withoutComment(TOP_LEVEL_KEY.exec(declaration)?.[2] ?? '')
+  if (value !== '' && value !== '{}') return lines
+  return [
+    ...lines.slice(0, start),
+    declaration.replace(/:\s*\{\s*\}/, ':'),
+    `${blockIndent(block)}protobufjs: false`,
+    ...lines.slice(start + 1),
+  ]
+}
+
+/**
+ * Settle the placeholder pnpm parks in a profile it could not finish.
+ * @param lines - the workspace document, split into lines.
+ * @param index - line holding the protobufjs entry.
+ * @returns the lines, with a placeholder resolved and any real choice kept.
+ */
+function replacePlaceholder(lines: readonly string[], index: number): readonly string[] {
+  const parts = ALLOW_BUILDS_ENTRY.exec(lines[index] ?? '')
+  const prefix = parts?.[1]
+  if (prefix === undefined || withoutComment(parts?.[2] ?? '') !== PNPM_BUILD_PLACEHOLDER) return lines
+  return lines.with(index, `${prefix}false`)
+}
+
+/**
+ * Settle the build-script policy of a workspace document that already exists.
+ *
+ * Lines are split on either ending and rejoined on `\n`: a CRLF document whose
+ * keys went unrecognized would have policy appended a second time, and a second
+ * `allowBuilds` key is the unparseable file this exists to avoid.
+ * @param document - contents of the profile's `pnpm-workspace.yaml`.
+ * @returns the document to write, identical when nothing needed settling.
+ */
+function settleBuildPolicy(document: string): string {
+  const lines = settleProtobufjs(settleStrictDepBuilds(document.trimEnd().split(/\r?\n/)))
+  return `${lines.join('\n')}\n`
+}
+
+/**
+ * Make unapproved dependency build scripts a decided matter before pnpm runs.
+ *
+ * DSH creates a profile and installs its first plugin in one command. Under
+ * pnpm 11 that first install stops at ERR_PNPM_IGNORED_BUILDS — today over
+ * protobufjs, tomorrow over whatever a transitive dependency brings with it —
+ * after parking a placeholder decision in the profile. So the policy is two
+ * halves: `strictDepBuilds: false` so an unapproved script is warned about and
+ * skipped rather than fatal, and an explicit protobufjs entry saying this one
+ * was considered. Both are written before the first install, and a profile a
+ * previous CLI left mid-failure is repaired the same way. An operator's own
+ * choice, on either half, is never overwritten.
  * @param profile - profile whose package-manager policy should be ready.
  * @param home - harness home; injectable for tests.
+ * @throws {Error} when the profile name would write outside the home.
  */
 export function ensureProfileBuildPolicy(profile: string, home: string = dshHome()): void {
+  const refusal = refuseProfileName(profile)
+  if (refusal !== undefined) throw new Error(refusal)
+
   const path = join(home, 'profiles', profile, 'pnpm-workspace.yaml')
-  if (!existsSync(path)) {
+  const document = existsSync(path) ? readFileSync(path, 'utf8') : undefined
+  if (document === undefined || document.trim() === '') {
     mkdirSync(dirname(path), { recursive: true })
     writeFileSync(path, PROFILE_PNPM_WORKSPACE)
     return
   }
 
-  const document = readFileSync(path, 'utf8')
-  const repaired = document.replace(
-    /^(\s*protobufjs:\s*)set this to true or false\s*$/m,
-    '$1false',
-  )
-  if (repaired !== document) writeFileSync(path, `${repaired.trimEnd()}\n`)
-  if (/^\s*protobufjs:\s*(?:true|false)\s*$/m.test(repaired)) return
-
-  const withPolicy = /^allowBuilds:\s*$/m.test(repaired)
-    ? repaired.replace(/^allowBuilds:\s*$/m, 'allowBuilds:\n  protobufjs: false')
-    : `${repaired.trimEnd()}\n\nallowBuilds:\n  protobufjs: false\n`
-  writeFileSync(path, `${withPolicy.trimEnd()}\n`)
+  const settled = settleBuildPolicy(document)
+  if (settled !== document) writeFileSync(path, settled)
 }
 
 /** Create the profile when absent, then install the matching plugin version into it. */
