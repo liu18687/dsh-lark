@@ -18,8 +18,10 @@ import type {
 } from '@larksuite/channel'
 import {
   approvalCard as buildApprovalCard,
+  fileApprovalCard as buildFileApprovalCard,
   QUESTION_SELECT,
   settledApprovalCard as buildSettledApprovalCard,
+  settledFileApprovalCard as buildSettledFileApprovalCard,
   toast,
   TOAST,
 } from './cards.ts'
@@ -49,7 +51,7 @@ import type {
 import { isStepStartEvent, isToolCallEvent, isTurnEndEvent, isTurnStartEvent, isUserMessageEvent } from './host.ts'
 import { createCotRenderer } from './cot.ts'
 import type { CotPort } from './cot.ts'
-import { createMessageRenderer, createStreamRenderer } from './outbound.ts'
+import { createMessageRenderer, createStreamRenderer, replyOptions } from './outbound.ts'
 import type { OutboundPort, OutboundRenderer, ReplyTarget, ToolPresentation } from './outbound.ts'
 import { refuseApprovalClick, refuseMessage } from './authorization.ts'
 import type { Authorization } from './authorization.ts'
@@ -68,13 +70,25 @@ import {
 import type { CatalogEntry, ModelActionValue } from './model.ts'
 import { readMeters, renderStatusCard, STATUS_COMMAND, statusActionValue } from './status.ts'
 import type { StatusFields } from './status.ts'
-import { ChatQuestions, questionActionValue, shadowQuestionTool } from './questions.ts'
+import { ChatQuestions, QUESTION_TIMEOUT_MS, questionActionValue, shadowQuestionTool } from './questions.ts'
 import { PLAN_TOOL, planReviewQuestion, shadowPlanTool } from './plan.ts'
 import type { HostPlanMode, PlanReviewPorts } from './plan.ts'
 import type { AskedQuestion, QuestionAnswer } from './questions.ts'
 import { ownVersion } from './version.ts'
 import { collectImages } from './images.ts'
 import type { CollectedImages, ImagePort } from './images.ts'
+import { collectInboundFiles } from './files.ts'
+import type { CollectedFiles, InboundFilePort } from './files.ts'
+import {
+  describeReadFailure,
+  GET_COMMAND,
+  readOutboundFile,
+  runGetCommand,
+  SEND_FILE_TOOL,
+  sendFileTool,
+} from './outbound-file.ts'
+import type { OutboundFile, SendFilePorts } from './outbound-file.ts'
+import { failureDetail } from './format.ts'
 import { syncSlashPanel } from './slash-panel.ts'
 import type { SlashPanelPort } from './slash-panel.ts'
 import { ConversationSessions, conversationKey } from './session.ts'
@@ -89,7 +103,7 @@ import { instanceIdentity } from './instance.ts'
  * The transport surface the bridge drives. `LarkChannel` from
  * `@larksuite/channel` satisfies it structurally; tests substitute a fake.
  */
-export interface ChannelPort extends OutboundPort, SlashPanelPort, ImagePort, CotPort {
+export interface ChannelPort extends OutboundPort, SlashPanelPort, ImagePort, InboundFilePort, CotPort {
   /** Open the transport (WebSocket long connection by default). */
   connect(): Promise<void>
   /** Close the transport and release its resources. */
@@ -127,6 +141,12 @@ export interface ChannelPort extends OutboundPort, SlashPanelPort, ImagePort, Co
    * as "not known yet".
    */
   getBotIdentity?(): { readonly openId: string; readonly name?: string }
+  /**
+   * List a chat's human roster when the transport exposes it. This is optional
+   * because older channel implementations can still settle approvals using the
+   * callback's open id alone.
+   */
+  getChatMembers?(chatId: string): Promise<readonly { readonly id: string; readonly name?: string }[]>
   /** Replace a sent card's content in place. */
   updateCard(messageId: string, card: object): Promise<void>
 }
@@ -206,6 +226,13 @@ interface PendingApproval {
   readonly toolName: string
   /** Captured call facts; undefined when the asker named no call. */
   readonly call?: CallSnapshot | undefined
+  /**
+   * Paints this question's settled card; captured at ask time so each kind
+   * paints its own. A tool escalation and an outbound file settle through the
+   * same machinery and must not settle into the same card — the room needs to
+   * read what it just decided, not the shape of the last thing decided here.
+   */
+  readonly paint: (outcome: HostApprovalOutcome, decidedBy?: string) => object
   /** Set once the platform accepted the card. */
   messageId?: string | undefined
   state: 'sending' | 'open' | 'settled'
@@ -275,6 +302,64 @@ function settledCard(toolName: string, outcome: HostApprovalOutcome, decidedBy?:
   return buildSettledApprovalCard({ toolName, outcome, decidedBy })
 }
 
+/**
+ * Build the interactive card asking a group to authorize one outbound file.
+ *
+ * What the room is shown is the file's place inside the workspace and the
+ * workspace's own name, never {@link OutboundFile.path}: the canonical path is
+ * an absolute host path, and putting one in a group publishes the operator's
+ * home directory and login name to everyone in it. Both come off the canonical
+ * path the container check already cleared, so nothing about what the room is
+ * judging changes — only the prefix that identifies the machine goes.
+ * @param file - the file the workspace check cleared.
+ * @param bytes - the length of the buffer that will go out if this is allowed.
+ * Taken from the buffer rather than from the verdict, so the size on the card
+ * measures the artefact being approved and not whatever was on disk before it
+ * was read.
+ * @param id - correlation id carried by both decision buttons.
+ * @returns a Feishu card object for `send({ card })`.
+ */
+function fileApprovalCard(file: OutboundFile, bytes: number, id: string): object {
+  return buildFileApprovalCard({
+    path: file.pathInWorkspace,
+    workspace: file.workspaceName,
+    bytes,
+    allow: { kind: APPROVAL_ACTION, id, decision: 'allow' },
+    reject: { kind: APPROVAL_ACTION, id, decision: 'reject' },
+  })
+}
+
+/**
+ * Build the static replacement card shown after a file approval settles.
+ * @param file - the file that was offered, kept so the record says what was
+ * decided — named the same way the live card named it, and for the same reason.
+ * @param outcome - the closed decision; a timeout arrives here as `cancelled`.
+ * @param decidedBy - who pressed, when a person did.
+ * @returns a Feishu card object for `updateCard`.
+ */
+function settledFileCard(file: OutboundFile, outcome: HostApprovalOutcome, decidedBy?: string): object {
+  return buildSettledFileApprovalCard({
+    path: file.pathInWorkspace,
+    workspace: file.workspaceName,
+    outcome,
+    decidedBy,
+  })
+}
+
+/**
+ * The transport's own failure code, when the rejection carried one.
+ *
+ * Read structurally rather than through `instanceof`: `LarkChannelError` is a
+ * type-only import here, and the code is the half of the failure the model can
+ * act on — `rate_limited` means try later, `permission_denied` never will.
+ * @param error - the rejection value, which need not be an `Error`.
+ * @returns the code, or undefined when the failure named none.
+ */
+function channelErrorCode(error: unknown): string | undefined {
+  const code = (error as { code?: unknown } | null | undefined)?.code
+  return typeof code === 'string' && code !== '' ? code : undefined
+}
+
 /** How long one tool-activity label may be before it is ellipsized. */
 const ACTIVITY_LABEL_MAX_CHARS = 90
 
@@ -299,6 +384,37 @@ const RECONNECT_QUOTA_LIMIT = 10
 
 /** The host tool this channel shadows so questions become chat cards. */
 const QUESTION_TOOL = 'ask_user_question'
+
+/**
+ * How long an unanswered approval stands, in the whole minutes the sentence the
+ * model reads quotes. Derived rather than restated, so the number in the
+ * sentence cannot drift from the timer.
+ */
+const TIMEOUT_MINUTES = Math.round(QUESTION_TIMEOUT_MS / 60_000)
+
+/**
+ * How many outbound files one group chat may have waiting on a decision at once.
+ *
+ * This is a MEMORY ceiling before it is a courtesy. A group send reads the whole
+ * file into a `Buffer` before the room is asked (ADR 0004, and `deliverFile` on
+ * why the order cannot be the other way round), so every undecided card pins up
+ * to `maxSendFileBytes` — 20 MiB by default — for as long as the approval
+ * timeout allows, half an hour. The per-file ceiling bounds one of those; this
+ * bounds how many a chat can hold at once, and without it the product has no
+ * bound at all: a file dropped into a workspace can carry "send these twenty
+ * files", the model can raise twenty parallel calls off one injected
+ * instruction, and 400 MiB of pinned heap per chat is a process the operator
+ * loses rather than a card someone declines.
+ *
+ * Three, because it is the count that has to survive both readings: enough that
+ * a turn legitimately handing over a diff, a log and a screenshot never meets
+ * the wall, and few enough that a room is never asked to triage a stack of
+ * decisions — an approver facing ten cards approves them, which is precisely the
+ * fatigue ADR 0002 declined to build. Not configurable, for that second reason:
+ * a deployment raising it to fifty would be buying back the fatigue and the
+ * heap together.
+ */
+const MAX_PENDING_FILE_SENDS = 3
 
 /**
  * How many unclaimed reply targets may wait for their `user/message` event. A
@@ -366,16 +482,22 @@ function createCallPresenter(tools: HostTools | undefined, scope: unknown): Tool
 
 /**
  * Compose the parts of a chat agent's world this channel owns: the tools it
- * must not call, and the prompt sentence that tells the model what to do
- * instead. Both registrations are scoped to this one agent.
+ * must not call, the one tool this channel adds, and the prompt sentence that
+ * tells the model what to do instead. Every registration is scoped to this one
+ * agent.
  * @param agentCtx - the agent's scope context, inside creation `setup`.
  * @param config - resolved plugin configuration.
+ * @param askQuestions - how a question reaches this agent's chat, when it can.
+ * @param planReview - how a plan is reviewed in this agent's chat, when it can be.
+ * @param sendFiles - how an artifact reaches this agent's chat, when it may.
+ * @param self - the bot account this agent speaks as.
  */
 function composeChatAgent(
   agentCtx: Context,
   config: ResolvedConfig,
   askQuestions: ((questions: readonly AskedQuestion[], sessionId: string | undefined) => Promise<QuestionAnswer[]>) | undefined,
   planReview: PlanReviewPorts | undefined,
+  sendFiles: SendFilePorts | undefined,
   self: BotSelf,
 ): void {
   const tools = agentCtx.get('tools') as HostTools | undefined
@@ -404,13 +526,35 @@ function composeChatAgent(
   if (shadowedPlan) tools?.register?.(shadowPlanTool(planReview!))
   if (!shadowedPlan && planReview?.planMode() !== undefined) denied.add(PLAN_TOOL)
 
+  // `send_file` is NOT a shadow — the host has no tool of that name — but it is
+  // registered on the same terms, because it is the same kind of thing: a
+  // capability that exists only because there is a chat to use it on. Unlike a
+  // shadow it is denied whenever it is absent, deployment switch included: a
+  // model that reads "unavailable here" writes its findings into the reply,
+  // while one that merely never sees the tool keeps offering to send a file.
+  const registersSendFile = sendFiles !== undefined
+    && !denied.has(SEND_FILE_TOOL)
+    && tools?.register !== undefined
+  if (registersSendFile) tools?.register?.(sendFileTool(sendFiles!))
+  else {
+    // A deployment that turned the switch off, or denied the name, decided this
+    // and needs no telling. A registry too old to take a per-agent tool did NOT:
+    // the capability the deployment configured ON is simply missing, and the
+    // console is the only place that fact can surface (§9 of the design).
+    if (sendFiles !== undefined && !denied.has(SEND_FILE_TOOL)) {
+      sendFiles.report(`lark-channel: ${SEND_FILE_TOOL} could not be registered for this agent `
+        + '(this host tool registry takes no per-agent tools), so the model cannot send files in this chat')
+    }
+    denied.add(SEND_FILE_TOOL)
+  }
+
   // Every chat agent gets its bearings, denials or none: an agent told nothing
   // about where it woke up treats a chat like a ticket queue.
   const prompt = agentCtx.get('systemPrompt') as HostSystemPrompt | undefined
   prompt?.section({
     name: PRESENCE_SECTION,
     order: PRESENCE_ORDER,
-    text: presenceSection(self, [...denied]),
+    text: presenceSection(self, [...denied], config.receiveFiles),
   })
 
   if (denied.size === 0) return
@@ -419,20 +563,49 @@ function composeChatAgent(
   // not have, which would fail every chat agent's creation over a tool the
   // deployment simply never composed.
   tools?.guard(execution =>
-    denied.has(execution.name)
-      ? `${execution.name} is unavailable in this chat channel: its answer would surface on a `
-        + 'different interface. Ask the user directly in your reply instead, and continue when they answer.'
-      : undefined,
+    denied.has(execution.name) ? denialReason(execution.name) : undefined,
   )
+}
+
+/**
+ * Why one denied tool cannot run here, in words true of THAT tool.
+ *
+ * A refusal is what steers the model's next move, so a reason that does not
+ * describe its situation is worse than a terse one: telling it to "ask the user
+ * directly in your reply" about a file send names an answer that does not exist,
+ * and a model that reads it goes looking for a question to ask.
+ * @param name - the tool the guard is refusing.
+ * @returns the sentence the model reads instead of a result.
+ */
+function denialReason(name: string): string {
+  const unavailable = `${name} is unavailable in this chat channel`
+  if (name === QUESTION_TOOL || name === PLAN_TOOL) {
+    return `${unavailable}: its answer would surface on a different interface. `
+      + 'Ask the user directly in your reply instead, and continue when they answer.'
+  }
+  if (name === SEND_FILE_TOOL) {
+    // Nothing here is waiting for an answer: there is no file channel at all.
+    return `${unavailable}: no file can leave the workspace for this chat. `
+      + 'Put what matters into your reply — the findings, the excerpt that counts — rather than offering an attachment.'
+  }
+  // Anything the deployment denied by configuration. It may be a tool with no
+  // answer, no interface, and no substitute, so this promises none of those.
+  return `${unavailable}. Continue without it, and say in your reply what you could not do.`
 }
 
 /**
  * Create an identified user message from one chat input. Group messages carry
  * the sender so the model can tell voices apart; direct messages stay verbatim.
  * @param msg - normalized inbound chat message.
+ * @param images - what this message's images became.
+ * @param inbound - what this message's files became on disk.
  * @returns a frozen user message for `agent.followup()`.
  */
-export function chatUserMessage(msg: NormalizedMessage, images: CollectedImages): HostUserMessage {
+export function chatUserMessage(
+  msg: NormalizedMessage,
+  images: CollectedImages,
+  inbound: CollectedFiles,
+): HostUserMessage {
   const spoken = msg.chatType === 'group'
     ? `${msg.senderName ?? msg.senderId}: ${msg.content}`
     : msg.content
@@ -440,8 +613,10 @@ export function chatUserMessage(msg: NormalizedMessage, images: CollectedImages)
   // said in their own chat, mention or not.
   const note = msg.senderIsBot === true ? batonNote(msg.senderId) : ''
   // Notes ride the text so a model that cannot be shown an image still knows
-  // one was sent, instead of answering as though it had seen it.
-  const text = [spoken, note, ...images.notes].filter(line => line !== '').join('\n')
+  // one was sent, instead of answering as though it had seen it. Files come
+  // first: a path is something the model can act on, while an image note is
+  // usually the reason it cannot see one.
+  const text = [spoken, note, ...inbound.notes, ...images.notes].filter(line => line !== '').join('\n')
   const content: HostContentBlock[] = [
     ...text === '' ? [] : [{ type: 'text' as const, text }],
     ...images.blocks,
@@ -479,6 +654,19 @@ export function installBridge(
   const bySession = new Map<string, ChatBinding>()
   const pendingApprovals = new Map<string, PendingApproval>()
   /**
+   * Outbound file sends holding a buffer, per chat id — the group ones, which
+   * are the sends that wait on a human while they hold it.
+   *
+   * A count of live SENDS rather than of open cards, because the buffer is read
+   * before the card exists: counting cards would leave every reader of the count
+   * blind to exactly the window where the bytes have been read and nobody has
+   * been asked yet, and a fistful of parallel calls all pass through that window
+   * together. Keyed by chat rather than by session so the several sessions a room
+   * can hold — one per thread, or per member — cannot each open their own quota
+   * into the same room.
+   */
+  const heldFileSends = new Map<string, number>()
+  /**
    * Tool-call arguments by session, then call id, with the turn that made the
    * call. An approval names the call it decides but not what that call does,
    * and the human cannot judge an escalation without seeing the command. Keyed
@@ -488,6 +676,15 @@ export function installBridge(
    * turn) because within a session an id is only known unique per turn.
    */
   const callSnapshots = new Map<string, Map<string, { readonly turn: number; readonly arguments: string }>>()
+  /**
+   * Workspaces already told that inbound files land inside them. Keyed by path
+   * rather than by conversation, because the untracked directory is the
+   * workspace's problem and not the chat's: two conversations in one directory
+   * have one `.gitignore` to edit between them, and a `/cd` into a directory
+   * nobody has mentioned yet earns the hint again. Per-bridge state, so a second
+   * plugin instance starts with its own — and a test does too.
+   */
+  const hintedWorkspaces = new Set<string>()
   const defaultCwd = resolve(config.cwd ?? process.cwd())
 
   /** Which directory each conversation runs in, and the session id that pair owns. */
@@ -577,7 +774,7 @@ export function installBridge(
   // the shipped profiles compose no logger printer, and a silently swallowed
   // outbound failure is indistinguishable from a hung chat.
   const reportSendFailure = (error: unknown): void => {
-    const detail = error instanceof Error ? error.message : String(error)
+    const detail = failureDetail(error)
     notify(`lark-channel: outbound send failed: ${detail}`)
     ctx.logger.warn('outbound send failed: %s', detail)
   }
@@ -636,6 +833,13 @@ export function installBridge(
    */
   const targetByMessageId = new Map<string, ReplyTarget>()
 
+  /**
+   * Where a session's replies are currently aimed, so an artifact lands under
+   * the ask. The renderer already knows this, but it keeps the aim privately
+   * inside its own send options, and a file does not go out through it.
+   */
+  const aimBySession = new Map<string, ReplyTarget>()
+
   /** Open intent-confirmation questions, and the two ways they get answered. */
   const questions = new ChatQuestions({
     send: async (chatId, card) => (await port.send(chatId, { card })).messageId,
@@ -691,6 +895,23 @@ export function installBridge(
     planMode: () => ctx.get('planMode') as HostPlanMode | undefined,
   }
 
+  /**
+   * What the model's own `send_file` needs from this bridge, or undefined where
+   * the deployment closed that door — which is what makes the tool absent from
+   * the agent rather than present and always refusing.
+   */
+  const sendFilePorts: SendFilePorts | undefined = config.sendFiles
+    ? {
+        deliver: (sessionId, file, signal) => deliverFile(sessionId, file, signal),
+        workspaceOf: (sessionId) => {
+          const key = sessions.keyOf(sessionId)
+          return key === undefined ? undefined : chatWorkspaces.pathFor(key)
+        },
+        maxBytes: config.maxSendFileBytes,
+        report: notify,
+      }
+    : undefined
+
   /** Resolved once; a display nicety must not be able to break activation. */
   let pluginVersion = ''
   try {
@@ -725,7 +946,7 @@ export function installBridge(
       presentCall: createCallPresenter(ctx.get('tools') as HostTools | undefined, toolScope),
       setup: async (agentCtx: Context) => {
         if (presets !== undefined && presetId !== undefined) await presets.mount(agentCtx, presetId)
-        composeChatAgent(agentCtx, config, askQuestions, planReview, botSelf())
+        composeChatAgent(agentCtx, config, askQuestions, planReview, sendFilePorts, botSelf())
       },
     }
   }
@@ -903,6 +1124,7 @@ export function installBridge(
       { name: STOP_COMMAND, description: '停止当前任务' },
       { name: CD_COMMAND, description: '切换本会话的工作区目录' },
       { name: WS_COMMAND, description: '查看可用工作区' },
+      { name: GET_COMMAND, description: '把工作区里的文件发到聊天' },
       { name: MODEL_COMMAND, description: '查看或切换本会话模型' },
       { name: STATUS_COMMAND, description: '查看本会话状态' },
       { name: NEW_COMMAND, description: '开一个新会话，清空上下文' },
@@ -954,6 +1176,18 @@ export function installBridge(
   })
 
   /**
+   * Where an answer to one inbound message belongs. A topic thread is part of
+   * the address, not a detail: a reply that names only the message leaves the
+   * thread and lands in the chat's main channel.
+   * @param msg - the message being answered.
+   * @returns the reply target for {@link replyOptions}.
+   */
+  const replyTargetOf = (msg: NormalizedMessage): ReplyTarget => ({
+    messageId: msg.messageId,
+    ...msg.threadId === undefined ? {} : { threadId: msg.threadId },
+  })
+
+  /**
    * Dispose one conversation's agent so the next message walks the ladder
    * again — under a new id after `/cd`, or resuming the same session under a
    * new route after a model switch.
@@ -971,6 +1205,7 @@ export function installBridge(
       await sessions.release(key)
       runningBySession.delete(releasedId)
       callSnapshots.delete(releasedId)
+      aimBySession.delete(releasedId)
       questions.cancelSession(releasedId)
     }
   }
@@ -1098,10 +1333,33 @@ export function installBridge(
     if (
       channelCommand === CD_COMMAND || channelCommand === WS_COMMAND
       || channelCommand === MODEL_COMMAND || channelCommand === STATUS_COMMAND
-      || channelCommand === NEW_COMMAND
+      || channelCommand === NEW_COMMAND || channelCommand === GET_COMMAND
     ) {
       try {
         const key = conversation
+        // Answered before the release below is even derived: `/get` does not
+        // change this conversation's identity — it reads one file out of the
+        // directory the conversation already runs in — so releasing its agent
+        // would throw away a live context to send an attachment.
+        if (channelCommand === GET_COMMAND) {
+          const reply = await runGetCommand(
+            msg.content,
+            chatWorkspaces.pathFor(key),
+            config.maxSendFileBytes,
+            async (file, bytes) => {
+              // No approval card, in a group either (ADR 0002): the human typed
+              // the path, and asking him to approve his own command is theatre.
+              await port.send(
+                msg.chatId,
+                { file: { source: bytes, fileName: file.fileName } },
+                replyOptions(replyTargetOf(msg)),
+              )
+            },
+          )
+          // A delivered file speaks for itself; only a refusal needs words.
+          if (reply !== undefined) await port.send(msg.chatId, { markdown: reply }).catch(reportSendFailure)
+          return
+        }
         // Dispose the conversation's current agent so the next message walks
         // the ladder again — under a new id after `/cd`, or resuming the same
         // session under the new route after `/model use`. The id is captured
@@ -1131,7 +1389,7 @@ export function installBridge(
       } catch (error) {
         notify(`lark-channel: ${channelCommand} command failed in ${msg.chatId}: ${String(error)}`)
         await port
-          .send(msg.chatId, { text: `⚠️ 命令执行失败：${error instanceof Error ? error.message : String(error)}` })
+          .send(msg.chatId, { text: `⚠️ 命令执行失败：${failureDetail(error)}` })
           .catch(reportSendFailure)
       }
       return
@@ -1159,23 +1417,46 @@ export function installBridge(
       // dispatch, so `/stop` still interrupts a chat that owes an answer.
       if (questions.answerByText(opened.handle.agent.session.id, msg.content)) return
 
-      const images = await collectImages(
-        msg,
-        port,
-        ctx.get('attachments') as HostAttachments | undefined,
-        config.attachImages,
-      )
+      // Files land only once an agent exists to read them: acquisition is what
+      // can still fail here, and a failed one must leave no orphan in someone's
+      // repository. The workspace is the conversation's own, so `/cd` moves
+      // where the next message's files arrive.
+      const workspace = chatWorkspaces.pathFor(conversation)
+      let inbound: CollectedFiles = { landed: [], notes: [] }
+      let images: CollectedImages = { blocks: [], notes: [] }
+      // Its own catch, and not the one below: both collectors handle their own
+      // failures today, so a rejection here is latent — but reported as agent
+      // creation it would name the wrong cause AND drop the turn, losing the
+      // message from the model's view entirely. A collection failure costs the
+      // attachments; it must not cost the conversation.
+      try {
+        inbound = await collectInboundFiles(msg, port, {
+          workspace,
+          enabled: config.receiveFiles,
+          maxFileBytes: config.maxReceiveFileBytes,
+          report: notify,
+          hintWorkspace: !hintedWorkspaces.has(workspace),
+        })
+        if (inbound.landed.length > 0) hintedWorkspaces.add(workspace)
+        images = await collectImages(
+          msg,
+          port,
+          inbound.landed,
+          ctx.get('attachments') as HostAttachments | undefined,
+          config.attachImages,
+        )
+      } catch (error) {
+        notify(`lark-channel: collecting the attachments of ${msg.messageId} failed: ${String(error)}`)
+        ctx.logger.warn('collecting attachments of %s failed: %s', msg.messageId, error)
+      }
       // The reply target is registered by MESSAGE ID and claimed when the
       // host's `user/message` event names it, because a turn is not one
       // message: the react loop drains several queued followups into a single
       // turn, so aiming at arrival — or by turn order — replies to the wrong
       // message the moment two overlap. When a turn consumes several, the last
       // claim wins: a batched answer addresses the latest ask.
-      const message = chatUserMessage(msg, images)
-      const target: ReplyTarget = {
-        messageId: msg.messageId,
-        ...msg.threadId === undefined ? {} : { threadId: msg.threadId },
-      }
+      const message = chatUserMessage(msg, images, inbound)
+      const target = replyTargetOf(msg)
       if (targetByMessageId.size >= MAX_PENDING_TARGETS) {
         const oldest = targetByMessageId.keys().next().value
         if (oldest !== undefined) targetByMessageId.delete(oldest)
@@ -1193,7 +1474,7 @@ export function installBridge(
       notify(`lark-channel: agent creation failed for chat ${msg.chatId}: ${String(error)}`)
       ctx.logger.warn('agent creation failed for chat %s: %s', msg.chatId, error)
       await port
-        .send(msg.chatId, { text: `⚠️ 无法启动会话：${error instanceof Error ? error.message : String(error)}` })
+        .send(msg.chatId, { text: `⚠️ 无法启动会话：${failureDetail(error)}` })
         .catch(reportSendFailure)
     }
   }
@@ -1225,8 +1506,43 @@ export function installBridge(
     if (pending.messageId !== undefined) {
       pendingApprovals.delete(id)
       void port
-        .updateCard(pending.messageId, settledCard(pending.toolName, outcome, decidedBy))
+        .updateCard(pending.messageId, pending.paint(outcome, decidedBy))
         .catch(reportSendFailure)
+    }
+    return true
+  }
+
+  /**
+   * Publish one registered approval's card and settle the race the send itself
+   * creates: a decision can arrive — an abort, a timeout, disposal — while the
+   * platform is still rendering the card, and the asker is answered by then. The
+   * card that just appeared must not be left showing live buttons.
+   *
+   * Shared by both kinds of approval on purpose: this is the delicate half, and
+   * two copies of it would drift. What each kind does about a card that never
+   * reached the chat is its own business, hence the boolean rather than a policy
+   * decided here.
+   * @param id - the pending approval's correlation id.
+   * @param pending - the registered question, whose `messageId` and `state` this advances.
+   * @param card - the live card to send.
+   * @returns whether the card reached the chat.
+   */
+  const sendApprovalCard = async (id: string, pending: PendingApproval, card: object): Promise<boolean> => {
+    let sent: SendResult
+    try {
+      sent = await port.send(pending.chatId, { card })
+    } catch (error) {
+      reportSendFailure(error)
+      return false
+    }
+    pending.messageId = sent.messageId
+    if (pending.state === 'settled') {
+      pendingApprovals.delete(id)
+      void port
+        .updateCard(sent.messageId, pending.paint(pending.outcome ?? 'cancelled', pending.decidedBy))
+        .catch(reportSendFailure)
+    } else {
+      pending.state = 'open'
     }
     return true
   }
@@ -1269,6 +1585,7 @@ export function installBridge(
       chatType: binding.chatType,
       toolName: request.toolName,
       call,
+      paint: (outcome, decidedBy) => settledCard(request.toolName, outcome, decidedBy),
       state: 'sending',
       settle: resolveOutcome,
       removeAbort: () => { request.signal?.removeEventListener('abort', onAbort) },
@@ -1276,18 +1593,12 @@ export function installBridge(
     pendingApprovals.set(id, pending)
     request.signal?.addEventListener('abort', onAbort, { once: true })
 
-    let sent: SendResult
-    try {
-      sent = await port.send(binding.chatId, {
-        card: approvalCard(
-          request.toolName,
-          request.reason,
-          call?.arguments,
-          id,
-        ),
-      })
-    } catch (error) {
-      reportSendFailure(error)
+    const published = await sendApprovalCard(
+      id,
+      pending,
+      approvalCard(request.toolName, request.reason, call?.arguments, id),
+    )
+    if (!published) {
       if (settleApproval(id, 'cancelled') && !withdrawn()) {
         // Nothing reached a human and nothing was withdrawn: let the next
         // composed answerer decide instead of silently cancelling the ask.
@@ -1295,21 +1606,235 @@ export function installBridge(
         return next()
       }
       pendingApprovals.delete(id)
-      return settled
-    }
-
-    pending.messageId = sent.messageId
-    if (pending.state === 'settled') {
-      // Settled while the send was in flight: the asker is long answered, but
-      // the platform just rendered a live card — paint it settled here.
-      pendingApprovals.delete(id)
-      void port
-        .updateCard(sent.messageId, settledCard(pending.toolName, pending.outcome ?? 'cancelled', pending.decidedBy))
-        .catch(reportSendFailure)
-    } else {
-      pending.state = 'open'
     }
     return settled
+  }
+
+  /**
+   * Ask one group to authorize one outbound file, and wait for its answer.
+   *
+   * Registered in the same `pendingApprovals` the tool escalations use, so it
+   * inherits every property that map's machinery already guarantees: settled
+   * exactly once, painted by whichever of the click and the send gets there,
+   * judged by `refuseApprovalClick`, counted by `/status`, and cancelled when
+   * the fiber unwinds. Only the card and the words differ, and those ride the
+   * `paint` closure.
+   * @param binding - the group chat this file would land in.
+   * @param file - the file the workspace check cleared.
+   * @param sending - the bytes that will go out if the room allows it, already
+   * read: what the card quotes is this buffer's length, so the room is deciding
+   * about an artefact that exists rather than about a path that may still change.
+   * @param signal - the calling execution's cancellation, so a stopped turn
+   * takes its card down with it instead of leaving one that can still release
+   * the file long after the turn that asked for it is gone.
+   * @returns undefined once it may go out, or the English reason it may not.
+   */
+  const askFileSend = async (
+    binding: ChatBinding,
+    file: OutboundFile,
+    sending: Buffer,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> => {
+    // Already cancelled: publishing a card here would ask a room to decide
+    // something nobody is waiting for any more.
+    if (signal?.aborted === true) {
+      return 'That turn was cancelled before this chat could be asked, so the file was not sent.'
+    }
+    const id = randomUUID()
+    let resolveOutcome!: (outcome: HostApprovalOutcome) => void
+    const settled = new Promise<HostApprovalOutcome>((resolve) => { resolveOutcome = resolve })
+    // A card nobody answers must not hold the model's turn open forever, and it
+    // is NOT a refusal: the model is told which of the two happened, because
+    // "they said no" and "nobody was looking" call for different next moves.
+    let expired = false
+    const timer = setTimeout(() => {
+      expired = true
+      notify(`lark-channel: a file approval in ${binding.chatId} went undecided; ${file.fileName} was not sent`)
+      settleApproval(id, 'cancelled')
+    }, QUESTION_TIMEOUT_MS)
+    timer.unref?.()
+
+    // The same shape the tool escalations use, so the settle is the one that
+    // already guarantees a question closes once and its card stops offering
+    // buttons — this path adds no judgement of its own about that.
+    const onAbort = (): void => { settleApproval(id, 'cancelled') }
+    const pending: PendingApproval = {
+      chatId: binding.chatId,
+      chatType: binding.chatType,
+      toolName: SEND_FILE_TOOL,
+      paint: (outcome, decidedBy) => settledFileCard(file, outcome, decidedBy),
+      state: 'sending',
+      settle: resolveOutcome,
+      removeAbort: () => { signal?.removeEventListener('abort', onAbort) },
+    }
+    pendingApprovals.set(id, pending)
+    signal?.addEventListener('abort', onAbort, { once: true })
+
+    try {
+      if (!await sendApprovalCard(id, pending, fileApprovalCard(file, sending.byteLength, id))) {
+        settleApproval(id, 'cancelled')
+        pendingApprovals.delete(id)
+        return 'The approval card could not be sent to this chat, so the file was not sent either.'
+      }
+      const outcome = await settled
+      if (outcome === 'allowed-once') return undefined
+      if (expired) {
+        return `Nobody in this chat approved sending that file within ${TIMEOUT_MINUTES} minutes, so it was `
+          + 'not sent. It was not refused — say what the file contains in your reply instead.'
+      }
+      if (outcome === 'rejected') {
+        return 'Someone in this chat rejected sending that file, so it was not sent. '
+          + 'Do not offer it again unless they ask for it.'
+      }
+      return 'The request to send that file was withdrawn before anyone decided, so it was not sent.'
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  /**
+   * Claim one of a chat's file-send slots.
+   * @param chatId - the chat the bytes would land in.
+   * @returns whether a slot was free; a claim taken must be released.
+   */
+  const holdFileSend = (chatId: string): boolean => {
+    const held = heldFileSends.get(chatId) ?? 0
+    if (held >= MAX_PENDING_FILE_SENDS) return false
+    heldFileSends.set(chatId, held + 1)
+    return true
+  }
+
+  /**
+   * Give one slot back, once the buffer it accounted for is off the heap.
+   * @param chatId - the chat the claim was taken against.
+   */
+  const releaseFileSend = (chatId: string): void => {
+    const left = (heldFileSends.get(chatId) ?? 1) - 1
+    // Deleted rather than left at zero: a long-lived process serving many rooms
+    // should not accumulate one entry per room it once sent a file to.
+    if (left > 0) heldFileSends.set(chatId, left)
+    else heldFileSends.delete(chatId)
+  }
+
+  /**
+   * Read one cleared file, ask the room when the room has to be asked, and put
+   * the bytes in the chat.
+   *
+   * The gating matrix lives here (ADR 0002): a direct message goes straight out,
+   * because its only reader is the person already authorized to drive this agent
+   * — who could have asked for the contents on screen instead, so the leak
+   * boundary is zero and an approval would only breed the fatigue that ends in
+   * blind approving. A group is where the leak lives, so a group asks.
+   *
+   * The bytes are read BEFORE the room is asked, and the buffer in hand is what
+   * goes out. Read afterwards, an approval would certify a PATH rather than a
+   * file: thirty minutes is ample for a background process the model started to
+   * leave a same-size `.env` under the name the card showed, and neither the
+   * size re-check in `readOutboundFile` nor the container check — which never
+   * runs again on the cleared path — can see that swap. Reading first makes the
+   * artefact the room approved and the artefact that leaves one object.
+   *
+   * That order is what costs memory, and more than ADR 0004 set out to spend:
+   * that decision budgeted ONE buffer for the few seconds of a send, while a
+   * group send holds one for as long as the room takes to answer. What bounds the
+   * sum is the caller's slot, not anything here.
+   * @param binding - the chat the file goes to, which also decides whether it is gated.
+   * @param sessionId - the agent's session, for the reply target the file lands under.
+   * @param file - the file the workspace check cleared.
+   * @param signal - the calling execution's cancellation, which also takes down
+   * a group approval still waiting on a human.
+   * @returns undefined once the file is in the chat, or the English reason it is not.
+   */
+  const offerFile = async (
+    binding: ChatBinding,
+    sessionId: string,
+    file: OutboundFile,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> => {
+    // First, so that everything after this point is about bytes that exist.
+    let bytes: Buffer
+    try {
+      bytes = await readOutboundFile(file)
+    } catch (error) {
+      // Scrubbed, because an fs failure quotes the absolute path it was given and
+      // this sentence goes to the model — which `describeRefusalForModel` is
+      // careful never to hand a path it did not type itself.
+      return `That file could not be read: ${describeReadFailure(error, file)}`
+    }
+    if (binding.chatType !== 'p2p') {
+      const refused = await askFileSend(binding, file, bytes, signal)
+      if (refused !== undefined) return refused
+    }
+    try {
+      // A buffer, never a path (ADR 0004), and through the transport's own media
+      // path rather than a hand-rolled upload (ADR 0005).
+      await port.send(
+        binding.chatId,
+        { file: { source: bytes, fileName: file.fileName } },
+        replyOptions(aimBySession.get(sessionId)),
+      )
+    } catch (error) {
+      // The SDK's own code is the actionable half — `rate_limited` invites a
+      // retry, `permission_denied` never will — so it survives to the model
+      // instead of being flattened into "the send failed".
+      const code = channelErrorCode(error)
+      const detail = failureDetail(error)
+      notify(`lark-channel: sending ${file.fileName} to ${binding.chatId} failed [${code ?? 'unknown'}]: ${detail}`)
+      return `The chat platform refused the upload [${code ?? 'unknown'}]: ${detail}`
+    }
+    return undefined
+  }
+
+  /**
+   * Send one cleared file to the chat its session belongs to, gate and quota
+   * included.
+   *
+   * This is the MODEL's way out. `/get` does NOT come through here, and that is
+   * the point: a human who typed a path has stated his intent, and making him
+   * approve his own command is theatre. It runs its own send in the command
+   * dispatch, which is what keeps the human row of the matrix from ever drifting
+   * into the model's row — a shared function with a "gate this one" flag is
+   * exactly how it would.
+   *
+   * What this function owns beyond that dispatch is the slot, and the ORDER in
+   * which it is taken: before {@link offerFile}, therefore before the file is
+   * read. A quota checked afterwards would be counting buffers that are already
+   * on the heap, which is the whole cost it exists to refuse — and one injected
+   * instruction can raise as many parallel calls as the model will emit, all of
+   * them passing a check that runs after their own read. The direct-message path
+   * takes no slot: it holds a buffer for the few seconds of a send and waits on
+   * nobody, which is exactly the spend ADR 0004 budgeted.
+   *
+   * Failures come back as a string rather than a throw: the caller is a tool
+   * body that turns whatever it gets into the model's error, and one refusal
+   * shape for "rejected", "timed out" and "the upload failed" is what keeps
+   * that body from having to know which of them happened.
+   * @param sessionId - the agent's session, which names the chat.
+   * @param file - the file the workspace check cleared.
+   * @param signal - the calling execution's cancellation, which also takes down
+   * a group approval still waiting on a human.
+   * @returns undefined once the file is in the chat, or the English reason it is not.
+   */
+  const deliverFile = async (
+    sessionId: string,
+    file: OutboundFile,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> => {
+    const binding = bySession.get(sessionId)
+    if (binding === undefined) return 'This session is no longer bound to a chat, so a file has nowhere to go.'
+    if (binding.chatType === 'p2p') return offerFile(binding, sessionId, file, signal)
+    if (!holdFileSend(binding.chatId)) {
+      return `This chat already has ${MAX_PENDING_FILE_SENDS} files waiting for someone to allow them, so this `
+        + 'one was not offered. Wait until those are decided before offering another file.'
+    }
+    try {
+      return await offerFile(binding, sessionId, file, signal)
+    } finally {
+      // Released only once the send is over: the buffer this slot accounts for
+      // lives until then, whether the room allowed it, refused it, or the upload
+      // failed on the way out.
+      releaseFileSend(binding.chatId)
+    }
   }
 
   const handleCardAction = async (evt: CardActionEvent): Promise<CardActionResponse | undefined> => {
@@ -1393,7 +1918,7 @@ export function installBridge(
    * @param evt - the click, for authorization and the decider's name.
    * @returns the toast and the settled card to paint over the live one.
    */
-  const decideApproval = (value: ApprovalActionValue, evt: CardActionEvent): CardActionResponse => {
+  const decideApproval = async (value: ApprovalActionValue, evt: CardActionEvent): Promise<CardActionResponse> => {
     const pending = pendingApprovals.get(value.id)
     // Only an OPEN question takes a click: `sending` has no real card yet (a
     // click claiming otherwise is forged or duplicated), and `settled` is
@@ -1415,8 +1940,11 @@ export function installBridge(
       return { toast: toast('error', TOAST.notApprover) }
     }
     const outcome: HostApprovalOutcome = value.decision === 'allow' ? 'allowed-once' : 'rejected'
-    const decidedBy = evt.operator.name ?? evt.operator.openId
-    const toolName = pending.toolName
+    const decidedBy = await resolveApprovalDecider(evt)
+    // Captured before settling, which drops the question from the map: what this
+    // click paints is decided by the kind of question it answered, not by this
+    // dispatch — a tool escalation and an outbound file settle differently.
+    const paint = pending.paint
     if (!settleApproval(value.id, outcome, decidedBy, false)) {
       return { toast: toast('info', TOAST.approvalGone) }
     }
@@ -1426,8 +1954,29 @@ export function installBridge(
       // otherwise relies on reports refusals in a body the SDK discards, so a
       // failed repaint is invisible — a card left showing live buttons after
       // its decision is worse than any toast.
-      card: { type: 'raw', data: settledCard(toolName, outcome, decidedBy) },
+      card: { type: 'raw', data: paint(outcome, decidedBy) },
     }
+  }
+
+  /**
+   * Pick the name that a settled approval records without making the approval
+   * depend on the optional roster API. Card callbacks do not reliably contain
+   * `operator.name`; the channel caches its member roster, so an already-warm
+   * chat avoids another remote lookup.
+   * @param evt - an already-authorized approval click.
+   * @returns the callback name, resolved member name, or safe open-id fallback.
+   */
+  const resolveApprovalDecider = async (evt: CardActionEvent): Promise<string> => {
+    if (evt.operator.name !== undefined && evt.operator.name !== '') return evt.operator.name
+    try {
+      const members = await port.getChatMembers?.(evt.chatId)
+      const name = members?.find(member => member.id === evt.operator.openId)?.name
+      if (name !== undefined && name !== '') return name
+    } catch (error) {
+      // Name decoration must never turn a valid approval into a failed send.
+      ctx.logger.debug('could not resolve approval decider name', error)
+    }
+    return evt.operator.openId
   }
 
   // Inbound events. Registered before connect so no early event is dropped.
@@ -1509,13 +2058,17 @@ export function installBridge(
     if (isTurnStartEvent(event)) {
       // Fail closed: a turn that never names one of our messages sends its
       // answer unaimed to the chat. Guessing — reusing the previous target —
-      // is how an injected turn's output lands on an unrelated thread.
+      // is how an injected turn's output lands on an unrelated thread. An
+      // artifact this turn produces is aimed by the same rule, so the two move
+      // together rather than one of them lagging a turn behind.
       binding.renderer.aim(undefined)
+      aimBySession.delete(session.id)
     } else if (isUserMessageEvent(event)) {
       const target = event.data.id === undefined ? undefined : targetByMessageId.get(event.data.id)
       if (target !== undefined && event.data.id !== undefined) {
         targetByMessageId.delete(event.data.id)
         binding.renderer.aim(target)
+        aimBySession.set(session.id, target)
       }
     } else if (isToolCallEvent(event)) {
       let calls = callSnapshots.get(session.id)
@@ -1542,7 +2095,10 @@ export function installBridge(
     binding.renderer.handle(event)
     // AFTER the renderer: the turn's own closing output (the answer, a failure
     // line) still deserves its target; only what comes later must not.
-    if (isTurnEndEvent(event)) binding.renderer.aim(undefined)
+    if (isTurnEndEvent(event)) {
+      binding.renderer.aim(undefined)
+      aimBySession.delete(session.id)
+    }
   })
 
   // Approval questions for owned agents become cards; everything else delegates.
@@ -1576,6 +2132,7 @@ export function installBridge(
     compositions.clear()
     callSnapshots.clear()
     runningBySession.clear()
+    aimBySession.clear()
     return Promise.allSettled([
       sessions.close(),
       ...open.map((binding) => binding.renderer.close()),
@@ -1585,7 +2142,7 @@ export function installBridge(
   // Registered last so disposal disconnects the transport first.
   ctx.effect(() => {
     port.connect().catch((error: unknown) => {
-      notify(`lark-channel: connect failed: ${error instanceof Error ? error.message : String(error)}`)
+      notify(`lark-channel: connect failed: ${failureDetail(error)}`)
       ctx.logger.error('lark channel connect failed: %s', error)
     })
     return () => port.disconnect().catch(reportSendFailure)

@@ -1,3 +1,4 @@
+import { writeFile } from 'node:fs/promises'
 import { Context } from '@deepseek-ai/cordis'
 import { vi } from 'vitest'
 import type {
@@ -89,6 +90,16 @@ export function createFakePort() {
   }[] = []
   /** Downloadable resources, by file key, as the transport would serve them. */
   const resourceBytes = new Map<string, { buffer: Uint8Array; contentType?: string }>()
+  /** Members returned by the optional cached roster lookup. */
+  const chatMembers = new Map<string, readonly { id: string; name?: string }[]>()
+  /** Roster lookups, retained to assert untrusted clicks have no side effects. */
+  const memberLookups: string[] = []
+  /**
+   * Every download the transport was asked for, and which half served it. An
+   * image that landed is read off the disk instead of fetched again, and only
+   * the call count can tell a spared round trip from a repeated one.
+   */
+  const downloads: { fileKey: string; via: 'memory' | 'disk' }[] = []
   /** Optional holds a test injects into port operations to stage races. */
   const gates: { beforeSend?: () => Promise<void> } = {}
   const state = {
@@ -108,6 +119,8 @@ export function createFakePort() {
     failCotCreate: false,
     /** Reject writing events to one. */
     failCotWrite: false,
+    /** Reject roster reads, as an app without member-list permission would. */
+    failChatMembers: false,
   }
   let counter = 0
 
@@ -142,6 +155,11 @@ export function createFakePort() {
   const port: ChannelPort = {
     async connect() { state.connects += 1 },
     async disconnect() { state.disconnects += 1 },
+    async getChatMembers(chatId) {
+      memberLookups.push(chatId)
+      if (state.failChatMembers) throw new Error('cannot list chat members (fake)')
+      return chatMembers.get(chatId) ?? []
+    },
     on: subscribe as ChannelPort['on'],
     async send(to, input, opts): Promise<SendResult> {
       // A test may hold the send in flight to exercise what races it.
@@ -184,9 +202,22 @@ export function createFakePort() {
       cot.timestamps.push(...events.map((e) => e.timestamp))
     },
     async downloadResourceWithMeta(messageId, fileKey, _type) {
+      downloads.push({ fileKey, via: 'memory' })
       const stored = resourceBytes.get(fileKey)
       if (stored === undefined) throw new Error(`no such resource ${fileKey} on ${messageId} (fake)`)
       return stored
+    },
+    async downloadResourceToFile(messageId, fileKey, _type, destPath) {
+      downloads.push({ fileKey, via: 'disk' })
+      const stored = resourceBytes.get(fileKey)
+      if (stored === undefined) throw new Error(`no such resource ${fileKey} on ${messageId} (fake)`)
+      // Real bytes on a real path: the caller's quota and note assertions are
+      // about what a later read finds, not about what this fake returned.
+      await writeFile(destPath, stored.buffer)
+      return {
+        ...stored.contentType === undefined ? {} : { contentType: stored.contentType },
+        bytesWritten: stored.buffer.byteLength,
+      }
     },
     async listSlashCommands() {
       if (state.failPanelList) throw new Error('no permission to list commands (fake)')
@@ -234,6 +265,9 @@ export function createFakePort() {
     panelCreated,
     panelDeleted,
     resourceBytes,
+    chatMembers,
+    memberLookups,
+    downloads,
     cots,
     state,
     gates,
