@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -8,6 +8,7 @@ import {
   SERVICE_LABEL,
   dshHome,
   envCredentials,
+  ensureProfileBuildPolicy,
   hasCredentialSection,
   isOnboarded,
   launchdPlist,
@@ -127,6 +128,46 @@ describe('supervisorKind', () => {
   it('names launchd on macOS and no supervisor on Windows', () => {
     expect(supervisorKind('darwin')).toBe('launchd')
     expect(supervisorKind('win32')).toBeUndefined()
+  })
+})
+
+describe('profile build policy', () => {
+  it('pre-seeds a fresh profile before its first pnpm install', () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-home-'))
+    ensureProfileBuildPolicy('lark', home)
+    const document = readFileSync(join(home, 'profiles', 'lark', 'pnpm-workspace.yaml'), 'utf8')
+    expect(document).toContain('nodeLinker: hoisted')
+    expect(document).toContain('protobufjs: false')
+  })
+
+  it('repairs the placeholder pnpm leaves after ERR_PNPM_IGNORED_BUILDS', () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-home-'))
+    const directory = join(home, 'profiles', 'lark')
+    mkdirSync(directory, { recursive: true })
+    writeFileSync(join(directory, 'pnpm-workspace.yaml'), [
+      'packages:',
+      '  - .',
+      'allowBuilds:',
+      '  protobufjs: set this to true or false',
+      '',
+    ].join('\n'))
+
+    ensureProfileBuildPolicy('lark', home)
+
+    expect(readFileSync(join(directory, 'pnpm-workspace.yaml'), 'utf8'))
+      .toContain('protobufjs: false')
+  })
+
+  it('preserves an operator choice to run protobufjs postinstall', () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-home-'))
+    const directory = join(home, 'profiles', 'lark')
+    mkdirSync(directory, { recursive: true })
+    writeFileSync(join(directory, 'pnpm-workspace.yaml'), 'allowBuilds:\n  protobufjs: true\n')
+
+    ensureProfileBuildPolicy('lark', home)
+
+    expect(readFileSync(join(directory, 'pnpm-workspace.yaml'), 'utf8'))
+      .toBe('allowBuilds:\n  protobufjs: true\n')
   })
 })
 

@@ -17,6 +17,8 @@ dsh-lark-channel start
 
 A QR code appears in the terminal. Scan it in Feishu to create the app, then DM the bot or @-mention it in a group.
 
+Before the first dependency install, the command writes the profile's pnpm build policy. It explicitly skips protobufjs's notice-only postinstall, so no manual `pnpm approve-builds` step is needed.
+
 Prefer to install nothing? Run it through npx instead — every later command then carries the same prefix:
 
 ```sh

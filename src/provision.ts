@@ -49,6 +49,17 @@ export const ONBOARDING_WATCH_MS = 10 * 60 * 1000
 /** Log size past which `start` truncates it, since no supervisor rotates it. */
 export const LOG_TRUNCATE_BYTES = 10 * 1024 * 1024
 
+/** pnpm policy a standalone profile needs before its first dependency install. */
+const PROFILE_PNPM_WORKSPACE = `packages:
+  - .
+
+nodeLinker: hoisted
+autoInstallPeers: false
+
+allowBuilds:
+  protobufjs: false
+`
+
 /** What the operator asked for, after argument parsing. */
 export type Command =
   | { readonly kind: 'start'; readonly profile: string; readonly workspace: string }
@@ -484,6 +495,39 @@ function requireDsh(): string {
   return found
 }
 
+/**
+ * Make protobufjs's optional postinstall an explicit decision before pnpm runs.
+ *
+ * DSH creates a profile and installs its first plugin in one command. With
+ * pnpm 11, that first install writes a placeholder decision for protobufjs and
+ * then exits with ERR_PNPM_IGNORED_BUILDS. Pre-seeding the workspace avoids the
+ * failed first pass; repairing the exact placeholder also recovers profiles
+ * left behind by an older CLI. An operator's explicit true/false choice wins.
+ * @param profile - profile whose package-manager policy should be ready.
+ * @param home - harness home; injectable for tests.
+ */
+export function ensureProfileBuildPolicy(profile: string, home: string = dshHome()): void {
+  const path = join(home, 'profiles', profile, 'pnpm-workspace.yaml')
+  if (!existsSync(path)) {
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, PROFILE_PNPM_WORKSPACE)
+    return
+  }
+
+  const document = readFileSync(path, 'utf8')
+  const repaired = document.replace(
+    /^(\s*protobufjs:\s*)set this to true or false\s*$/m,
+    '$1false',
+  )
+  if (repaired !== document) writeFileSync(path, `${repaired.trimEnd()}\n`)
+  if (/^\s*protobufjs:\s*(?:true|false)\s*$/m.test(repaired)) return
+
+  const withPolicy = /^allowBuilds:\s*$/m.test(repaired)
+    ? repaired.replace(/^allowBuilds:\s*$/m, 'allowBuilds:\n  protobufjs: false')
+    : `${repaired.trimEnd()}\n\nallowBuilds:\n  protobufjs: false\n`
+  writeFileSync(path, `${withPolicy.trimEnd()}\n`)
+}
+
 /** Create the profile when absent, then install the matching plugin version into it. */
 function provision(dsh: string, profile: string, workspace: string): void {
   const installed = installedPluginVersion(profile)
@@ -494,6 +538,7 @@ function provision(dsh: string, profile: string, workspace: string): void {
     )
   }
   process.stderr.write(`dsh-lark-channel: provisioning profile ${profile}\n`)
+  ensureProfileBuildPolicy(profile)
   must([dsh, 'plugin', '--profile', profile, 'add', `dsh-lark-channel@${ownVersion()}`], workspace)
 }
 
@@ -804,6 +849,7 @@ function alignPluginVersion(profile: string): void {
       ? `dsh-lark-channel: installing the plugin ${version} into profile ${profile}\n`
       : `dsh-lark-channel: profile ${profile} has ${installed}; bringing it to ${version}\n`,
   )
+  ensureProfileBuildPolicy(profile)
   must([dsh, 'plugin', '--profile', profile, 'add', `dsh-lark-channel@${version}`])
 }
 
