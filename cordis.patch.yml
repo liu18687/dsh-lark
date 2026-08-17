@@ -1,6 +1,8 @@
 # Bundle patch applied over the selected DSH profile when this package is listed
 # in `dsh.profile.bundles`. The row id is deployment-local; the package name
 # must match package.json.
+# Package installation policy (the profile's pnpm build-script settings) is
+# prepared by the provisioning CLI before this runtime patch is loaded.
 
 - insert:
     - id: lark-channel

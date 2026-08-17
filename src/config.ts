@@ -20,7 +20,10 @@ import type { SessionScope } from './session.ts'
  */
 const DEFAULT_DENY_TOOLS = [] as const
 
-/** Plugin configuration supplied by the profile composition. */
+/**
+ * Runtime plugin configuration supplied by the profile composition. Package
+ * installation policy is owned by the provisioning CLI, not this schema.
+ */
 export interface Config {
   /**
    * Names this row when a deployment composes more than one, so two bots keep
