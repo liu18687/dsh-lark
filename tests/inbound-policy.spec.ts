@@ -8,6 +8,10 @@ import { LarkChannelError } from '@larksuite/channel'
 import type { RejectEvent } from '@larksuite/channel'
 import { describe, expect, it, vi } from 'vitest'
 import { createFakePresets, fakeMessage, mountChannel } from './harness.ts'
+import { channelOptions } from '../src/runtime.ts'
+import type { ChannelConfig } from '../src/runtime.ts'
+import { resolveConfig } from '../src/config.ts'
+import { resolveAuthorization } from '../src/authorization.ts'
 import type { LoggedLine } from './harness.ts'
 
 /** A rejection carrying one reason, with the other fields filled in. */
@@ -369,5 +373,37 @@ describe('durable sessions', () => {
     } finally {
       await harness.dispose()
     }
+  })
+})
+
+describe('transport options', () => {
+  /** One resolved deployment, with the credentials the transport needs. */
+  const deployment = (overrides: Record<string, unknown> = {}): ChannelConfig =>
+    resolveConfig({ appId: 'cli_test', appSecret: 'secret', ...overrides }) as ChannelConfig
+
+  it('closes the merge window, whatever a conversation is', () => {
+    // The transport merges a chat's burst into `{...last, content: joined}` —
+    // the last sender's name on everyone's words — and this channel labels
+    // each group message with who said it, so a merge misattributes rather
+    // than blurs. Under a finer scope it also hands one conversation another's
+    // words. Nothing is lost: the agent's inbox drains several messages into
+    // one turn on its own.
+    for (const sessionScope of ['chat', 'chat-sender', 'chat-thread']) {
+      const options = channelOptions(deployment({ sessionScope }), resolveAuthorization(deployment()))
+      expect(options.safety?.batch?.text?.delayMs).toBe(0)
+      expect(options.safety?.batch?.media?.delayMs).toBe(0)
+    }
+  })
+
+  it('narrows the transport itself only where a deployment asked to', () => {
+    const open = channelOptions(deployment(), resolveAuthorization(deployment()))
+    expect(open.policy?.dmMode).toBeUndefined()
+    expect(open.policy?.groupAllowlist).toBeUndefined()
+
+    const narrowing = deployment({ groupAllowlist: ['oc_team'], senderAllowlist: ['ou_ops'] })
+    const narrowed = channelOptions(narrowing, resolveAuthorization(narrowing))
+    expect(narrowed.policy?.dmMode).toBe('allowlist')
+    expect(narrowed.policy?.dmAllowlist).toEqual(['ou_ops'])
+    expect(narrowed.policy?.groupAllowlist).toEqual(['oc_team'])
   })
 })

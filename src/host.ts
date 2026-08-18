@@ -67,6 +67,26 @@ export interface HostAttachments {
   saveImage(input: { data: Uint8Array; mediaType: string; name?: string }): Promise<HostImageRef>
 }
 
+/**
+ * The deployment's permission presets (subset of the host `permissionPresets`
+ * service). Read-only here: this channel classifies a switch by what the
+ * preset actually does, and leaves the writing to `/permission`.
+ */
+export interface HostPermissionPresets {
+  /** Every switchable preset name, in the table's declaration order. */
+  readonly names: readonly string[]
+  /**
+   * One preset's knob bundle.
+   * @throws when the name is not in the deployment's table.
+   */
+  resolve(name: string): {
+    readonly sandbox: string
+    readonly approval: string
+    readonly name?: string | undefined
+    readonly description?: string | undefined
+  }
+}
+
 /** Public live-agent handle (subset of the host `Agent` interface). */
 export interface HostAgent {
   /** The single identity shared with {@link session}. */
@@ -79,6 +99,22 @@ export interface HostAgent {
    * active, so a chat may offer it unconditionally.
    */
   cancel(cause: string): void
+  /**
+   * Resolve once the agent has no driver or maintenance task running.
+   * Optional here because the contract reaches this plugin as an object rather
+   * than as a dependency range: an older host simply has no such method.
+   */
+  whenIdle?(): Promise<void>
+  /**
+   * Run one non-turn task from the agent's true idle phase. The task starts
+   * synchronously once that phase is claimed, later waking input waits in the
+   * inbox until it settles, and the claim THROWS SYNCHRONOUSLY when a turn or
+   * another maintenance task already owns the agent.
+   *
+   * This is what makes a channel-issued command safe: every command appends to
+   * the session log, and the log takes one writer.
+   */
+  runMaintenance?<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T>
 }
 
 /** An owned agent plus its teardown capability, from `agents.create()`. */
@@ -588,6 +624,17 @@ declare module '@deepseek-ai/cordis' {
   interface Events {
     /** Durable session facts broadcast by the host session store. */
     'session/event'(session: HostSession, event: HostSessionEvent): void
+    /**
+     * One message left an agent's inbox inside its open turn. This is where a
+     * turn decides what it is answering, and it precedes the turn's first
+     * step — which is why a reply is aimed here rather than at the later
+     * `user/message` record.
+     */
+    'agent/inbox/claimed'(payload: {
+      readonly agent: HostAgent
+      readonly message: { readonly id?: string }
+      readonly turn?: number
+    }): void
     /** Waterfall permission question; answer only for owned agents, else delegate via `next()`. */
     'approval/request'(
       request: HostApprovalRequest,

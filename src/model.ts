@@ -16,6 +16,7 @@
  */
 
 import { modelCard } from './cards.ts'
+import { marked } from './clicks.ts'
 import type { HostAgentOptions } from './host.ts'
 import type { ConversationSubject } from './session.ts'
 
@@ -201,7 +202,9 @@ export function modelPickerCard(
   deploymentRoute: string,
 ): object {
   const shown = catalog.slice(0, PICKER_ROWS)
-  const pick = (route?: string): ModelActionValue => ({
+  // Marked per rendering: a picker card stays in the chat, and switching back
+  // to a model already picked once is an ordinary thing to want.
+  const pick = (route?: string): ModelActionValue => marked({
     kind: MODEL_ACTION,
     key: subject.key,
     chatId: subject.chatId,

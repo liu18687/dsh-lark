@@ -69,10 +69,11 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 | Model switching | `/model` opens a picker; the session and its context carry over, and the default is one press away |
 | Native run view | Reasoning, tool calls, and results as a thinking process, with the answer sent on its own |
 | Cards that ask | Single or multiple choice, or type an answer; approve a plan or send feedback; allow or refuse a tool call |
-| Live status | `/status` shows workspace, model, and session — plus context occupancy and token totals where the host meters them — and refreshes in place |
+| Permission presets | `/permission` opens a picker saying what each preset may touch and whether it still asks; loosening the sandbox needs an approver, tightening it does not |
+| Live status | `/status` shows workspace, model, session, and the permission preset in force — plus context occupancy and token totals where the host meters them — and refreshes in place |
 | Session scope | One agent per chat, per topic thread, or per person in a shared chat |
 | Several agents | Each bot keeps its own settings, credential, and sessions, and two of them can talk in one group |
-| Slash commands | Host commands (`/plan`, `/compact`, `/permission`, …) run straight through the DSH command runtime |
+| Slash commands | Host commands (`/plan`, `/compact`, …) run straight through the DSH command runtime |
 | File transfer | A file sent into the chat becomes something the agent can read from the workspace; sending one back shows a group an approval card first |
 
 ## Commands
@@ -86,6 +87,8 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 | `/model` | Open the model picker |
 | `/model use <provider/model>` | Switch without opening a card |
 | `/model reset` | Back to the deployment default |
+| `/permission` | Open the permission-preset picker |
+| `/permission <preset>` | Switch preset without opening a card |
 | `/new` | Start a fresh session in place; workspace and model stay |
 | `/stop` | Stop the running task |
 | `/help` | Everything this chat accepts, host commands included |

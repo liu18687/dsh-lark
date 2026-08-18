@@ -22,6 +22,7 @@ import {
   createFakeAttachments,
   createFakeCredentials,
   createFakeCommands,
+  createFakePermissionPresets,
   createFakePresets,
   createFakeSettings,
   createFakeTools,
@@ -950,9 +951,24 @@ describe('dsh-lark-channel', () => {
       const messageId = created.agent.followup.mock.calls[0]![0].id
 
       harness.ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } })
-      harness.ctx.emit('session/event', session, { type: 'user/message', data: { id: messageId } })
+      // Aimed where the turn TAKES the message, which is before its first step:
+      // an artifact produced early in a turn would otherwise go out unaimed,
+      // because the `user/message` record arrives after the turn is already
+      // producing.
+      harness.ctx.emit('agent/inbox/claimed', {
+        agent: created.agent,
+        message: { id: messageId },
+        turn: 1,
+      })
       await tool.execute({ path: 'report.md' }, { agent: created.agent })
       expect(filesSent(harness)[0]!.opts?.replyTo).toBe('om_in_1')
+
+      // The later record of the same claim keeps the same aim rather than
+      // moving it: a host that publishes only this one still lands the file
+      // under the ask.
+      harness.ctx.emit('session/event', session, { type: 'user/message', data: { id: messageId } })
+      await tool.execute({ path: 'report.md' }, { agent: created.agent })
+      expect(filesSent(harness).at(-1)!.opts?.replyTo).toBe('om_in_1')
 
       // And the aim is dropped with the turn: a file produced by later work
       // nobody asked for must not be pinned under an unrelated message.
@@ -960,7 +976,7 @@ describe('dsh-lark-channel', () => {
         type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
       })
       await tool.execute({ path: 'report.md' }, { agent: created.agent })
-      expect(filesSent(harness)[1]!.opts?.replyTo).toBeUndefined()
+      expect(filesSent(harness).at(-1)!.opts?.replyTo).toBeUndefined()
       await harness.dispose()
     })
 
@@ -2622,6 +2638,516 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
+    it('answers a bare /permission from the projection, without running a command', async () => {
+      const ran: string[] = []
+      const commands = {
+        list: () => [],
+        execute: async (_agent: unknown, line: string) => {
+          ran.push(line.trim())
+          return { result: { kind: 'success', text: 'preset danger-full-access' } }
+        },
+      }
+      const sessionProjections = {
+        snapshot: () => ({
+          asOfSeq: 1,
+          values: {
+            permissions: {
+              currentValue: 'workspace-write',
+              options: [{ value: 'workspace-write' }, { value: 'danger-full-access' }],
+            },
+          },
+        }),
+      }
+      const harness = await mountChannel({}, { commands, sessionProjections })
+      await harness.fake.emitMessage(fakeMessage({ content: 'hello' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+
+      await harness.fake.emitMessage(fakeMessage({ content: '/permission' }))
+      await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
+      // Reading the preset writes nothing: a host command appends to the
+      // session log, and a status read that appends is a second writer.
+      expect(ran).toEqual([])
+
+      const card = (harness.fake.sent.filter((m) => 'card' in m.input).at(-1)!.input as { card: object }).card
+      const control = cardControls(card)[0]!
+      expect((control.value as { preset: string }).preset).toBe('danger-full-access')
+
+      const response = await harness.fake.emitCardAction(clickAction(control.value))
+      expect(response).toMatchObject({ toast: { type: 'info' } })
+      // Switching IS a write, and it went through the host's own command.
+      await vi.waitFor(() => { expect(ran).toEqual(['/permission danger-full-access']) })
+      // The card is repainted where it sits once the switch has landed, and
+      // what it becomes is a statement: pressing what is already true is not
+      // an action anyone needs.
+      await vi.waitFor(() => { expect(harness.fake.updated).toHaveLength(1) })
+      const settled = harness.fake.updated[0]!.card
+      expect(cardControls(settled)).toHaveLength(0)
+      expect(cardTexts(settled).some((text) => text.content.includes('已切到 danger-full-access'))).toBe(true)
+      await harness.dispose()
+    })
+
+    it('waits for the agent\'s idle phase instead of writing beside a running turn', async () => {
+      // Every host command appends to the session log, and the log takes one
+      // writer. The channel does not guess when that is safe from events and
+      // timers any more: it asks the agent for its idle phase, which is the
+      // host's own answer to the same question.
+      const ran: string[] = []
+      const commands = {
+        list: () => [],
+        execute: async (_agent: unknown, line: string) => {
+          ran.push(line.trim())
+          return { result: { kind: 'success', text: 'ok' } }
+        },
+      }
+      const sessionProjections = {
+        snapshot: () => ({
+          asOfSeq: 1,
+          values: { permissions: { currentValue: 'workspace-write', options: [{ value: 'danger-full-access' }] } },
+        }),
+      }
+      const harness = await mountChannel({}, { commands, sessionProjections })
+      await harness.fake.emitMessage(fakeMessage({ content: '/permission' }))
+      await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
+      const card = (harness.fake.sent.filter((m) => 'card' in m.input).at(-1)!.input as { card: object }).card
+      harness.agents.created[0]!.agent.drive(true)
+
+      const response = await harness.fake.emitCardAction(clickAction(cardControls(card)[0]!.value))
+      // Answered at once, and the card is already unpressable — two presses
+      // would be two writers on one log.
+      expect(response).toMatchObject({ toast: { type: 'info' } })
+      expect(cardControls((response as { card: { data: object } }).card.data)).toHaveLength(0)
+      await new Promise((done) => { setTimeout(done, 30) })
+      expect(ran).toEqual([])
+
+      harness.agents.created[0]!.agent.drive(false)
+      await vi.waitFor(() => { expect(ran).toEqual(['/permission danger-full-access']) })
+      await vi.waitFor(() => { expect(harness.fake.updated).toHaveLength(1) })
+      const settled = harness.fake.updated[0]!.card
+      expect(cardControls(settled)).toHaveLength(0)
+      expect(cardTexts(settled).some((t) => t.content.includes('已切到 danger-full-access'))).toBe(true)
+      await harness.dispose()
+    })
+
+    it('answers a typed switch without holding the chat behind a running turn', async () => {
+      // The message handler runs inside the transport's per-chat queue, and a
+      // switch waits for the agent's idle phase. Awaiting that here would hold
+      // the queue that carries the approval click a turn may be waiting for.
+      const ran: string[] = []
+      const commands = {
+        list: () => [],
+        execute: async (_agent: unknown, line: string) => {
+          ran.push(line.trim())
+          return { result: { kind: 'success', text: 'ok' } }
+        },
+      }
+      const sessionProjections = {
+        snapshot: () => ({
+          asOfSeq: 1,
+          values: { permissions: { currentValue: 'workspace-write', options: [{ value: 'danger-full-access' }] } },
+        }),
+      }
+      const harness = await mountChannel({}, { commands, sessionProjections })
+      await harness.fake.emitMessage(fakeMessage({ content: 'work' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      harness.agents.created[0]!.agent.drive(true)
+
+      await harness.fake.emitMessage(fakeMessage({ content: '/permission danger-full-access' }))
+      // Acknowledged while the turn still runs, and nothing written yet.
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('这轮任务结束后切到 danger-full-access') })
+      expect(ran).toEqual([])
+
+      harness.agents.created[0]!.agent.drive(false)
+      await vi.waitFor(() => { expect(ran).toEqual(['/permission danger-full-access']) })
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已切到 danger-full-access') })
+      await harness.dispose()
+    })
+
+    it('gates loosening on approvers and lets anyone tighten, typed or pressed', async () => {
+      // One rule for the card and the typed command, asymmetric on purpose:
+      // taking the sandbox off is a grant, putting it back is not. The typed
+      // form used to walk straight into the host command, so a member the card
+      // refused could type the same switch — and the card refused them even
+      // for the switch that makes the conversation safer.
+      const ran: string[] = []
+      const commands = {
+        list: () => [],
+        execute: async (_agent: unknown, line: string) => {
+          ran.push(line.trim())
+          return { result: { kind: 'success', text: 'ok' } }
+        },
+      }
+      const sessionProjections = {
+        snapshot: () => ({
+          asOfSeq: 1,
+          values: {
+            permissions: {
+              currentValue: 'workspace-write',
+              options: [{ value: 'workspace-write' }, { value: 'danger-full-access' }],
+            },
+          },
+        }),
+      }
+      const harness = await mountChannel(
+        { approvers: ['ou_boss'] },
+        // A deployment with a preset a name check would wave straight through:
+        // called `team-default`, and unconfined underneath.
+        {
+          commands,
+          sessionProjections,
+          permissionPresets: createFakePermissionPresets({
+            'team-default': { sandbox: 'danger-full-access', approval: 'never' },
+            'read-only': { sandbox: 'read-only', approval: 'ask' },
+          }),
+        },
+      )
+
+      // An ordinary member may not take the sandbox off.
+      await harness.fake.emitMessage(fakeMessage({ content: '/permission danger-full-access', senderId: 'ou_dev' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('你无权') })
+      expect(ran).toEqual([])
+
+      // The same member may put it back on.
+      await harness.fake.emitMessage(fakeMessage({ content: '/permission workspace-write', senderId: 'ou_dev' }))
+      await vi.waitFor(() => { expect(ran).toEqual(['/permission workspace-write']) })
+
+      // And an approver may take it off.
+      await harness.fake.emitMessage(fakeMessage({ content: '/permission danger-full-access', senderId: 'ou_boss' }))
+      await vi.waitFor(() => {
+        expect(ran).toEqual(['/permission workspace-write', '/permission danger-full-access'])
+      })
+
+      // A custom preset is judged by what it DOES: `team-default` takes the
+      // sandbox off under an ordinary-looking name, so it needs an approver
+      // too — while a custom preset that tightens does not.
+      await harness.fake.emitMessage(fakeMessage({ content: '/permission team-default', senderId: 'ou_dev' }))
+      await vi.waitFor(() => {
+        expect(harness.fake.sent.filter((m) => JSON.stringify(m.input).includes('你无权'))).toHaveLength(2)
+      })
+      await harness.fake.emitMessage(fakeMessage({ content: '/permission read-only', senderId: 'ou_dev' }))
+      await vi.waitFor(() => { expect(ran).toContain('/permission read-only') })
+
+      // The card follows the same rule, from the same conversation.
+      await harness.fake.emitMessage(fakeMessage({ content: '/permission', senderId: 'ou_dev' }))
+      await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
+      const card = (harness.fake.sent.filter((m) => 'card' in m.input).at(-1)!.input as { card: object }).card
+      const loosen = cardControls(card)
+        .find((control) => (control.value as { preset: string }).preset === 'danger-full-access')!
+      const refused = await harness.fake.emitCardAction(clickAction(loosen.value, { openId: 'ou_dev' }))
+      expect(refused).toMatchObject({ toast: { type: 'error' } })
+      await harness.dispose()
+    })
+
+    it('serializes two fast clicks into two turns of one queue', async () => {
+      // The failure this prevents is not a wrong toast: two concurrent host
+      // commands are two writers on one session log.
+      let running = 0
+      const overlaps: number[] = []
+      const commands = {
+        list: () => [],
+        execute: async () => {
+          running += 1
+          overlaps.push(running)
+          await new Promise((done) => { setTimeout(done, 20) })
+          running -= 1
+          return { result: { kind: 'success', text: 'ok' } }
+        },
+      }
+      const sessionProjections = {
+        snapshot: () => ({
+          asOfSeq: 1,
+          values: {
+            permissions: {
+              currentValue: 'workspace-write',
+              options: [{ value: 'workspace-write' }, { value: 'danger-full-access' }],
+            },
+          },
+        }),
+      }
+      const harness = await mountChannel({}, { commands, sessionProjections })
+      await harness.fake.emitMessage(fakeMessage({ content: '/permission' }))
+      await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
+      const card = (harness.fake.sent.filter((m) => 'card' in m.input).at(-1)!.input as { card: object }).card
+      const value = cardControls(card)[0]!.value
+
+      await Promise.all([
+        harness.fake.emitCardAction(clickAction(value)),
+        harness.fake.emitCardAction(clickAction({ ...value as object, a: 'second-rendering' })),
+      ])
+      await vi.waitFor(() => { expect(overlaps).toHaveLength(2) })
+      expect(overlaps).toEqual([1, 1])
+      await harness.dispose()
+    })
+
+    it('keeps rendering a turn after one event throws inside the renderer', async () => {
+      // A shape the renderer does not expect — a tool result whose content is
+      // a string where the contract says a list — used to throw out of the
+      // event dispatch: the chat saw a thinking process open and then go
+      // silent, with nothing anywhere saying why.
+      const harness = await mountChannel({ showProcess: true })
+      await harness.fake.emitMessage(fakeMessage({ content: 'look around' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const session = harness.agents.created[0]!.agent.session
+      const emit = (type: string, data: unknown) => { harness.ctx.emit('session/event', session, { type, data }) }
+
+      emit('turn/start', { turn: 1 })
+      emit('step/start', { turn: 1, step: 1 })
+      emit('assistant/chunk', { turn: 1, chunk: { type: 'reasoning-delta', text: '先看看' } })
+      emit('tool/call', { turn: 1, callId: 'c1', name: 'bash', arguments: '{"command":"ls"}' })
+      emit('tool/result', {
+        turn: 1,
+        step: 1,
+        message: { source: { kind: 'tool', callId: 'c1' }, content: [{ type: 'tool-result', toolCallId: 'c1', content: 'not a list' }] },
+      })
+      // The turn carries on, and so does the process.
+      emit('assistant/chunk', { turn: 1, chunk: { type: 'reasoning-delta', text: '再想想' } })
+      emit('turn/end', { turn: 1, reason: { kind: 'completed' } })
+
+      await vi.waitFor(() => {
+        const types = harness.fake.cots[0]?.events.map((e) => e.type) ?? []
+        expect(types).toContain('TOOL_CALL_START')
+        expect(types.filter((type) => type === 'REASONING_MESSAGE_CONTENT')).toHaveLength(2)
+        expect(types).toContain('RUN_FINISHED')
+      })
+      // And the failure is named where an operator looks.
+      expect(harness.notices.some((line) => line.includes('rendering tool/result'))).toBe(true)
+      await harness.dispose()
+    })
+
+    it('reports a repaint the platform refused, and answers the click anyway', async () => {
+      // A card too old to edit, an app that lost the scope: the switch itself
+      // already happened, so the click must not fail — but an operator has to
+      // learn that the card in the chat no longer says what the session does.
+      const ran: string[] = []
+      const harness = await mountChannel({}, {
+        commands: {
+          list: () => [],
+          execute: async (_agent: unknown, line: string) => {
+            ran.push(line.trim())
+            return { result: { kind: 'success', text: 'ok' } }
+          },
+        },
+        sessionProjections: {
+          snapshot: () => ({
+            asOfSeq: 1,
+            values: { permissions: { currentValue: 'workspace-write', options: [{ value: 'danger-full-access' }] } },
+          }),
+        },
+        permissionPresets: createFakePermissionPresets(),
+      })
+      await harness.fake.emitMessage(fakeMessage({ content: '/permission' }))
+      await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
+      const card = (harness.fake.sent.filter((m) => 'card' in m.input).at(-1)!.input as { card: object }).card
+      harness.fake.state.failCardUpdate = true
+
+      const response = await harness.fake.emitCardAction(clickAction(cardControls(card)[0]!.value))
+      expect(response).toMatchObject({ toast: { type: 'info' } })
+      await vi.waitFor(() => { expect(ran).toEqual(['/permission danger-full-access']) })
+      await vi.waitFor(() => {
+        expect(harness.notices.some((line) => line.includes('could not repaint the permission card'))).toBe(true)
+      })
+      harness.fake.state.failCardUpdate = false
+      await harness.dispose()
+    })
+
+    it('says nothing when the conversation moved on before the switch ran', async () => {
+      // `/new` releases the agent, which cancels what the queue was holding for
+      // it. That is the conversation changing its mind, not a failure — and a
+      // failure line here would carry the queue's own English, session id and
+      // all, into the chat.
+      let release = (): void => {}
+      const held = new Promise<void>((resolve) => { release = resolve })
+      const commands = {
+        list: () => [],
+        execute: async () => { await held; return { result: { kind: 'success', text: 'ok' } } },
+      }
+      const sessionProjections = {
+        snapshot: () => ({
+          asOfSeq: 1,
+          values: { permissions: { currentValue: 'workspace-write', options: [{ value: 'danger-full-access' }] } },
+        }),
+      }
+      const harness = await mountChannel({}, {
+        commands,
+        sessionProjections,
+        permissionPresets: createFakePermissionPresets(),
+      })
+      await harness.fake.emitMessage(fakeMessage({ content: '/permission' }))
+      await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
+      const card = (harness.fake.sent.filter((m) => 'card' in m.input).at(-1)!.input as { card: object }).card
+      // A running turn, so the switch is still waiting for the idle phase.
+      harness.agents.created[0]!.agent.drive(true)
+      await harness.fake.emitCardAction(clickAction(cardControls(card)[0]!.value))
+
+      await harness.fake.emitMessage(fakeMessage({ content: '/new' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已开新会话') })
+      release()
+
+      await new Promise((done) => { setTimeout(done, 30) })
+      expect(sentText(harness)).not.toContain('失败')
+      expect(harness.notices.some((line) => line.includes('moved on before it ran'))).toBe(true)
+      await harness.dispose()
+    })
+
+    it('leaves the picker live when the switch failed, and says so in the chat', async () => {
+      const commands = {
+        list: () => [],
+        execute: async () => ({ result: { kind: 'error', text: 'no such preset' } }),
+      }
+      const sessionProjections = {
+        snapshot: () => ({
+          asOfSeq: 1,
+          values: { permissions: { currentValue: 'workspace-write', options: [{ value: 'danger-full-access' }] } },
+        }),
+      }
+      const harness = await mountChannel({}, { commands, sessionProjections })
+      await harness.fake.emitMessage(fakeMessage({ content: '/permission' }))
+      await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
+      const card = (harness.fake.sent.filter((m) => 'card' in m.input).at(-1)!.input as { card: object }).card
+
+      await harness.fake.emitCardAction(clickAction(cardControls(card)[0]!.value))
+      // A failure is said where it can be acted on, and the button stays live
+      // because pressing it again still has something to do.
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('切换到 danger-full-access 失败') })
+      await vi.waitFor(() => { expect(harness.fake.updated).toHaveLength(1) })
+      expect(cardControls(harness.fake.updated[0]!.card).length).toBeGreaterThan(0)
+      await harness.dispose()
+    })
+
+    it('switches the preset of the session the chat is on NOW, after /new moved it', async () => {
+      const ran: string[] = []
+      const commands = {
+        list: () => [],
+        execute: async (_agent: unknown, line: string) => {
+          ran.push(line.trim())
+          return { result: { kind: 'success', text: 'ok' } }
+        },
+      }
+      const sessionProjections = {
+        snapshot: () => ({
+          asOfSeq: 1,
+          values: { permissions: { currentValue: 'workspace-write', options: [{ value: 'danger-full-access' }] } },
+        }),
+      }
+      const harness = await mountChannel({}, { commands, sessionProjections })
+      // A chat that has been through `/new` leaves its earlier session behind
+      // in the bridge's tables. A click that resolved the conversation by chat
+      // would find that first, dead binding and refuse — beside a
+      // conversation plainly holding a live agent.
+      await harness.fake.emitMessage(fakeMessage({ content: 'first' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      await harness.fake.emitMessage(fakeMessage({ content: '/new' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已开新会话') })
+      await harness.fake.emitMessage(fakeMessage({ content: 'second' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(2) })
+      expect(harness.agents.created[1]!.sessionId).toBe('lark-oc_chat_1--e1')
+
+      await harness.fake.emitMessage(fakeMessage({ content: '/permission' }))
+      await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
+      const card = (harness.fake.sent.filter((m) => 'card' in m.input).at(-1)!.input as { card: object }).card
+      const response = await harness.fake.emitCardAction(clickAction(cardControls(card)[0]!.value))
+
+      expect(response).toMatchObject({ toast: { type: 'info' } })
+      await vi.waitFor(() => { expect(ran).toEqual(['/permission danger-full-access']) })
+      await harness.dispose()
+    })
+
+    it('answers the click before the switch it started has finished', async () => {
+      // The platform waits seconds for a card callback and then stops showing
+      // anything. A host command can take longer than that, so the answer must
+      // not be behind it: a switch that works looked like a dead button.
+      let release = (): void => {}
+      const finished = new Promise<void>((resolve) => { release = resolve })
+      const ran: string[] = []
+      const commands = {
+        list: () => [],
+        execute: async (_agent: unknown, line: string) => {
+          ran.push(line.trim())
+          await finished
+          return { result: { kind: 'success', text: 'ok' } }
+        },
+      }
+      const sessionProjections = {
+        snapshot: () => ({
+          asOfSeq: 1,
+          values: { permissions: { currentValue: 'workspace-write', options: [{ value: 'danger-full-access' }] } },
+        }),
+      }
+      const harness = await mountChannel({}, { commands, sessionProjections })
+      await harness.fake.emitMessage(fakeMessage({ content: 'hello' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      await harness.fake.emitMessage(fakeMessage({ content: '/permission' }))
+      await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
+      const card = (harness.fake.sent.filter((m) => 'card' in m.input).at(-1)!.input as { card: object }).card
+
+      const response = await harness.fake.emitCardAction(clickAction(cardControls(card)[0]!.value))
+      // Answered while the command is still running, and the card that comes
+      // back is clickable again rather than a dead repaint.
+      expect(response).toMatchObject({ toast: { type: 'info' } })
+      await vi.waitFor(() => { expect(ran).toEqual(['/permission danger-full-access']) })
+      // The answer was given while that command is still unresolved.
+      expect(harness.fake.updated).toHaveLength(0)
+
+      release()
+      await vi.waitFor(() => { expect(harness.fake.updated).toHaveLength(1) })
+      await harness.dispose()
+    })
+
+    it('opens the conversation the card names when nothing is live', async () => {
+      // The preset belongs to the durable session, not to whatever agent
+      // happens to be open: after a restart — or, as here, a release — the
+      // card in the chat must still work rather than send the reader back to
+      // type a message first.
+      const ran: string[] = []
+      const commands = {
+        list: () => [],
+        execute: async (_agent: unknown, line: string) => {
+          ran.push(line.trim())
+          return { result: { kind: 'success', text: 'ok' } }
+        },
+      }
+      const sessionProjections = {
+        snapshot: () => ({
+          asOfSeq: 1,
+          values: { permissions: { currentValue: 'workspace-write', options: [{ value: 'danger-full-access' }] } },
+        }),
+      }
+      const harness = await mountChannel({}, { commands, sessionProjections })
+      await harness.fake.emitMessage(fakeMessage({ content: '/permission' }))
+      await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })
+      const card = (harness.fake.sent.filter((m) => 'card' in m.input).at(-1)!.input as { card: object }).card
+
+      // `/new` releases the agent, so the chat has none — the state the card
+      // was dead in.
+      await harness.fake.emitMessage(fakeMessage({ content: '/new' }))
+      await vi.waitFor(() => { expect(sentText(harness)).toContain('已开新会话') })
+      expect(harness.agents.created).toHaveLength(1)
+
+      await harness.fake.emitCardAction(clickAction(cardControls(card)[0]!.value))
+      await vi.waitFor(() => { expect(ran).toEqual(['/permission danger-full-access']) })
+      // Opened for the switch, on the session the conversation resolves to now.
+      expect(harness.agents.created).toHaveLength(2)
+      expect(harness.agents.created[1]!.sessionId).toBe('lark-oc_chat_1--e1')
+      await harness.dispose()
+    })
+
+    it('gives every rendering of a control card its own click payloads', async () => {
+      // The transport drops a repeated card action for twelve hours, keyed by
+      // the payload. Two renderings must therefore differ, or pressing refresh
+      // a second time never reaches this plugin at all.
+      const harness = await mountChannel()
+      await harness.fake.emitMessage(fakeMessage({ content: '/status' }))
+      await vi.waitFor(() => { expect(harness.fake.sent).toHaveLength(1) })
+      await harness.fake.emitMessage(fakeMessage({ content: '/status' }))
+      await vi.waitFor(() => { expect(harness.fake.sent).toHaveLength(2) })
+
+      const marks = harness.fake.sent
+        .map((m) => cardControls((m.input as { card: object }).card)[0]!.value as { a?: string })
+        .map((value) => value.a)
+      expect(marks.every((mark) => typeof mark === 'string' && mark !== '')).toBe(true)
+      expect(new Set(marks).size).toBe(2)
+      await harness.dispose()
+    })
+
     it('runs /new: a fresh session id, the old agent released, settings kept', async () => {
       const store = createFakeSettings()
       const harness = await mountChannel({}, { settings: store.settings })
@@ -2800,6 +3326,36 @@ describe('dsh-lark-channel', () => {
       await harness.dispose()
     })
 
+    it('aims a turn at the message its inbox claimed, before the first step', async () => {
+      // The session log's own order is `turn/start`, `step/start`,
+      // `user/message`: a turn is already producing before that record says
+      // which message it answers. `agent/inbox/claimed` is where the turn
+      // actually takes the message, and it lands before the first step.
+      const harness = await mountChannel({ showProcess: false })
+      await harness.fake.emitMessage(fakeMessage({ messageId: 'om_only', content: 'one' }))
+      await vi.waitFor(() => { expect(harness.agents.created).toHaveLength(1) })
+      const created = harness.agents.created[0]!
+      const session = created.agent.session
+
+      harness.ctx.emit('session/event', session, { type: 'turn/start', data: { turn: 1 } })
+      harness.ctx.emit('agent/inbox/claimed', {
+        agent: created.agent,
+        message: { id: created.agent.followup.mock.calls[0]![0]!.id },
+        turn: 1,
+      })
+      harness.ctx.emit('session/event', session, { type: 'step/start', data: { turn: 1 } })
+      harness.ctx.emit('session/event', session, {
+        type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: 'early' }] } },
+      })
+      harness.ctx.emit('session/event', session, {
+        type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } },
+      })
+
+      await vi.waitFor(() => { expect(harness.fake.sent).toHaveLength(1) })
+      expect(harness.fake.sent[0]!.opts?.replyTo).toBe('om_only')
+      await harness.dispose()
+    })
+
     it('replies target the message the turn CONSUMED, and the last of several', async () => {
       const harness = await mountChannel({ showProcess: false })
       await harness.fake.emitMessage(fakeMessage({ messageId: 'om_first', content: 'one' }))
@@ -2880,6 +3436,8 @@ describe('dsh-lark-channel', () => {
     const shadow = created.registeredTools.find((tool) => tool.name === 'exit_plan_mode') as unknown as {
       execute(args: unknown, exec: unknown): Promise<{ approved: true }>
     }
+    // The tool refuses outside plan mode, which the session log is the record of.
+    created.agent.session.events.push({ type: 'plan/mode', data: { active: true } })
     const plan = '# 迁移计划\n\n1. 先跑测试\n2. 再发预发'
 
     const approved = shadow.execute({ plan }, { agent: created.agent })
@@ -2908,6 +3466,7 @@ describe('dsh-lark-channel', () => {
     const shadow = created.registeredTools.find((tool) => tool.name === 'exit_plan_mode') as unknown as {
       execute(args: unknown, exec: unknown): Promise<{ approved: true }>
     }
+    created.agent.session.events.push({ type: 'plan/mode', data: { active: true } })
 
     const settled = shadow.execute({ plan: '# 计划\n步骤' }, { agent: created.agent }).catch((e: Error) => e)
     await vi.waitFor(() => { expect(harness.fake.sent.some((m) => 'card' in m.input)).toBe(true) })

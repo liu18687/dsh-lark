@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { HostAgentHandle } from '../src/host.ts'
 import { ConversationSessions, conversationKey, sessionIdFor } from '../src/session.ts'
 import type { SessionLadder, SessionScope } from '../src/session.ts'
@@ -391,3 +391,224 @@ describe('conversation sessions', () => {
     })
   })
 })
+
+describe('a release still tearing down', () => {
+  it('does not hand a fresh acquire the agent it is disposing', async () => {
+    // The host registry keeps answering with an agent until its disposal
+    // finishes. A walk that starts inside that window finds it through
+    // `lookup`, adopts it as someone ELSE's — so it never disposes it — and
+    // publishes it as the conversation's binding, which the release then
+    // destroys. Nothing shows until the next message drives a dead agent.
+    const live: string[] = []
+    const disposed: string[] = []
+    let releaseDispose = (): void => {}
+    const held = new Promise<void>((resolve) => { releaseDispose = resolve })
+    let created = 0
+    const handles = new Map<string, HostAgentHandle>()
+    const handleFor = (sessionId: string, slow: boolean): HostAgentHandle => ({
+      agent: { id: sessionId, session: { id: sessionId }, followup: () => {}, cancel: () => {} },
+      dispose: async () => {
+        // The registry only forgets it once disposal completes, as a host does.
+        if (slow) await held
+        disposed.push(sessionId)
+        const at = live.indexOf(sessionId)
+        if (at >= 0) live.splice(at, 1)
+      },
+    })
+    const ladder: SessionLadder = {
+      lookup: (sessionId) => (live.includes(sessionId) ? handles.get(sessionId) : undefined),
+      resume: async () => { throw new Error('no stored session') },
+      create: async (sessionId) => {
+        created += 1
+        const handle = handleFor(sessionId, created === 1)
+        handles.set(sessionId, handle)
+        live.push(sessionId)
+        return handle
+      },
+      report: () => {},
+    }
+    const sessions = new ConversationSessions('chat', ladder)
+
+    const first = await sessions.acquireKey('oc_1')
+    const releasing = sessions.release('oc_1')
+    // Mid-teardown: the registry still answers, and this is the walk that used
+    // to adopt what was being destroyed.
+    const acquiring = sessions.acquireKey('oc_1')
+    releaseDispose()
+    await releasing
+    const second = await acquiring
+
+    expect(disposed).toEqual(['lark-oc_1'])
+    expect(second.handle).not.toBe(first.handle)
+    // Owned, so this conversation will take its own agent down again later.
+    expect(second.owned).toBe(true)
+    await sessions.close()
+  })
+})
+
+describe('a release whose walk is still running', () => {
+  /**
+   * A ladder that behaves the way the host does: `create` PUBLISHES the agent
+   * to the registry before this store ever sees the handle, and `lookup`
+   * answers with it from that moment until its disposal finishes.
+   */
+  function publishingLadder() {
+    const live = new Map<string, HostAgentHandle>()
+    const disposed: string[] = []
+    let releaseCreate = (): void => {}
+    const created: string[] = []
+    const ladder: SessionLadder = {
+      lookup: (sessionId) => live.get(sessionId),
+      resume: async () => { throw new Error('no stored session') },
+      create: async (sessionId) => {
+        created.push(sessionId)
+        const handle: HostAgentHandle = {
+          agent: { id: sessionId, session: { id: sessionId }, followup: () => {}, cancel: () => {} },
+          dispose: async () => {
+            disposed.push(sessionId)
+            // Per AGENT, not per id: disposing a retired one must not evict the
+            // agent that replaced it, which is how a host behaves too.
+            if (live.get(sessionId) === handle) live.delete(sessionId)
+          },
+        }
+        // Published first, handed over second — with a gap in between, which
+        // is where the first `create` of this test parks.
+        live.set(sessionId, handle)
+        if (created.length === 1) await new Promise<void>((resolve) => { releaseCreate = resolve })
+        return handle
+      },
+      report: () => {},
+    }
+    return { ladder, live, disposed, created, finishFirstCreate: () => { releaseCreate() } }
+  }
+
+  it('does not let a fresh walk adopt what the detached one is about to dispose', async () => {
+    const { ladder, live, disposed, finishFirstCreate } = publishingLadder()
+    const sessions = new ConversationSessions('chat', ladder)
+
+    // First walk: parked inside `create`, already published to the registry.
+    const first = sessions.acquireKey('oc_1')
+    await new Promise((done) => { setTimeout(done, 5) })
+    // Released before it ever bound, then asked for again — the window where
+    // the registry holds an agent nobody in this store owns yet.
+    const releasing = sessions.release('oc_1')
+    const acquiring = sessions.acquireKey('oc_1')
+    finishFirstCreate()
+
+    // A detached walk does not fail its caller: it retries under the new
+    // state, so both callers end up on the same binding.
+    const [retried, bound] = await Promise.all([first, acquiring])
+    await releasing
+    expect(retried.handle).toBe(bound.handle)
+
+    // And the agent they hold is the live one, not the object the stale walk
+    // disposed on its way out.
+    expect(live.get('lark-oc_1')).toBe(bound.handle)
+    expect(disposed).toEqual(['lark-oc_1'])
+    expect(bound.owned).toBe(true)
+    await sessions.close()
+  })
+
+  it('closes only once a release in flight has finished disposing', async () => {
+    // A release takes its binding out of `opened` before it disposes, so a
+    // close that only walks `opened` would return while that agent is still
+    // being torn down — and "closed" has to mean closed.
+    const disposed: string[] = []
+    let releaseDispose = (): void => {}
+    const held = new Promise<void>((resolve) => { releaseDispose = resolve })
+    const ladder: SessionLadder = {
+      lookup: () => undefined,
+      resume: async () => { throw new Error('no stored session') },
+      create: async (sessionId) => ({
+        agent: { id: sessionId, session: { id: sessionId }, followup: () => {}, cancel: () => {} },
+        dispose: async () => { await held; disposed.push(sessionId) },
+      }),
+      report: () => {},
+    }
+    const sessions = new ConversationSessions('chat', ladder)
+    await sessions.acquireKey('oc_1')
+
+    const releasing = sessions.release('oc_1')
+    await new Promise((done) => { setTimeout(done, 5) })
+    let closed = false
+    const closing = sessions.close().then(() => { closed = true })
+    await new Promise((done) => { setTimeout(done, 10) })
+    expect(closed).toBe(false)
+
+    releaseDispose()
+    await Promise.all([releasing, closing])
+    expect(disposed).toEqual(['lark-oc_1'])
+  })
+})
+
+describe('closing while a walk is still running', () => {
+  it('settles the agent that walk was still creating', async () => {
+    // `bind` sees the closed store, disposes what it made and rejects — but a
+    // close that did not wait would already have returned, leaving the host
+    // creating and destroying an agent behind a plugin that considers itself
+    // gone.
+    const created: string[] = []
+    const disposed: string[] = []
+    let finishCreate = (): void => {}
+    const held = new Promise<void>((resolve) => { finishCreate = resolve })
+    const ladder: SessionLadder = {
+      lookup: () => undefined,
+      resume: async () => { throw new Error('no stored session') },
+      create: async (sessionId) => {
+        created.push(sessionId)
+        await held
+        return {
+          agent: { id: sessionId, session: { id: sessionId }, followup: () => {}, cancel: () => {} },
+          dispose: async () => { disposed.push(sessionId) },
+        }
+      },
+      report: () => {},
+    }
+    const sessions = new ConversationSessions('chat', ladder)
+
+    const opening = sessions.acquireKey('oc_1')
+    await vi.waitFor(() => { expect(created).toEqual(['lark-oc_1']) })
+    const closing = sessions.close()
+    finishCreate()
+    await closing
+
+    // Closed means closed: the late product is already disposed.
+    expect(disposed).toEqual(['lark-oc_1'])
+    await expect(opening).rejects.toThrow()
+  })
+
+  it('a second release joins the teardown already running', async () => {
+    // Two callers can release one conversation — a `/cd` and a card click
+    // landing together. The second must not report "nothing to do" while the
+    // first is still disposing.
+    const disposed: string[] = []
+    let finishDispose = (): void => {}
+    const held = new Promise<void>((resolve) => { finishDispose = resolve })
+    const ladder: SessionLadder = {
+      lookup: () => undefined,
+      resume: async () => { throw new Error('no stored session') },
+      create: async (sessionId) => ({
+        agent: { id: sessionId, session: { id: sessionId }, followup: () => {}, cancel: () => {} },
+        dispose: async () => { await held; disposed.push(sessionId) },
+      }),
+      report: () => {},
+    }
+    const sessions = new ConversationSessions('chat', ladder)
+    await sessions.acquireKey('oc_1')
+
+    const first = sessions.release('oc_1')
+    const second = sessions.release('oc_1')
+    let secondDone = false
+    void second.then(() => { secondDone = true })
+    await new Promise((done) => { setTimeout(done, 10) })
+    expect(secondDone).toBe(false)
+
+    finishDispose()
+    expect(await first).toBe(true)
+    // Nothing left of its own to do, but it waited for what was.
+    expect(await second).toBe(false)
+    expect(disposed).toEqual(['lark-oc_1'])
+    await sessions.close()
+  })
+})
+

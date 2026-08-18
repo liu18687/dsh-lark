@@ -283,7 +283,7 @@ function actions(buttons: readonly CardButton[], compact = false): object {
  * @returns a body element.
  */
 function optionRow(
-  option: { readonly label: string; readonly description?: string | undefined },
+  option: { readonly label: Line; readonly description?: Line | undefined },
   value: object,
 ): object {
   return {
@@ -470,6 +470,13 @@ const APPROVAL = {
     zh: '授权仅对这一次调用生效，批准前请确认上面的内容确实是你要执行的。',
     en: 'This grant covers a single call. Check the command above before you allow it.',
   },
+  escalation: { zh: '沙箱提权', en: 'Sandbox escalation' },
+  escalationTo: { zh: '这次调用要求提升到 %s', en: 'this call asks to be raised to %s' },
+  always: { zh: '不再询问，放开本会话', en: 'Stop asking, open this session' },
+  alwaysFoot: {
+    zh: '「不再询问」会把本会话切到 %s：完全不沙箱，且之后不再有审批卡（仍需审批的动作会被直接拒绝）。重启后依然有效，用 /permission 可随时切回。',
+    en: 'Stop asking switches this session to %s: no sandbox at all, and no approval cards after it (anything still needing approval is refused outright). It survives a restart; /permission switches back.',
+  },
   summary: { zh: '需要授权：%s', en: 'Approval needed: %s' },
   closed: { zh: '这条授权已结束，按钮不再可用。', en: 'This request is closed; its buttons no longer work.' },
   decidedBy: { zh: '%s · 决定人：', en: '%s · decided by ' },
@@ -507,22 +514,46 @@ export function approvalCard(input: {
   readonly toolName: string
   readonly reason?: string | undefined
   readonly command?: string | undefined
+  /** The sandbox mode this call asked to be raised to, when it asked. */
+  readonly escalateTo?: string | undefined
   readonly allow: object
   readonly reject: object
+  /** Payload for the button that switches the session, when one is offered. */
+  readonly always?: object | undefined
 }): object {
   const command = clip(input.command ?? '', COMMAND_MAX_CHARS)
   const reason = clip(input.reason ?? '', REASON_MAX_CHARS)
+  const escalated = input.escalateTo !== undefined && input.escalateTo !== ''
   return card('warning', fill(APPROVAL.summary, input.toolName), [
-    ...heading('warning', APPROVAL.title, fill(APPROVAL.context, input.toolName)),
+    ...heading(
+      'warning',
+      APPROVAL.title,
+      escalated
+        // What is actually being granted, not merely which tool ran: an
+        // escalation is a wider reach for one call, and the card that hides
+        // that is asking for consent to something it did not name.
+        ? join(fill(APPROVAL.context, input.toolName), `｜${fill(APPROVAL.escalationTo, input.escalateTo!).zh}`,
+          ` | ${fill(APPROVAL.escalationTo, input.escalateTo!).en}`)
+        : fill(APPROVAL.context, input.toolName),
+    ),
     ...command.shown === '' ? [] : [quoted(APPROVAL.command, command.shown, 'grey-50', command.hidden)],
     ...reason.shown === '' ? [] : [quoted(APPROVAL.reason, reason.shown, 'orange-50', reason.hidden)],
     actions([
       { label: APPROVAL.allow, value: input.allow, kind: 'primary' },
-      { label: APPROVAL.reject, value: input.reject, kind: 'danger' },
+      ...input.always === undefined ? [] : [{ label: APPROVAL.always, value: input.always, kind: 'danger' as const }],
+      { label: APPROVAL.reject, value: input.reject, kind: 'danger' as const },
     ]),
-    ...footer(APPROVAL.foot),
+    ...footer(
+      input.always === undefined
+        ? APPROVAL.foot
+        : join(APPROVAL.foot, `\n${fill(APPROVAL.alwaysFoot, UNCONFINED_LABEL).zh}`,
+          `\n${fill(APPROVAL.alwaysFoot, UNCONFINED_LABEL).en}`),
+    ),
   ])
 }
+
+/** The preset the loud button switches to; named once so card and bridge agree. */
+const UNCONFINED_LABEL = 'danger-full-access'
 
 /** How one approval ended, in the words and colour the settled card uses. */
 const APPROVAL_OUTCOME: Record<string, { readonly state: CardState; readonly title: Copy }> = {
@@ -771,6 +802,8 @@ const STATUS = {
   session: { zh: '会话', en: 'Session' },
   activity: { zh: '当前', en: 'Activity' },
   version: { zh: '版本', en: 'Version' },
+  preset: { zh: '权限', en: 'Permissions' },
+  presetOpen: { zh: '不沙箱，且不再弹审批卡', en: 'no sandbox, and no approval cards' },
   pending: { zh: '待审批', en: 'Awaiting approval' },
   context: { zh: '上下文', en: 'Context' },
   usage: { zh: '本会话用量', en: 'Tokens this session' },
@@ -838,7 +871,7 @@ export function modelCard(input: {
  * the border and the click, so a list of choices keeps its rhythm where one
  * entry is the current answer.
  */
-function settledRow(label: string, detail: string | undefined, note: Copy): object {
+function settledRow(label: Line, detail: Line | undefined, note: Copy, ink: string = INK.info.token): object {
   return {
     tag: 'interactive_container',
     background_style: 'grey-50',
@@ -858,7 +891,9 @@ function settledRow(label: string, detail: string | undefined, note: Copy): obje
       ...detail === undefined || detail === ''
         ? []
         : [line(detail, SIZE.label, '0px 0px 0px 0px', 'grey')],
-      line(note, SIZE.label, '2px 0px 0px 0px', INK.info.token),
+      // The caller's own state ink: a card declares only the pair it uses, so
+      // borrowing another card's token renders nothing and fails the card.
+      line(note, SIZE.label, '2px 0px 0px 0px', ink),
     ],
   }
 }
@@ -884,6 +919,8 @@ export function statusCard(input: {
   readonly activity: 'running' | 'idle' | 'unbound'
   readonly pendingApprovals: number
   readonly version: string
+  /** The permission preset in force, as the deployment defines it. */
+  readonly preset?: PresetRow | undefined
   readonly refresh: object
 }): object {
   return card('neutral', STATUS.summary, [
@@ -892,6 +929,15 @@ export function statusCard(input: {
       ...field(STATUS.workspace, input.workspace, input.workspaceIsDefault ? STATUS.isDefault : undefined, true),
       ...field(STATUS.model, input.route, input.routeIsDefault ? STATUS.isDefault : undefined),
       ...field(STATUS.activity, STATUS[input.activity]),
+      ...input.preset === undefined
+        ? []
+        // Named where someone looks for it: a session that stopped asking
+        // should not be something you discover by noticing no card arrived.
+        : field(
+          STATUS.preset,
+          input.preset.value,
+          isUnconfinedRow(input.preset) ? STATUS.presetOpen : undefined,
+        ),
       ...input.pendingApprovals === 0
         ? []
         : field(STATUS.pending, fill(STATUS.pendingCount, String(input.pendingApprovals))),
@@ -927,6 +973,12 @@ export const TOAST = {
   modelUnreadable: { zh: '这个路由无法解析', en: 'That route could not be read' },
   refreshed: { zh: '已刷新', en: 'Refreshed' },
   notYours: { zh: '你无权修改本会话', en: 'You are not allowed to change this conversation' },
+  presetSwitching: { zh: '正在切换…', en: 'Switching…' },
+  presetFailed: { zh: '切换失败，看操作台日志', en: 'The switch failed; see the operator console' },
+  presetQueued: {
+    zh: '已记下，当前这轮任务结束后生效',
+    en: 'Noted — it applies once the running turn finishes',
+  },
 } as const
 
 /**
@@ -937,4 +989,190 @@ export const TOAST = {
  */
 export function toast(type: 'success' | 'info' | 'error' | 'warning', copy: Copy): object {
   return { type, content: copy.zh, i18n: { zh_cn: copy.zh, en_us: copy.en } }
+}
+
+/** Every string the permission picker says. */
+const PERMISSION = {
+  title: { zh: '权限预设', en: 'Permission preset' },
+  context: { zh: '这个会话能碰到什么，以及会不会问你', en: 'What this session may touch, and whether it asks' },
+  inUse: { zh: '当前使用中', en: 'In use' },
+  confined: {
+    zh: '只能写工作区和临时目录；更宽的操作会弹审批卡。',
+    en: 'Writes inside the workspace and temp dirs; anything wider raises an approval card.',
+  },
+  // The host's third shipped sandbox mode. A deployment that overrides the
+  // preset table usually writes only `sandbox` and `approval` — the shipped
+  // descriptions go with the defaults it replaced — so a row this channel can
+  // explain from the mode alone is a row that stays explained.
+  readOnly: {
+    zh: '只读：不写任何文件；需要写的操作会弹审批卡。',
+    en: 'Read-only: writes nothing; anything that needs to write raises an approval card.',
+  },
+  // The two halves apart, for a deployment that mixed them: this channel's own
+  // words still describe what the table says, not what the name suggests.
+  unsandboxed: {
+    zh: '完全不沙箱：可以读写任何文件；越界的操作仍会弹审批卡。',
+    en: 'No sandbox: any file may be read or written; anything wider still raises an approval card.',
+  },
+  unasked: {
+    zh: '不再有审批卡——仍需审批的动作会被直接拒绝；沙箱边界不变。',
+    en: 'No approval cards — anything still needing approval is refused outright; the sandbox is unchanged.',
+  },
+  unconfined: {
+    zh: '完全不沙箱，且不再有审批卡——仍需审批的动作会被直接拒绝。重启后依然有效。',
+    en: 'No sandbox at all, and no approval cards — anything still needing approval is refused. Survives a restart.',
+  },
+  summary: { zh: '权限预设：%s', en: 'Permission preset: %s' },
+  unknown: { zh: '未知', en: 'unknown' },
+  foot: {
+    zh: '切换只影响本会话，随时可以切回；/status 里能看到当前是哪个。',
+    en: 'A switch applies to this conversation only and is reversible; /status shows which one is in force.',
+  },
+}
+
+/**
+ * The permission picker: which preset is in force, and what the others mean.
+ *
+ * The unconfined row is a danger row on purpose. Its name reads like "allow
+ * everything", while what it actually does is remove the sandbox AND stop the
+ * asking — so the row says both, in the place where someone is about to press
+ * it rather than in documentation they have not opened.
+ * @param input - the presets, which one is current, and each row's payload.
+ * @returns a schema 2.0 card object.
+ */
+export function permissionCard(input: {
+  readonly current?: string | undefined
+  readonly presets: readonly PresetRow[]
+  readonly valueFor: (preset: string) => object
+}): object {
+  const current = input.current ?? PERMISSION.unknown.zh
+  return card('warning', fill(PERMISSION.summary, current), [
+    ...heading('warning', PERMISSION.title, PERMISSION.context),
+    ...input.presets.map(preset => preset.value === input.current
+      ? settledRow(labelOf(preset), describePreset(preset), PERMISSION.inUse, INK.warning.token)
+      : optionRow(
+        { label: labelOf(preset), description: describePreset(preset) },
+        input.valueFor(preset.value),
+      )),
+    ...footer(PERMISSION.foot),
+  ])
+}
+
+/**
+ * One preset as a card row: what the host called it, and what the host says it
+ * does. Both optional, because a deployment may publish neither.
+ */
+export interface PresetRow {
+  readonly value: string
+  readonly name?: string | undefined
+  readonly description?: string | undefined
+  /** What the preset does, when the deployment's table could be read. */
+  readonly sandbox?: string | undefined
+  readonly approval?: string | undefined
+}
+
+/**
+ * How a row is labelled: the preset's own value, which is what a person types
+ * into `/permission`, with the host's display name beside it when it differs.
+ * @param preset - the row's preset.
+ * @returns the label line.
+ */
+function labelOf(preset: PresetRow): string {
+  return preset.name === undefined || preset.name === preset.value
+    ? preset.value
+    : `${preset.value} · ${preset.name}`
+}
+
+/** What the settled picker says, in each of its two endings. */
+const PERMISSION_SETTLED = {
+  done: { zh: '已切到 %s', en: 'Switched to %s' },
+  switching: { zh: '正在切到 %s…', en: 'Switching to %s…' },
+  held: { zh: '本轮任务结束后切到 %s', en: 'Switching to %s once the running turn ends' },
+  switchingContext: {
+    zh: '切换完成后这张卡片会自己更新',
+    en: 'This card updates itself once the switch lands',
+  },
+  heldContext: {
+    zh: '会话日志同一时刻只能有一个写入者，所以不在任务中途改',
+    en: 'A session log takes one writer at a time, so it is not changed mid-turn',
+  },
+  foot: { zh: '要再改的话，发一次 /permission。', en: 'Send /permission again to change it.' },
+  /** For a preset only the deployment knows, where there is nothing to explain. */
+  plain: { zh: '本会话的权限预设', en: "This conversation's permission preset" },
+}
+
+/**
+ * The card a picker is replaced with once a preset was chosen.
+ *
+ * A picker that stays live after the choice invites pressing what is already
+ * true, so it settles the way an approval does: the decision stated, nothing
+ * clickable, and the way back said out loud rather than assumed.
+ * @param input - the preset chosen, and whether it is in force yet.
+ * @returns a schema 2.0 card object.
+ */
+export function settledPermissionCard(input: {
+  /** The preset as this deployment defines it, not merely as it is named. */
+  readonly preset: PresetRow
+  /** Where the switch is: asked for, waiting on a turn, or in force. */
+  readonly stage?: 'switching' | 'held' | 'done' | undefined
+}): object {
+  const stage = input.stage ?? 'done'
+  const state: CardState = isUnconfinedRow(input.preset) ? 'warning' : 'success'
+  const title = fill(PERMISSION_SETTLED[stage], input.preset.value)
+  const context = stage === 'done'
+    ? describePreset(input.preset) ?? PERMISSION_SETTLED.plain
+    : stage === 'held' ? PERMISSION_SETTLED.heldContext : PERMISSION_SETTLED.switchingContext
+  return card(state, title, [
+    ...heading(state, title, context),
+    // Only a landed switch says how to change it back; while one is in flight
+    // that sentence would read as an invitation to press something else.
+    ...stage === 'done' ? footer(PERMISSION_SETTLED.foot) : [],
+  ])
+}
+
+/**
+ * Whether one row is the preset this channel's loudest copy describes: no
+ * sandbox AND no more asking. Judged from the deployment's table when it can
+ * be read, and from the name only when it cannot — because then the name is
+ * the only thing anyone, including this channel, has to go on.
+ * @param row - the preset row.
+ * @returns true when both halves hold.
+ */
+function isUnconfinedRow(row: PresetRow): boolean {
+  if (row.sandbox !== undefined || row.approval !== undefined) {
+    return row.sandbox === 'danger-full-access' && row.approval === 'never'
+  }
+  return row.value === UNCONFINED_LABEL
+}
+
+/**
+ * What one preset means, for the row that offers it.
+ *
+ * This channel's own words for the two shipped presets — the unconfined one
+ * needs saying that it also stops the asking, which the host's one-line
+ * description does not — and the host's own text for everything else, left in
+ * whatever language it was written in rather than guessed at.
+ * @param preset - the row's preset.
+ * @returns the description, or undefined when nobody described it.
+ */
+function describePreset(preset: PresetRow | string): Line | undefined {
+  const row: PresetRow = typeof preset === 'string' ? { value: preset } : preset
+  // What it DOES decides what it is called here. A deployment writes its own
+  // table, so a preset named `workspace-write` can be unconfined underneath —
+  // and describing it from the name would ask a room to authorize one thing
+  // while granting another.
+  if (row.sandbox !== undefined || row.approval !== undefined) {
+    if (row.sandbox === 'danger-full-access' && row.approval === 'never') return PERMISSION.unconfined
+    if (row.sandbox === 'danger-full-access') return PERMISSION.unsandboxed
+    if (row.approval === 'never') return PERMISSION.unasked
+    if (row.sandbox === 'read-only') return PERMISSION.readOnly
+    if (row.sandbox === 'workspace-write') return PERMISSION.confined
+    return row.description
+  }
+  // Nothing readable about what it does: the name is all there is, and these
+  // three are the modes this channel ships against.
+  if (row.value === UNCONFINED_LABEL) return PERMISSION.unconfined
+  if (row.value === 'workspace-write') return PERMISSION.confined
+  if (row.value === 'read-only') return PERMISSION.readOnly
+  return row.description
 }

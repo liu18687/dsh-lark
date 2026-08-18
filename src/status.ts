@@ -7,7 +7,9 @@
  */
 
 import { statusCard } from './cards.ts'
+import { marked } from './clicks.ts'
 import type { HostContextPressure, HostSession, HostSessionProjections, HostTokenUsage } from './host.ts'
+import type { PresetOption } from './permission.ts'
 import type { ConversationSubject } from './session.ts'
 
 /** What one session's meters report, in the shape the status card takes. */
@@ -121,6 +123,12 @@ export interface StatusFields {
   /** The running plugin's version; empty hides the row rather than lying. */
   readonly version: string
   /**
+   * The permission preset in force, as the deployment defines it — the knobs
+   * travel with the name so the row describes what the session can actually
+   * do rather than what its preset happens to be called.
+   */
+  readonly preset?: PresetOption | undefined
+  /**
    * What the next request would carry against what the model can hold. Absent
    * until a session has made one request, and absent entirely where the
    * deployment composed no token meter.
@@ -156,14 +164,17 @@ export function renderStatusCard(fields: StatusFields, subject: ConversationSubj
     activity: fields.running ? 'running' : fields.bound ? 'idle' : 'unbound',
     pendingApprovals: fields.pendingApprovals,
     version: fields.version,
+    ...fields.preset === undefined ? {} : { preset: fields.preset },
     ...fields.context === undefined ? {} : { context: fields.context },
     ...fields.usage === undefined ? {} : { usage: fields.usage },
-    refresh: {
+    // Marked, because a status card stays in the chat and refreshing twice is
+    // the most ordinary thing to do with it.
+    refresh: marked({
       kind: STATUS_ACTION,
       key: subject.key,
       chatId: subject.chatId,
       chatType: subject.chatType,
       ...subject.owner === undefined ? {} : { owner: subject.owner },
-    } satisfies StatusActionValue,
+    } satisfies StatusActionValue),
   })
 }
