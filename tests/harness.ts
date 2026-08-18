@@ -121,6 +121,8 @@ export function createFakePort() {
     failCotWrite: false,
     /** Reject roster reads, as an app without member-list permission would. */
     failChatMembers: false,
+    /** Reject repaints, as a message too old to edit does. */
+    failCardUpdate: false,
   }
   let counter = 0
 
@@ -173,6 +175,7 @@ export function createFakePort() {
       return { messageId: `om_sent_${counter}` }
     },
     async updateCard(messageId, card) {
+      if (state.failCardUpdate) throw new Error('card update rejected (fake)')
       updated.push({ messageId, card })
     },
     async createCot(chatId, options) {
@@ -399,11 +402,40 @@ export interface CreatedAgent {
   registeredTools: { name: string }[]
   agent: {
     id: string
-    session: { id: string }
+    session: { id: string; events: { type: string; data: unknown }[] }
     followup: ReturnType<typeof vi.fn<(m: HostUserMessage) => void>>
     cancel: ReturnType<typeof vi.fn<(cause: string) => void>>
+    whenIdle: () => Promise<void>
+    runMaintenance: <T>(task: (signal: AbortSignal) => Promise<T>) => Promise<T>
+    /** Test hook: hold the agent as if a turn were driving it. */
+    drive: (driving: boolean) => void
   }
   dispose: ReturnType<typeof vi.fn<() => Promise<void>>>
+}
+
+/**
+ * The deployment's preset table, as the host's `permissionPresets` service
+ * publishes it: names plus each one's knob bundle. Defaults to the pair the
+ * host ships, and takes extra entries so a test can define the preset a name
+ * check would wave through — a custom one that is unconfined under a harmless
+ * name.
+ */
+export function createFakePermissionPresets(
+  extra: Record<string, { sandbox: string; approval: string }> = {},
+) {
+  const table: Record<string, { sandbox: string; approval: string }> = {
+    'workspace-write': { sandbox: 'workspace-write', approval: 'ask' },
+    'danger-full-access': { sandbox: 'danger-full-access', approval: 'never' },
+    ...extra,
+  }
+  return {
+    get names() { return Object.keys(table) },
+    resolve: (name: string) => {
+      const spec = table[name]
+      if (spec === undefined) throw new Error(`dsh: unknown preset ${name}`)
+      return spec
+    },
+  }
 }
 
 /** An in-memory `agents` registry capturing every agent it produced. */
@@ -416,12 +448,39 @@ export function createFakeAgents(options: { readonly canRegister?: boolean } = {
   const resumed: string[] = []
   const looked: string[] = []
 
-  const makeAgent = (sessionId: string): CreatedAgent['agent'] => ({
-    id: sessionId,
-    session: { id: sessionId },
-    followup: vi.fn<(m: HostUserMessage) => void>(),
-    cancel: vi.fn<(cause: string) => void>(),
-  })
+  const makeAgent = (sessionId: string): CreatedAgent['agent'] => {
+    // The idle phase, modelled the way the host documents it: one owner at a
+    // time, a REFUSAL THROWN SYNCHRONOUSLY when something already owns it, and
+    // `whenIdle` following whatever is running. A looser double would let the
+    // channel's own serialization go untested — which is exactly how the last
+    // two writer bugs reached a chat.
+    let owner: Promise<unknown> | undefined
+    let driving = false
+    return {
+      id: sessionId,
+      // A live session carries its log; several host services fold their state
+      // out of it rather than mirroring it, and this channel reads two that way.
+      session: { id: sessionId, events: [] },
+      followup: vi.fn<(m: HostUserMessage) => void>(),
+      cancel: vi.fn<(cause: string) => void>(),
+      whenIdle: async () => {
+        while (driving || owner !== undefined) {
+          if (owner !== undefined) await owner.catch(() => undefined)
+          if (driving) await new Promise((done) => { setTimeout(done, 1) })
+        }
+      },
+      runMaintenance: <T>(task: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+        if (driving || owner !== undefined) {
+          throw new Error('dsh: an agent activity already owns this agent')
+        }
+        const controller = new AbortController()
+        const running = task(controller.signal)
+        owner = running.catch(() => undefined).then(() => { owner = undefined })
+        return running
+      },
+      drive: (next: boolean) => { driving = next },
+    }
+  }
 
   /**
    * Run one composition the way the real factory does: on a scoped context
@@ -575,6 +634,10 @@ export async function mountChannel(
     llm?: object
     /** The `planMode` service a shadowed plan review switches through. */
     planMode?: object
+    /** The `sessionProjections` registry the preset and meter reads go through. */
+    sessionProjections?: object
+    /** The `permissionPresets` table a preset switch is classified against. */
+    permissionPresets?: object
     /** False models a tool registry too old to take per-agent registrations. */
     agentsCanRegisterTools?: boolean
     /** The `credentials` seam the app secret is stored behind. */
@@ -609,6 +672,8 @@ export async function mountChannel(
   if (services.workspaces !== undefined) ctx.provide('workspaceRegistry', services.workspaces)
   if (services.llm !== undefined) ctx.provide('llm', services.llm)
   if (services.planMode !== undefined) ctx.provide('planMode', services.planMode)
+  if (services.sessionProjections !== undefined) ctx.provide('sessionProjections', services.sessionProjections)
+  if (services.permissionPresets !== undefined) ctx.provide('permissionPresets', services.permissionPresets)
   if (services.credentials !== undefined) ctx.provide('credentials', services.credentials)
   if (services.commands !== undefined) ctx.provide('commands', services.commands)
   if (services.attachments !== undefined) ctx.provide('attachments', services.attachments)

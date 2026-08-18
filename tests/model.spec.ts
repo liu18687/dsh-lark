@@ -134,7 +134,9 @@ describe('runModelCommand', () => {
     // Every advertised route is one press away, carrying the conversation it
     // switches; on the default there is nothing to reset to.
     expect(cardControls(card).map((control) => control.value)).toContainEqual(
-      { kind: MODEL_ACTION, key: 'chat', chatId: 'oc_1', chatType: 'p2p', route: 'deepseek/deepseek-reasoner' },
+      expect.objectContaining(
+        { kind: MODEL_ACTION, key: 'chat', chatId: 'oc_1', chatType: 'p2p', route: 'deepseek/deepseek-reasoner' },
+      ),
     )
     expect(cardControls(card).every((control) => (control.value as { route?: string }).route !== undefined)).toBe(true)
   })
@@ -259,7 +261,7 @@ describe('renderStatusCard', () => {
     expect(shown(idle)).not.toContain('待审批')
     // The refresh button re-reads the same conversation it was built for.
     expect(cardControls(idle).map((control) => control.value))
-      .toEqual([{ kind: STATUS_ACTION, key: 'chat', chatId: 'oc_1', chatType: 'p2p' }])
+      .toEqual([expect.objectContaining({ kind: STATUS_ACTION, key: 'chat', chatId: 'oc_1', chatType: 'p2p' })])
 
     const busy = renderStatusCard({
       workspace: '/srv/other',

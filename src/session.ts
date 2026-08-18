@@ -155,6 +155,19 @@ export class ConversationSessions {
    * handed the very agent the release is about to dispose.
    */
   private readonly generations = new Map<string, number>()
+  /**
+   * Teardown still running, per key. The epoch above protects a walk that
+   * STARTED before the release; this protects the one that starts during it.
+   *
+   * A release detaches its maps and then awaits `dispose()`, and for that
+   * moment the host registry can still answer with the agent being torn down.
+   * A fresh walk arriving there finds it through `lookup`, adopts it as
+   * someone ELSE's live agent — so it will never dispose it — publishes it as
+   * the conversation's binding, and the release then destroys the object the
+   * new binding points at. Nothing about that is visible until the next
+   * message drives a disposed agent.
+   */
+  private readonly retiring = new Map<string, Promise<void>>()
   private closed = false
 
   /**
@@ -173,6 +186,21 @@ export class ConversationSessions {
   /** Session ids currently bound, in insertion order. */
   get sessionIds(): string[] {
     return [...this.keys.keys()]
+  }
+
+  /**
+   * The live agent this store opened for one session id.
+   *
+   * The store's own record rather than the registry's: this channel created
+   * or resumed the agent, so the authoritative answer to "is there something
+   * to drive for this conversation" is here, not in a lookup whose publication
+   * rules belong to the host.
+   * @param sessionId - the session id to look up.
+   * @returns the agent, or undefined when this store drives no such session.
+   */
+  agentFor(sessionId: string): HostAgentHandle['agent'] | undefined {
+    const key = this.keys.get(sessionId)
+    return key === undefined ? undefined : this.opened.get(key)?.handle.agent
   }
 
   /**
@@ -206,6 +234,13 @@ export class ConversationSessions {
   async acquireKey(key: string): Promise<OpenedSession> {
     for (;;) {
       if (this.closed) throw new Error('lark-channel: sessions are closed')
+      // Before the registry is consulted, not after: a teardown in flight is
+      // exactly when `lookup` still answers with the agent being disposed.
+      const retiring = this.retiring.get(key)
+      if (retiring !== undefined) {
+        await retiring
+        continue
+      }
       const generation = this.generation(key)
       const bound = this.opened.get(key)
       if (bound !== undefined) {
@@ -257,6 +292,11 @@ export class ConversationSessions {
    * @returns whether a binding existed.
    */
   async release(key: string): Promise<boolean> {
+    // A teardown already in flight IS this key's release: joining it keeps
+    // "released" meaning "quiescent" for the second caller too, instead of
+    // reporting nothing to do while an agent is still being destroyed.
+    const inFlight = this.retiring.get(key)
+    if (inFlight !== undefined) await inFlight
     const bound = this.opened.get(key)
     const opening = this.opening.get(key)
     if (bound === undefined && opening === undefined) return false
@@ -267,18 +307,38 @@ export class ConversationSessions {
     this.generations.set(key, this.generation(key) + 1)
     this.opened.delete(key)
     if (this.opening.get(key) === opening) this.opening.delete(key)
-    if (bound !== undefined) {
-      this.keys.delete(bound.handle.agent.session.id)
-      if (bound.owned) {
+    if (bound !== undefined) this.keys.delete(bound.handle.agent.session.id)
+    // ONE teardown covering everything this release still has in flight, and
+    // published while it runs — an acquire arriving mid-release waits for all
+    // of it rather than racing part of it.
+    //
+    // Both halves can still be producing an agent. The bound one is being
+    // disposed, and the registry answers with it until that finishes. The
+    // detached walk is still inside `resume`/`create`, which PUBLISH to the
+    // registry before this store ever sees the handle: a fresh walk that
+    // looked there would adopt that agent as someone else's, and the stale
+    // walk — seeing the moved epoch — would then dispose the very object the
+    // new binding just took.
+    // Deferred by one microtask so the barrier is in the map BEFORE any of
+    // this runs: `dispose()` is another package's code, and one that emits
+    // synchronously could re-enter `acquireKey` while the map still said
+    // nothing was retiring.
+    const teardown = Promise.resolve().then(async () => {
+      if (bound?.owned === true) {
         await bound.handle.dispose().catch((error: unknown) => {
           this.ladder.report(`lark-channel: disposing the released session for ${key} failed: ${failureDetail(error)}`)
         })
       }
+      // A detached walk cleans up its own product: bind() sees the moved
+      // epoch, disposes what it made, and rejects as superseded.
+      if (opening !== undefined) await opening.then(() => undefined, () => undefined)
+    })
+    this.retiring.set(key, teardown)
+    try {
+      await teardown
+    } finally {
+      if (this.retiring.get(key) === teardown) this.retiring.delete(key)
     }
-    // A detached walk cleans up its own product: bind() sees the moved epoch,
-    // disposes what it made, and rejects as superseded. Waiting here is only
-    // so a caller may treat "released" as "quiescent".
-    if (opening !== undefined) await opening.then(() => undefined, () => undefined)
     return true
   }
 
@@ -291,11 +351,28 @@ export class ConversationSessions {
   async close(): Promise<void> {
     this.closed = true
     const owned = [...this.opened.values()].filter(session => session.owned)
+    // A release already in flight took its binding out of `opened`, so closing
+    // would not see it — and "closed" would mean "closed except for whatever
+    // was being released at that moment", which is not what a caller disposing
+    // this store can act on.
+    const retiring = [...this.retiring.values()]
+    // And the walks that never got as far as a release: `bind` sees `closed`,
+    // disposes what it made and rejects — but AFTER this returns, so a caller
+    // that treats close as "nothing of mine is running" would be wrong about
+    // an agent the host is still creating and destroying.
+    const opening = [...this.opening.values()]
     this.opened.clear()
     this.keys.clear()
     this.opening.clear()
     this.generations.clear()
-    const settled = await Promise.allSettled(owned.map(session => session.handle.dispose()))
+    this.retiring.clear()
+    const settled = await Promise.allSettled([
+      ...owned.map(session => session.handle.dispose()),
+      ...retiring,
+      // Settled, not successful: a superseded walk rejects by design, and what
+      // matters here is that its cleanup finished.
+      ...opening.map(walk => walk.then(() => undefined, () => undefined)),
+    ])
     const failures = settled.flatMap(result => result.status === 'rejected' ? [result.reason as unknown] : [])
     if (failures.length > 0) throw new AggregateError(failures, 'lark-channel: session disposal failed')
   }

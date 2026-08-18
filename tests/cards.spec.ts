@@ -2,10 +2,14 @@ import { describe, expect, it } from 'vitest'
 import {
   approvalCard,
   fileApprovalCard,
+  modelCard,
+  permissionCard,
   questionCard,
   settledApprovalCard,
   settledFileApprovalCard,
+  settledPermissionCard,
   settledQuestionCard,
+  statusCard,
 } from '../src/cards.ts'
 import { cardControls, cardTexts } from './harness.ts'
 
@@ -246,6 +250,41 @@ describe('localization', () => {
     questionCard({ question: 'go on?', options: [], valueFor: () => ({}) }),
     settledQuestionCard({ question: 'go on?', answer: 'yes' }),
     settledQuestionCard({ question: 'go on?', cancelled: true }),
+    settledPermissionCard({ preset: { value: 'workspace-write' } }),
+    settledPermissionCard({ preset: { value: 'danger-full-access' }, stage: 'held' }),
+    settledPermissionCard({ preset: { value: 'danger-full-access' }, stage: 'switching' }),
+    fileApprovalCard({ path: 'build/report.pdf', workspace: 'project', bytes: 2048, allow: {}, reject: {} }),
+    settledFileApprovalCard({ path: 'build/report.pdf', workspace: 'project', outcome: 'allowed-once' }),
+    settledFileApprovalCard({ path: 'build/report.pdf', workspace: 'project', outcome: 'rejected', decidedBy: 'Alex' }),
+    // The control cards too: their copy is this module's, and the reason a
+    // Chinese-only description shipped once was that this sweep stopped at the
+    // two cards a model can raise.
+    permissionCard({
+      current: 'workspace-write',
+      presets: [{ value: 'workspace-write' }, { value: 'danger-full-access' }],
+      valueFor: () => ({}),
+    }),
+    modelCard({
+      current: 'p/m',
+      isDefault: false,
+      entries: [{ label: 'p/m', current: true, value: {} }, { label: 'p/n', current: false, value: {} }],
+      hidden: 2,
+      reset: {},
+    }),
+    statusCard({
+      workspace: '/w',
+      workspaceIsDefault: true,
+      route: 'p/m',
+      routeIsDefault: false,
+      sessionId: 's',
+      activity: 'running',
+      pendingApprovals: 2,
+      version: '0.0.6',
+      preset: { value: 'workspace-write', sandbox: 'workspace-write', approval: 'ask' },
+      context: { used: 1000, window: 128000 },
+      usage: { input: 10, output: 5, cacheRead: 1, cacheWrite: 2 },
+      refresh: {},
+    }),
   ]
 
   it('offers an English rendering of every string it authored', () => {
@@ -265,6 +304,20 @@ describe('localization', () => {
     }
   })
 
+  it('leaves no Chinese without an English rendering, given ASCII inputs', () => {
+    // The stronger half of the same rule, and the one that catches copy which
+    // LOST its translation: every borrowed value above is ASCII, so any
+    // Chinese in the rendered card is this module's own — and ours always
+    // carries `i18n`. A `.zh` picked out of a Copy passes the check above,
+    // because a bare string is indistinguishable from borrowed text.
+    for (const card of everyCard()) {
+      for (const { content, i18n } of cardTexts(card)) {
+        if (!/[一-鿿]/.test(content)) continue
+        expect({ content, en: i18n?.en_us ?? '' }).toMatchObject({ content, en: expect.stringMatching(/\S/) })
+      }
+    }
+  })
+
   it('leaves borrowed text in the language it arrived in', () => {
     const card = questionCard({
       header: '部署确认',
@@ -280,23 +333,71 @@ describe('localization', () => {
   })
 })
 
+/** Every `dsh_*` value used where the platform expects a colour. */
+function colourTokens(node: unknown): string[] {
+  if (Array.isArray(node)) return node.flatMap(colourTokens)
+  if (typeof node !== 'object' || node === null) return []
+  const record = node as Record<string, unknown>
+  const own = ['text_color', 'background_style', 'border_color']
+    .map((field) => record[field])
+    .filter((value): value is string => typeof value === 'string' && value.startsWith('dsh_'))
+  return [...own, ...Object.values(record).flatMap(colourTokens)]
+}
+
 describe('card foundation', () => {
   it('declares every colour it references', () => {
+    // Every builder this module exports, because the failure is invisible in
+    // code and fatal at render: an undeclared token makes the platform reject
+    // the whole card.
     const cards = [
       approvalCard({ toolName: 'bash', command: 'ls', reason: 'x', allow: {}, reject: {} }),
+      approvalCard({ toolName: 'bash', escalateTo: 'danger-full-access', allow: {}, reject: {}, always: {} }),
       settledApprovalCard({ toolName: 'bash', outcome: 'rejected' }),
       fileApprovalCard({ path: 'out.zip', workspace: 'w', bytes: 4096, allow: {}, reject: {} }),
       settledFileApprovalCard({ path: 'out.zip', workspace: 'w', outcome: 'allowed-once', decidedBy: 'Alex' }),
       questionCard({ question: '?', options: [{ label: 'a', description: 'b' }], valueFor: () => ({}) }),
+      questionCard({ question: '?', multiSelect: true, submit: {}, options: [{ label: 'a' }], valueFor: () => ({}) }),
       settledQuestionCard({ question: '?', answer: 'a' }),
+      modelCard({
+        current: 'p/m',
+        isDefault: false,
+        entries: [{ label: 'p/m', current: true, value: {} }, { label: 'p/n', current: false, value: {} }],
+        hidden: 1,
+        reset: {},
+      }),
+      statusCard({
+        workspace: '/w',
+        workspaceIsDefault: true,
+        route: 'p/m',
+        routeIsDefault: true,
+        sessionId: 's',
+        activity: 'idle',
+        pendingApprovals: 1,
+        version: '0.0.6',
+        preset: { value: 'danger-full-access', sandbox: 'danger-full-access', approval: 'never' },
+        context: { used: 1000, window: 128000 },
+        usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 },
+        refresh: {},
+      }),
+      permissionCard({
+        current: 'workspace-write',
+        presets: [{ value: 'workspace-write' }, { value: 'danger-full-access', name: 'Danger' }],
+        valueFor: () => ({}),
+      }),
+      settledPermissionCard({ preset: { value: 'danger-full-access' } }),
+      settledPermissionCard({ preset: { value: 'workspace-write' }, stage: 'switching' }),
+      settledPermissionCard({ preset: { value: 'a-preset-only-this-deployment-knows' } }),
+      fileApprovalCard({ path: 'build/report.pdf', workspace: 'project', bytes: 2048, allow: {}, reject: {} }),
+      settledFileApprovalCard({ path: 'build/report.pdf', workspace: 'project', outcome: 'cancelled' }),
     ]
     for (const card of cards) {
       const declared = Object.keys(
         (card as { config: { style: { color: Record<string, unknown> } } }).config.style.color,
       )
-      // An undeclared `dsh_*` colour renders as the platform's fallback ink,
-      // which silently drops the card's only signal of its own state.
-      const referenced = [...JSON.stringify(card).matchAll(/dsh_[a-z_]+/g)].map((match) => match[0])
+      // Colour FIELDS only: a `dsh_*` string elsewhere is an element name.
+      // An undeclared colour is not a fallback — the platform rejects the
+      // whole card, which is invisible in code and fatal at render.
+      const referenced = colourTokens(card)
       expect([...new Set(referenced)].filter((token) => !declared.includes(token))).toEqual([])
       expect((card as { schema: string }).schema).toBe('2.0')
     }

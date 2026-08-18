@@ -43,11 +43,16 @@ function hasCredentials(config: ResolvedConfig): config is ChannelConfig {
 }
 
 /**
- * Create the production Lark transport from resolved configuration.
+ * The transport options one deployment runs under.
+ *
+ * Separated from the client it configures so the decisions here — who the
+ * transport itself will accept, and whether it may merge a chat's messages —
+ * can be read and tested without a network client.
  * @param config - resolved plugin configuration with credentials.
- * @returns the real `@larksuite/channel` client behind the bridge's port surface.
+ * @param authorization - who this deployment answers.
+ * @returns the options for `createLarkChannel`.
  */
-export function createLarkChannelPort(config: ChannelConfig, authorization: Authorization): ChannelPort {
+export function channelOptions(config: ChannelConfig, authorization: Authorization): LarkChannelOptions {
   // Transport-level defense in depth. The plugin's own inbound check is the
   // authority (it runs where the agent is driven), but leaving the transport at
   // its `dmMode: 'open'` default would let unauthorized traffic reach this
@@ -69,8 +74,27 @@ export function createLarkChannelPort(config: ChannelConfig, authorization: Auth
     source: 'dsh-lark-channel',
     respectProxyEnv: true,
   }
+  // The transport batches by CHAT: messages arriving within its window are
+  // merged into one, `{...last, content: joined}` — the LAST sender's name on
+  // everyone's words. This channel prefixes each group message with who said
+  // it, so a merge does not just blur a burst, it misattributes it: A's
+  // sentence reaches the model labelled B. Under a finer session scope it is
+  // worse still, handing one conversation another's words. Nothing is lost by
+  // closing the window: the agent's own inbox already drains several queued
+  // messages into a single turn.
+  options.safety = { batch: { text: { delayMs: 0 }, media: { delayMs: 0 } } }
   if (config.domain !== undefined) options.domain = config.domain
-  const channel = createLarkChannel(options)
+  return options
+}
+
+/**
+ * Create the production Lark transport from resolved configuration.
+ * @param config - resolved plugin configuration with credentials.
+ * @param authorization - who this deployment answers.
+ * @returns the real `@larksuite/channel` client behind the bridge's port surface.
+ */
+export function createLarkChannelPort(config: ChannelConfig, authorization: Authorization): ChannelPort {
+  const channel = createLarkChannel(channelOptions(config, authorization))
   // The slash-command panel has no SDK method; it is a plain app-config API,
   // reached through the transport's own authenticated client.
   const raw = channel.rawClient as {
