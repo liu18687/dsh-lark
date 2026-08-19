@@ -87,6 +87,92 @@ export interface HostPermissionPresets {
   }
 }
 
+/**
+ * One session as the host's corpus lists it (subset of `SessionRecord`).
+ * `header.cwd` is what decides whether a conversation may continue it, and
+ * `live` is what tells a chat the web UI is already driving it.
+ */
+export interface HostSessionRecord {
+  readonly header?: {
+    readonly id?: string
+    readonly cwd?: string
+    readonly createdAt?: number
+    /**
+     * `subagent` for work an agent delegated to itself. Those are not
+     * conversations anyone had: they open with an instruction the agent wrote,
+     * run one turn, and end.
+     */
+    readonly origin?: string
+    /** Depth below a driving session; anything above zero was delegated. */
+    readonly delegationDepth?: number
+    /** The session this one was forked from, when it was forked at all. */
+    readonly parentSession?: string
+  }
+  /** Whether an agent currently drives this id. */
+  readonly live?: boolean
+}
+
+/** One event of a session, as the query engine's lightweight listing gives it. */
+export interface HostEventRecord {
+  readonly seq: number
+  readonly type: string
+  /** Unix epoch milliseconds. */
+  readonly time: number
+}
+
+/**
+ * One raw event as the log holds it. `source` is the field this channel is
+ * after: a session's `user/message` stream carries injected context — system
+ * prompt snapshots, skill catalogs, job notices — beside what a person typed,
+ * and only the source tells them apart.
+ */
+export interface HostRawEvent {
+  readonly seq: number
+  readonly type: string
+  readonly time?: number
+  readonly data?: {
+    readonly source?: { readonly kind?: string }
+    readonly content?: readonly { readonly type?: string; readonly text?: string }[]
+  }
+}
+
+/** One result of a batch title read; a rejected one carries no value. */
+export type HostTitleResult =
+  | { readonly sessionId: string; readonly status: 'fulfilled'; readonly value?: { readonly title?: { readonly title?: string } } }
+  | { readonly sessionId: string; readonly status: 'rejected'; readonly reason?: unknown }
+
+/**
+ * The `sessionQuery` engine (subset). Read-only: this channel lists what a
+ * conversation may continue and folds titles to label them, and leaves every
+ * write to the session store.
+ */
+export interface HostSessionQuery {
+  /** The complete logical corpus, newest first. */
+  listSessions(signal?: AbortSignal): Promise<readonly HostSessionRecord[]>
+  /**
+   * Lightweight records for one session's events — no text, so counting what a
+   * conversation contains and asking when it last moved costs no payload.
+   */
+  listEvents?(sessionId: string): Promise<readonly HostEventRecord[]>
+  /**
+   * One full event plus a bounded window around it — the only read here that
+   * carries an event's `source`, which is what tells a person's message apart
+   * from the ones a plugin injected into the same stream.
+   */
+  readEvent?(request: {
+    readonly sessionId: string
+    readonly seq: number
+    readonly before?: number
+    readonly after?: number
+  }): Promise<{ readonly events?: readonly HostRawEvent[] }>
+  /**
+   * Fold the latest title for several sessions at once. Optional because a
+   * deployment may compose a query engine without it; the picker then labels
+   * rows by time alone.
+   */
+  readTitleSnapshots?(sessionIds: readonly string[], signal?: AbortSignal): Promise<readonly HostTitleResult[]>
+}
+
 /** Public live-agent handle (subset of the host `Agent` interface). */
 export interface HostAgent {
   /** The single identity shared with {@link session}. */
@@ -301,6 +387,11 @@ export interface HostWorkspaceRegistry {
    * what this channel itself has seen.
    */
   list?(): readonly HostWorkspace[]
+  /**
+   * Sessions the operator archived: the host's own "hide this from every
+   * grouping surface". Optional for the same reason as {@link list}.
+   */
+  readonly archivedSessionIds?: readonly string[]
 }
 
 /** One provider route, as the `llm` registry advertises it. */

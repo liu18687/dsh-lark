@@ -9,6 +9,7 @@ import {
   settledFileApprovalCard,
   settledPermissionCard,
   settledQuestionCard,
+  sessionsCard,
   statusCard,
 } from '../src/cards.ts'
 import { cardControls, cardTexts } from './harness.ts'
@@ -231,6 +232,89 @@ describe('question card', () => {
   })
 })
 
+describe('session picker', () => {
+  const row = (over: Partial<Parameters<typeof sessionsCard>[0]['rows'][number]> & { id: string }) =>
+    ({ live: false, own: true, current: false, ...over })
+
+  it('names the workspace above the list rather than inside it', () => {
+    // The bug this fixes was visual: the workspace sat on a panel shaped like
+    // a row, so the scope of the list read as one of its entries.
+    const texts = cardTexts(sessionsCard({
+      rows: [row({ id: 's1', lastSaid: 'carry on', when: 1_000 })],
+      workspace: '/srv/apps/checkout',
+      now: 60_000,
+      valueFor: () => ({}),
+    })).map((text) => text.content)
+
+    expect(texts[1]).toContain('apps/checkout')
+    expect(texts.filter((text) => text.includes('checkout'))).toHaveLength(1)
+    // And the tail of the path, not the whole of it: an absolute path in a
+    // subtitle wraps on a phone and puts the operator's home on a screen.
+    expect(texts[1]).not.toContain('/srv/')
+    expect(cardControls(sessionsCard({
+      rows: [row({ id: 's1' })],
+      workspace: '/srv/apps/checkout',
+      valueFor: () => ({ id: 's1' }),
+    }))).toHaveLength(1)
+  })
+
+  it('groups this chat apart from elsewhere, and says nothing where all rows are alike', () => {
+    const mixed = cardTexts(sessionsCard({
+      rows: [
+        row({ id: 's1', lastSaid: 'ours', when: 2_000 }),
+        row({ id: 's2', lastSaid: 'theirs', when: 1_000, own: false }),
+      ],
+      workspace: '/w',
+      now: 60_000,
+      valueFor: () => ({}),
+    })).map((text) => text.content)
+    expect(mixed.indexOf('这个聊天')).toBeGreaterThan(-1)
+    expect(mixed.indexOf('这个聊天')).toBeLessThan(mixed.indexOf('ours'))
+    expect(mixed.indexOf('ours')).toBeLessThan(mixed.indexOf('其它来源'))
+    expect(mixed.indexOf('其它来源')).toBeLessThan(mixed.indexOf('theirs'))
+
+    const alike = cardTexts(sessionsCard({
+      rows: [row({ id: 's1', lastSaid: 'ours', when: 2_000 }), row({ id: 's2', lastSaid: 'also ours', when: 1_000 })],
+      workspace: '/w',
+      now: 60_000,
+      valueFor: () => ({}),
+    })).map((text) => text.content)
+    expect(alike).not.toContain('这个聊天')
+    expect(alike).not.toContain('其它来源')
+  })
+
+  it('tells three different emptinesses apart', () => {
+    const said = (input: Parameters<typeof sessionsCard>[0]): string =>
+      cardTexts(sessionsCard(input)).map((text) => text.content).join('\n')
+    const base = { rows: [], workspace: '/w', valueFor: () => ({}) }
+
+    // Nothing here at all — the only one that means "send a message".
+    expect(said(base)).toContain('发一条消息')
+    // A keyword that matched nothing: the list is not empty, the filter is.
+    expect(said({ ...base, keyword: '云文档' })).toContain('没有会话匹配')
+    expect(said({ ...base, keyword: '云文档' })).not.toContain('发一条消息')
+    // Nothing drawable, but older ones exist: saying "send a message to start
+    // one" over a corpus of sessions is simply false.
+    expect(said({ ...base, hidden: 8 })).not.toContain('发一条消息')
+    expect(said({ ...base, hidden: 8 })).toContain('8')
+  })
+
+  it('states the current session instead of offering it, wherever it lives', () => {
+    const card = sessionsCard({
+      rows: [
+        row({ id: 's1', lastSaid: 'ours', when: 2_000 }),
+        row({ id: 's2', lastSaid: 'picked', when: 1_000, own: false, current: true }),
+      ],
+      workspace: '/w',
+      now: 60_000,
+      valueFor: (id) => ({ id }),
+    })
+
+    expect(cardControls(card).map((control) => control.value)).toEqual([{ id: 's1' }])
+    expect(cardTexts(card).map((text) => text.content)).toContain('当前使用中')
+  })
+})
+
 describe('localization', () => {
   /**
    * Every card this module builds, in every state it has. Borrowed values are
@@ -253,6 +337,18 @@ describe('localization', () => {
     settledPermissionCard({ preset: { value: 'workspace-write' } }),
     settledPermissionCard({ preset: { value: 'danger-full-access' }, stage: 'held' }),
     settledPermissionCard({ preset: { value: 'danger-full-access' }, stage: 'switching' }),
+    sessionsCard({
+      rows: [
+        { id: 's1', title: 'a session', when: 1_000, live: true, own: false, current: false },
+        { id: 's2', when: 0, live: false, own: true, current: true },
+      ],
+      workspace: '/w',
+      hidden: 3,
+      // A fixed clock, so the relative labels are the same on every run.
+      now: 7_400_000,
+      valueFor: () => ({}),
+    }),
+    sessionsCard({ rows: [], workspace: '/w', canList: false, valueFor: () => ({}) }),
     fileApprovalCard({ path: 'build/report.pdf', workspace: 'project', bytes: 2048, allow: {}, reject: {} }),
     settledFileApprovalCard({ path: 'build/report.pdf', workspace: 'project', outcome: 'allowed-once' }),
     settledFileApprovalCard({ path: 'build/report.pdf', workspace: 'project', outcome: 'rejected', decidedBy: 'Alex' }),
@@ -387,6 +483,11 @@ describe('card foundation', () => {
       settledPermissionCard({ preset: { value: 'danger-full-access' } }),
       settledPermissionCard({ preset: { value: 'workspace-write' }, stage: 'switching' }),
       settledPermissionCard({ preset: { value: 'a-preset-only-this-deployment-knows' } }),
+      sessionsCard({
+        rows: [{ id: 's1', title: 'a session', when: 1_000, live: true, own: true, current: false }],
+        workspace: '/w',
+        valueFor: () => ({}),
+      }),
       fileApprovalCard({ path: 'build/report.pdf', workspace: 'project', bytes: 2048, allow: {}, reject: {} }),
       settledFileApprovalCard({ path: 'build/report.pdf', workspace: 'project', outcome: 'cancelled' }),
     ]

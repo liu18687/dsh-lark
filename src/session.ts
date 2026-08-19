@@ -18,7 +18,7 @@ export type SessionScope = 'chat' | 'chat-thread' | 'chat-sender'
  * Marks a session id as this channel's, in the host agent registry and in the
  * on-disk session log. Stable: changing it orphans every stored conversation.
  */
-const SESSION_PREFIX = 'lark-'
+export const SESSION_PREFIX = 'lark-'
 
 /** Separator between a conversation key's facets; absent from Feishu open ids. */
 const FACET_SEPARATOR = ':'

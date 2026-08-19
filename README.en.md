@@ -65,6 +65,7 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 | Capability | What you get |
 |---|---|
 | Durable sessions | Survive a restart; the next message continues where you were, and `/new` starts over in place |
+| Continue a session | `/sessions` lists what this conversation may continue in its workspace — its own history, plus sessions opened in the web UI or CLI — and one press switches to it; `/cd` and `/new` return it to the derived session |
 | Workspaces | `/ws` lists, `/cd` switches; returning to one resumes the work you left there |
 | Model switching | `/model` opens a picker; the session and its context carry over, and the default is one press away |
 | Native run view | Reasoning, tool calls, and results as a thinking process, with the answer sent on its own |
@@ -90,6 +91,8 @@ The work shows up in Feishu as it happens, and anything needing you arrives as a
 | `/permission` | Open the permission-preset picker |
 | `/permission <preset>` | Switch preset without opening a card |
 | `/new` | Start a fresh session in place; workspace and model stay |
+| `/sessions` | List the sessions this conversation may continue, one press each |
+| `/sessions <keyword>` | Filter that list by title or id |
 | `/stop` | Stop the running task |
 | `/help` | Everything this chat accepts, host commands included |
 
