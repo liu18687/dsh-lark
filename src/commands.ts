@@ -11,7 +11,8 @@
 
 import type { HostAgent, HostCommands } from './host.ts'
 import { GET_COMMAND } from './outbound-file.ts'
-import { CD_COMMAND, SESSION_COMMAND, WS_COMMAND } from './workspace.ts'
+import { SESSIONS_COMMAND } from './sessions.ts'
+import { CD_COMMAND, WS_COMMAND } from './workspace.ts'
 import { MODEL_COMMAND } from './model.ts'
 import { STATUS_COMMAND } from './status.ts'
 import { NEW_COMMAND } from './epoch.ts'
@@ -70,7 +71,7 @@ export function helpText(commands: HostCommands | undefined, agent: HostAgent): 
     `\`/${MODEL_COMMAND}\` — 查看或切换本会话模型`,
     `\`/${STATUS_COMMAND}\` — 查看本会话状态`,
     `\`/${NEW_COMMAND}\` — 开一个新会话，清空上下文`,
-    `\`/${SESSION_COMMAND}\` — 查看或切换已有会话（/session <id> 或 /session reset）`,
+    `\`/${SESSIONS_COMMAND}\` — 列出可接续的会话，点一行就切过去`,
     `\`/${HELP_COMMAND}\` — 显示这条帮助`,
   ]
   const hosted = (commands?.list(agent) ?? [])

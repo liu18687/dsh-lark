@@ -18,7 +18,7 @@ import type {
 } from '@larksuite/channel'
 import {
   approvalCard as buildApprovalCard,
-  sessionCard,
+  sessionsCard,
   fileApprovalCard as buildFileApprovalCard,
   QUESTION_SELECT,
   permissionCard,
@@ -42,6 +42,7 @@ import type {
   HostLlm,
   HostLoader,
   HostPermissionPresets,
+  HostSessionQuery,
   HostSessionEvent,
   HostSessionProjections,
   HostCommands,
@@ -62,7 +63,15 @@ import { marked } from './clicks.ts'
 import { createMaintenanceQueue, lendsIdlePhase, MaintenanceCancelled } from './maintenance.ts'
 import type { Authorization } from './authorization.ts'
 import { commandName, HELP_COMMAND, isCommandLine, runCommandLine, STOP_COMMAND } from './commands.ts'
-import { CD_COMMAND, ChatSessionOverrides, ChatWorkspaces, runSessionCommand, runWorkspaceCommand, SESSION_COMMAND, WS_COMMAND } from './workspace.ts'
+import { CD_COMMAND, ChatWorkspaces, runWorkspaceCommand, WS_COMMAND } from './workspace.ts'
+import {
+  ChatSessionPicks,
+  offerSessions,
+  sessionActionValue,
+  SESSIONS_ACTION,
+  SESSIONS_COMMAND,
+} from './sessions.ts'
+import type { OfferedSessions, SessionActionValue } from './sessions.ts'
 import { ChatEpochs, NEW_COMMAND, runNewCommand } from './epoch.ts'
 import {
   ChatModels,
@@ -98,12 +107,13 @@ import type { OutboundFile, SendFilePorts } from './outbound-file.ts'
 import { failureDetail } from './format.ts'
 import { syncSlashPanel } from './slash-panel.ts'
 import type { SlashPanelPort } from './slash-panel.ts'
-import { ConversationSessions, conversationKey } from './session.ts'
+import { ConversationSessions, conversationKey, SESSION_PREFIX, sessionIdFor } from './session.ts'
 import type { ConversationSubject, SessionLadder } from './session.ts'
 import { createAttemptQuota, createReconnectWatchdog } from './liveness.ts'
 import { createHopBudget, exhaustedNotice, judgeBotMessage, servedNotice, strangerNotice } from './botchat.ts'
 import { batonNote, PRESENCE_ORDER, PRESENCE_SECTION, presenceSection } from './presence.ts'
 import type { BotSelf } from './presence.ts'
+import { canonicalPathOf } from './containment.ts'
 import { instanceIdentity } from './instance.ts'
 import {
   isUnconfined,
@@ -795,8 +805,13 @@ export function installBridge(
     report: notify,
   })
 
-  /** Per-conversation explicit session overrides (/session <id>), symmetric to ChatWorkspaces. */
-  const chatSessionOverrides = new ChatSessionOverrides({
+  /**
+   * Which session each conversation was told to continue, when it was told at
+   * all. A pick overrides the derivation; `/cd` and `/new` clear it, because
+   * both of them ARE a change of session and a pick that survived them would
+   * quietly win over what the person just asked for.
+   */
+  const chatSessionPicks = new ChatSessionPicks({
     entries: config.chatSessions,
     persist: persistState,
     report: notify,
@@ -811,10 +826,21 @@ export function installBridge(
    */
   const pathBySession = new Map<string, string>()
   const routeBySession = new Map<string, HostAgentOptions>()
+  /**
+   * The session one conversation is on: its pick, or what it derives to.
+   *
+   * The one answer to that question, because every caller that answered it
+   * itself was one edit away from answering it differently — and a caller that
+   * reads the derived id while the conversation is on a picked one reads
+   * another session's state, or writes to it.
+   * @param key - the conversation key.
+   * @returns the session id in force right now.
+   */
+  const sessionIdOf = (key: string): string =>
+    chatSessionPicks.pickFor(key) ?? chatWorkspaces.sessionIdFor(key)
+
   const sessionIdForKey = (key: string): string => {
-    // An explicit /session override wins: the chat binds to any existing session (incl. Web UI ones).
-    const override = chatSessionOverrides.overrideFor(key)
-    const id = override ?? chatWorkspaces.sessionIdFor(key)
+    const id = sessionIdOf(key)
     pathBySession.set(id, chatWorkspaces.pathFor(key))
     const route = chatModels.routeFor(key)
     if (route === undefined) routeBySession.delete(id)
@@ -1089,6 +1115,18 @@ export function installBridge(
       return handle
     },
     create: async (sessionId) => {
+      // A picked session is one this conversation was told to CONTINUE, so it
+      // exists — reaching this rung under a picked id means the resume failed,
+      // and creating one here would start an empty session under the id of the
+      // conversation someone asked to carry on with. The pick is retired so the
+      // next message lands on this conversation's own session rather than
+      // failing the same way forever.
+      const picking = chatSessionPicks.keysPicking(sessionId)
+      if (picking.length > 0) {
+        for (const key of picking) await chatSessionPicks.set(key, undefined)
+        notify(`lark-channel: ${sessionId} could not be resumed; retired the pick held by ${picking.join(', ')}`)
+        throw new Error('这个会话打不开了（日志可能已损坏或版本不兼容），已回到本聊天自己的会话。再发一条消息即可继续。')
+      }
       const composition = await compositionFor(sessionId)
       // The workspace's own canonical path, so `attachSession` finds the header
       // cwd it validates against rather than an uncanonicalized variant of it.
@@ -1223,7 +1261,7 @@ export function installBridge(
       { name: MODEL_COMMAND, description: '查看或切换本会话模型' },
       { name: STATUS_COMMAND, description: '查看本会话状态' },
       { name: NEW_COMMAND, description: '开一个新会话，清空上下文' },
-      { name: SESSION_COMMAND, description: '查看或切换已有会话（/session <id> 或 /session reset）' },
+      { name: SESSIONS_COMMAND, description: '列出可接续的会话，点一行就切过去' },
       { name: HELP_COMMAND, description: '显示可用命令' },
     ]
     void syncSlashPanel(port, desired, notify).then(({ added, removed }) => {
@@ -1329,7 +1367,7 @@ export function installBridge(
    * not guaranteed to arrive.
    */
   const releaseFor = (key: string): (() => Promise<void>) => {
-    const releasedId = chatSessionOverrides.overrideFor(key) ?? chatWorkspaces.sessionIdFor(key)
+    const releasedId = sessionIdOf(key)
     return async () => {
       // Cancelled BEFORE the release, and awaited: releasing is what makes an
       // agent idle, and a switch waiting for exactly that would slip through
@@ -1345,31 +1383,8 @@ export function installBridge(
   }
 
   /** Everything `/status` reports, read fresh from channel state. */
-  /**
-   * Fold the latest title for one session via sessionQuery.readTitleSnapshots.
-   * Absent query service or title → undefined (card falls back to id only).
-   */
-  const sessionTitleFor = async (sessionId: string): Promise<string | undefined> => {
-    const query = ctx.get('sessionQuery') as { readTitleSnapshots?: (ids: readonly string[], signal?: AbortSignal) => Promise<unknown> } | undefined
-    if (query?.readTitleSnapshots === undefined) return undefined
-    try {
-      const snapshots = await query.readTitleSnapshots([sessionId]) as Array<{
-        sessionId?: string
-        status?: string
-        value?: { session?: { id?: string }; title?: { title?: string } } | undefined
-      } | undefined>
-      const snap = snapshots[0]
-      const sid = snap?.value?.session?.id ?? snap?.sessionId
-      if (sid !== sessionId) return undefined
-      const title = snap?.value?.title?.title
-      return title === undefined || title === '' ? undefined : title
-    } catch {
-      return undefined
-    }
-  }
-
-  const statusFieldsFor = async (subject: ConversationSubject): Promise<StatusFields> => {
-    const sessionId = chatSessionOverrides.overrideFor(subject.key) ?? chatWorkspaces.sessionIdFor(subject.key)
+  const statusFieldsFor = (subject: ConversationSubject): StatusFields => {
+    const sessionId = sessionIdOf(subject.key)
     const override = chatModels.routeFor(subject.key)
     const route = override === undefined ? deploymentRoute() : formatRoute(override)
     // Meters come off the LIVE session: a conversation whose agent has not been
@@ -1384,9 +1399,8 @@ export function installBridge(
       route,
       routeIsDefault: override === undefined,
       sessionId,
-      sessionTitle: await sessionTitleFor(sessionId),
       bound: sessions.keyOf(sessionId) !== undefined,
-      switched: chatSessionOverrides.has(subject.key),
+      switched: chatSessionPicks.pickFor(subject.key) !== undefined,
       running: runningBySession.get(sessionId) === true,
       pendingApprovals: [...pendingApprovals.values()]
         .filter(pending => pending.chatId === subject.chatId).length,
@@ -1499,7 +1513,7 @@ export function installBridge(
    * @returns the preset field, or nothing.
    */
   const presetOf = (subject: ConversationSubject): { preset?: PresetOption } => {
-    const agent = sessions.agentFor(chatWorkspaces.sessionIdFor(subject.key))
+    const agent = sessions.agentFor(sessionIdOf(subject.key))
     if (agent === undefined) return {}
     return { ...currentPreset(agent) === undefined ? {} : { preset: currentPreset(agent)! } }
   }
@@ -1617,7 +1631,7 @@ export function installBridge(
       channelCommand === CD_COMMAND || channelCommand === WS_COMMAND
       || channelCommand === MODEL_COMMAND || channelCommand === STATUS_COMMAND
       || channelCommand === NEW_COMMAND || channelCommand === GET_COMMAND
-      || channelCommand === SESSION_COMMAND
+      || channelCommand === SESSIONS_COMMAND
     ) {
       try {
         const key = conversation
@@ -1657,69 +1671,32 @@ export function installBridge(
         const subject = subjectOf(msg)
         let reply: { markdown: string } | { card: object }
         if (channelCommand === CD_COMMAND || channelCommand === WS_COMMAND) {
-          reply = { markdown: await runWorkspaceCommand(channelCommand, msg.content, key, chatWorkspaces, release) }
+          // A directory change is a session change, so it also ends any pick:
+          // otherwise the conversation would move to a new workspace and go on
+          // talking to the session it was told to continue in the old one. It
+          // rides the same callback as the release, which the command runs only
+          // where the directory ACTUALLY moved — clearing before the command
+          // would retire a pick over a path that turned out not to exist.
+          const moved = async (): Promise<void> => {
+            await chatSessionPicks.set(key, undefined)
+            await release()
+          }
+          reply = { markdown: await runWorkspaceCommand(channelCommand, msg.content, key, chatWorkspaces, moved) }
         } else if (channelCommand === NEW_COMMAND) {
+          // Same reason, more bluntly: `/new` asks for a session that has no
+          // history, which is the opposite of continuing one.
+          await chatSessionPicks.set(key, undefined)
           reply = { markdown: await runNewCommand(chatWorkspaces.baseSessionIdFor(key), chatEpochs, release) }
-        } else if (channelCommand === SESSION_COMMAND) {
-          const currentId = chatSessionOverrides.overrideFor(key) ?? chatWorkspaces.sessionIdFor(key)
-          const listSessions = async (): Promise<readonly { id: string; title?: string | undefined; cwd?: string | undefined; createdAt?: number | undefined }[]> => {
-            const query = ctx.get('sessionQuery') as {
-              listSessions?: (signal?: AbortSignal) => Promise<unknown>
-              readTitleSnapshots?: (sessionIds: readonly string[], signal?: AbortSignal) => Promise<unknown>
-            } | undefined
-            if (query?.listSessions === undefined) return []
-            const currentPath = chatWorkspaces.pathFor(key)
-            try {
-              const records = await query.listSessions() as Array<{ header?: { id?: string; cwd?: string; createdAt?: number } }>
-              const registry = ctx.get('workspaceRegistry') as { archivedSessionIds?: readonly string[] } | undefined
-              const archived = new Set(registry?.archivedSessionIds ?? [])
-              const sessions = records
-                .filter(record => record.header?.id !== undefined)
-                .filter(record => !archived.has(record.header!.id!))
-                .filter(record => record.header?.cwd === currentPath)
-                .map(record => ({
-                  id: record.header!.id!,
-                  cwd: record.header?.cwd,
-                  createdAt: record.header?.createdAt,
-                }))
-              if (query.readTitleSnapshots !== undefined && sessions.length > 0) {
-                try {
-                  const snapshots = await query.readTitleSnapshots(sessions.map(s => s.id)) as Array<{
-                    sessionId?: string
-                    status?: string
-                    value?: { session?: { id?: string }; title?: { title?: string } } | undefined
-                  } | undefined>
-                  const byId = new Map<string, string | undefined>()
-                  for (const r of snapshots) {
-                    const sid = r?.value?.session?.id ?? r?.sessionId
-                    if (sid === undefined) continue
-                    const title = r?.value?.title?.title
-                    byId.set(sid, title === undefined || title === '' ? undefined : title)
-                  }
-                  return sessions.map(x => ({ ...x, title: byId.get(x.id) }))
-                } catch {
-                  return sessions
-                }
-              }
-              return sessions
-            } catch {
-              return []
-            }
-          }
-          {
-            const result = await runSessionCommand(msg.content, key, chatSessionOverrides, currentId, listSessions, chatWorkspaces.pathFor(key))
-            reply = result.card === undefined
-              ? { markdown: result.markdown }
-              : { card: sessionCard({ rows: result.card.rows, workspace: result.card.workspace, canList: result.card.canList }) }
-          }
         } else if (channelCommand === MODEL_COMMAND) {
           reply = await runModelCommand(msg.content, subject, chatModels, {
             catalog: modelCatalog,
             deploymentRoute,
             release,
           })
+        } else if (channelCommand === SESSIONS_COMMAND) {
+          reply = { card: await sessionPicker(subject, msg.content) }
         } else {
-          reply = { card: renderStatusCard({ ...await statusFieldsFor(subject), ...presetOf(subject) }, subject) }
+          reply = { card: renderStatusCard({ ...statusFieldsFor(subject), ...presetOf(subject) }, subject) }
         }
         await port.send(msg.chatId, reply).catch(reportSendFailure)
       } catch (error) {
@@ -2209,6 +2186,8 @@ export function installBridge(
     if (pick !== undefined) return switchModel(pick, evt)
     const preset = permissionActionValue(evt.action.value)
     if (preset !== undefined) return switchPresetFromCard(preset, evt)
+    const session = sessionActionValue(evt.action.value)
+    if (session !== undefined) return continueSession(session, evt)
     const refresh = statusActionValue(evt.action.value)
     if (refresh !== undefined) {
       const refusal = refuseControlClick(refresh, evt)
@@ -2220,7 +2199,7 @@ export function installBridge(
         toast: toast('success', TOAST.refreshed),
         card: {
           type: 'raw',
-          data: renderStatusCard({ ...await statusFieldsFor(refresh), ...presetOf(refresh) }, refresh),
+          data: renderStatusCard({ ...statusFieldsFor(refresh), ...presetOf(refresh) }, refresh),
         },
       }
     }
@@ -2261,7 +2240,7 @@ export function installBridge(
     // idle phase and runs a host command, which can take longer than that. A
     // response that arrives late is not shown at all, so a switch that worked
     // looked to the chat like a dead button.
-    const sessionId = chatWorkspaces.sessionIdFor(value.key)
+    const sessionId = sessionIdOf(value.key)
     const stage = runningBySession.get(sessionId) === true ? 'held' : 'switching'
     spawn(completeSwitch(value, evt.messageId))
     return {
@@ -2336,6 +2315,187 @@ export function installBridge(
     }
     await port.send(chatId, { text: presetHeldText(preset) }).catch(reportSendFailure)
     spawn(pending.then(say))
+  }
+
+  /**
+   * Continue the session one row named.
+   *
+   * The payload's id is not trusted: the same list is derived again and the id
+   * must still be in it. A card outlives the state it was drawn from — a
+   * session can be archived, a `/cd` can move the conversation elsewhere — and
+   * the only thing that may resume a session here is a row this conversation
+   * would be offered NOW.
+   * @param value - the payload the pressed row carried.
+   * @param evt - the click, for authorization and the operator log.
+   * @returns the toast and the repainted picker.
+   */
+  const continueSession = async (
+    value: SessionActionValue,
+    evt: CardActionEvent,
+  ): Promise<CardActionResponse> => {
+    const refusal = refuseControlClick(value, evt)
+    if (refusal !== undefined) {
+      notify(`lark-channel: rejected a session switch: ${refusal}`)
+      return { toast: toast('error', TOAST.notYours) }
+    }
+    // What the list was derived under, so what it authorizes can be checked
+    // against the conversation as it stands when the pick is actually written.
+    const before = conversationStamp(value.key)
+    const offered = await offeredSessions(value.key)
+    const choice = offered.rows.find(candidate => candidate.id === value.session)
+    if (choice === undefined) {
+      notify(`lark-channel: ${value.session} is no longer offered to ${value.key}`)
+      return {
+        toast: toast('info', TOAST.sessionGone),
+        card: { type: 'raw', data: await sessionPicker(subjectOfValue(value), '', offered) },
+      }
+    }
+    // The derived one is not an override: picking it is how a conversation
+    // goes back, and going back means having no pick at all.
+    const derived = chatWorkspaces.sessionIdFor(value.key)
+    // Checked before the release as well as after it: the release disposes a
+    // live agent, and a press that has already lost its conversation should not
+    // cost the room its running one.
+    if (conversationStamp(value.key) === before) await releaseFor(value.key)()
+    // A `/cd` or a `/new` may have landed while this was deriving and releasing.
+    // Both of them END a pick, and both of them ran their own clear BEFORE this
+    // write would land — so writing anyway would resurrect a pick they retired,
+    // pointing at a session belonging to a workspace this conversation left.
+    if (conversationStamp(value.key) !== before) {
+      notify(`lark-channel: ${value.key} moved while a session switch was in flight`)
+      return {
+        toast: toast('info', TOAST.sessionGone),
+        card: { type: 'raw', data: await sessionPicker(subjectOfValue(value)) },
+      }
+    }
+    await chatSessionPicks.set(value.key, choice.id === derived ? undefined : choice.id)
+    notify(`lark-channel: ${value.key} continues ${choice.id}`)
+    return {
+      toast: toast('success', choice.id === derived ? TOAST.sessionOwn : TOAST.sessionSwitched),
+      // Repainted from the list this press was authorized against: the facts
+      // behind each row cannot have changed in between, and the one thing that
+      // did — which row is current — is read fresh below.
+      card: { type: 'raw', data: await sessionPicker(subjectOfValue(value), '', offered) },
+    }
+  }
+
+  /**
+   * What a conversation resolves to, as one comparable value.
+   *
+   * The workspace and the derived id together: `/cd` moves the first, `/new`
+   * moves the second, and either one retires a pick.
+   * @param key - the conversation key.
+   * @returns a value that changes whenever the conversation does.
+   */
+  const conversationStamp = (key: string): string =>
+    `${chatWorkspaces.pathFor(key)}\u0000${chatWorkspaces.sessionIdFor(key)}`
+
+  /**
+   * The conversation a card payload names, without whatever else it carries.
+   * @param value - a payload extending {@link ConversationSubject}.
+   * @returns just the conversation.
+   */
+  const subjectOfValue = (value: ConversationSubject): ConversationSubject => ({
+    key: value.key,
+    chatId: value.chatId,
+    chatType: value.chatType,
+    ...value.owner === undefined ? {} : { owner: value.owner },
+  })
+
+  /**
+   * The picker for one conversation: what it may continue, and one press each.
+   *
+   * Everything the card offers is resolved here, because the list IS the
+   * authorization — a row that never appears cannot be pressed, and the click
+   * handler re-derives the same list rather than trusting the payload's id.
+   * @param subject - the conversation the card is built for.
+   * @param line - the command line, so a keyword can narrow the list.
+   * @param derived - a list already derived for this conversation, to repaint
+   * from instead of reading every session's log a second time.
+   * @returns the card to send.
+   */
+  const sessionPicker = async (
+    subject: ConversationSubject,
+    line = '',
+    derived?: OfferedSessions,
+  ): Promise<object> => {
+    const keyword = line.trimStart().replace(/^\/\S+\s*/, '').trim()
+    const offered = derived ?? await offeredSessions(subject.key, keyword)
+    const current = sessionIdOf(subject.key)
+    return sessionsCard({
+      rows: offered.rows.map(choice => ({
+        id: choice.id,
+        ...choice.title === undefined ? {} : { title: choice.title },
+        ...choice.lastSaid === undefined ? {} : { lastSaid: choice.lastSaid },
+        ...choice.turns === undefined ? {} : { turns: choice.turns },
+        // Last movement, not creation: "recent" in a list of conversations
+        // means the one you were just in, not the one you opened first.
+        ...(choice.lastActive ?? choice.createdAt) === undefined
+          ? {}
+          : { when: choice.lastActive ?? choice.createdAt },
+        live: choice.live,
+        own: choice.own,
+        // Read now rather than taken from the row: a repaint follows the press
+        // that moved it, and the row was derived before that.
+        current: choice.id === current,
+      })),
+      workspace: chatWorkspaces.pathFor(subject.key),
+      hidden: offered.hidden,
+      ...keyword === '' ? {} : { keyword },
+      canList: sessionQuery() !== undefined,
+      // The row's own id LAST: a caller may hand in a payload that already
+      // carries one — the click handler repaints from the value it was given —
+      // and spreading that over the row would point every button at the
+      // session someone just pressed.
+      valueFor: session => marked({ kind: SESSIONS_ACTION, ...subject, session }),
+    })
+  }
+
+  /** The host's session-query engine, when this deployment composed one. */
+  const sessionQuery = (): HostSessionQuery | undefined =>
+    ctx.get('sessionQuery') as HostSessionQuery | undefined
+
+  /**
+   * Sessions the operator archived, which no surface should offer.
+   *
+   * Archiving is the host's own "hide this from every grouping surface", so a
+   * chat that kept offering an archived session would be the one place the
+   * decision did not land.
+   * @returns the archived ids, empty where no registry is composed.
+   */
+  const archivedSessions = (): ReadonlySet<string> => {
+    const registry = ctx.get('workspaceRegistry') as HostWorkspaceRegistry | undefined
+    return new Set(registry?.archivedSessionIds ?? [])
+  }
+
+  /**
+   * What this conversation may continue right now.
+   *
+   * The conversation's half of {@link offerSessions}: which chat, which
+   * workspace, and what this deployment lets us read. The rule itself lives in
+   * `sessions.ts`, where it is a function of its inputs rather than of a
+   * running channel.
+   * @param key - the conversation key.
+   * @param keyword - optional filter over titles and ids.
+   * @returns the rows to offer and the hidden count.
+   */
+  const offeredSessions = async (key: string, keyword = ''): Promise<OfferedSessions> => {
+    const query = sessionQuery()
+    if (query === undefined) return { rows: [], hidden: 0 }
+    return offerSessions({
+      query,
+      scope: {
+        base: sessionIdFor(key, instanceIdentity(config.instance).sessionPrefix),
+        current: sessionIdOf(key),
+        workspace: chatWorkspaces.pathFor(key),
+        marker: SESSION_PREFIX,
+        archived: archivedSessions(),
+        ...keyword === '' ? {} : { keyword },
+      },
+      canonical: path => canonicalPathOf(path) ?? path,
+      signal: commandSignal(),
+      report: notify,
+    })
   }
 
   /**

@@ -917,7 +917,6 @@ export function statusCard(input: {
   readonly route: string
   readonly routeIsDefault: boolean
   readonly sessionId: string
-  readonly sessionTitle?: string | undefined
   readonly activity: 'running' | 'idle' | 'unbound' | 'switched'
   readonly pendingApprovals: number
   readonly version: string
@@ -953,14 +952,7 @@ export function statusCard(input: {
           input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, compactCount(input.usage.cacheRead)).zh,
           input.usage.cacheRead === 0 ? '' : fill(STATUS.cached, compactCount(input.usage.cacheRead)).en,
         )),
-      ...(input.sessionTitle === undefined || input.sessionTitle === ''
-        ? field(STATUS.session, input.sessionId)
-        // Keep the 会话 label; title (grey subtitle) above, id (body) below, both in the value area.
-        : [
-            line(STATUS.session, SIZE.label, '14px 0px 0px 0px', 'grey'),
-            line(input.sessionTitle, SIZE.label, '2px 0px 0px 0px', 'grey'),
-            line(input.sessionId, SIZE.body, '2px 0px 0px 0px'),
-          ]),
+      ...field(STATUS.session, input.sessionId),
       ...input.version === '' ? [] : field(STATUS.version, input.version),
     ]),
     actions([{ label: STATUS.refresh, value: input.refresh }], true),
@@ -968,66 +960,163 @@ export function statusCard(input: {
   ])
 }
 
-/** Session picker copy. */
-const SESSION = {
-  title: { zh: '可切换会话', en: 'Switchable sessions' },
-  subtitle: { zh: '选择要接续的对话', en: 'Pick a conversation to resume' },
-  current: { zh: '当前', en: 'current' },
-  currentOverride: { zh: '当前（已切换）', en: 'current (switched)' },
-  noSessions: { zh: '当前工作区暂无其他会话，发条消息即可创建。', en: 'No other sessions in this workspace — send a message to create one.' },
-  unavailable: { zh: '会话列表不可用。', en: 'Session list unavailable.' },
-  workspace: { zh: '工作区', en: 'Workspace' },
-  empty: { zh: '（无标题）', en: '(untitled)' },
-  footer: {
-    zh: '/session <id> 切换到列表中的会话；/session reset 解除切换。',
-    en: '/session <id> switches to a listed session; /session reset clears the switch.',
+/** Every string the session picker says. */
+const SESSIONS = {
+  title: { zh: '可接续的会话', en: 'Sessions you can continue' },
+  // The workspace rides the subtitle rather than a field of its own: it is the
+  // scope of the whole list, not an item in it, and a panel that looks like a
+  // row is exactly what made the two impossible to tell apart.
+  context: { zh: '%s 里的对话', en: 'Conversations in %s' },
+  hereGroup: { zh: '这个聊天', en: 'This chat' },
+  elsewhereGroup: { zh: '其它来源', en: 'Elsewhere' },
+  untitled: { zh: '（还没说过话）', en: '(nothing said yet)' },
+  turns: { zh: '%s 轮', en: '%s turns' },
+  inUse: { zh: '当前使用中', en: 'In use now' },
+  elsewhere: { zh: '其它界面正在使用', en: 'Open on another surface' },
+  none: {
+    zh: '这里还没有可接续的会话，发一条消息就会开一个。',
+    en: 'Nothing to continue here yet — send a message to start one.',
   },
-  summary: { zh: '可切换会话', en: 'Switchable sessions' },
+  noMatch: {
+    zh: '没有会话匹配这个关键词。直接发 /sessions 看全部。',
+    en: 'No session matches that keyword — send /sessions for the whole list.',
+  },
+  unavailable: {
+    zh: '这个部署没有组合会话查询服务，列不出会话。',
+    en: 'This deployment composes no session query service, so nothing can be listed.',
+  },
+  // Says what the filter actually matches: a row is labelled by the last thing
+  // said in it, but the keyword is matched against titles and ids — searching a
+  // corpus by its content is a full-text read this does not do.
+  more: {
+    zh: '还有 %s 个更早的会话，/sessions <关键词> 可按标题过滤',
+    en: '%s older ones — /sessions <keyword> filters by title',
+  },
+  justNow: { zh: '刚刚', en: 'just now' },
+  minutes: { zh: '%s 分钟前', en: '%s min ago' },
+  hours: { zh: '%s 小时前', en: '%s h ago' },
+  days: { zh: '%s 天前', en: '%s d ago' },
+  foot: {
+    zh: '点一行，下一条消息接续该会话；/cd 或 /new 会回到自动派生的那个。',
+    en: 'Press a row and your next message continues it; /cd and /new return to the derived one.',
+  },
+  summary: { zh: '可接续的会话', en: 'Sessions you can continue' },
 }
 
-/** One row in the session picker. */
+/** One row of the session picker, as the bridge resolves it. */
 export interface SessionCardRow {
   readonly id: string
   readonly title?: string | undefined
+  /** The last thing a person said in it. */
+  readonly lastSaid?: string | undefined
+  /** Turns taken. */
+  readonly turns?: number | undefined
+  /** When it last moved, in unix milliseconds. */
+  readonly when?: number | undefined
+  readonly live: boolean
+  readonly own: boolean
   readonly current: boolean
-  readonly override: boolean
 }
 
 /**
- * Render the session picker as a card: one field per session, label = title,
- * value = id — so a phone user can copy the id without the title.
- * @param input - sessions in the current workspace plus workspace path.
- * @returns a schema 2.0 card object for `send({ card })`.
+ * How long ago, in both languages. Coarse on purpose: the picker is for
+ * recognizing a conversation, and a timestamp makes a reader do arithmetic.
+ * @param age - milliseconds since the session was created.
+ * @returns the label.
  */
-export function sessionCard(input: {
+function agoLabel(age: number): Copy {
+  const minutes = Math.max(0, Math.round(age / 60_000))
+  if (minutes < 1) return SESSIONS.justNow
+  if (minutes < 60) return fill(SESSIONS.minutes, String(minutes))
+  const hours = Math.round(minutes / 60)
+  if (hours < 24) return fill(SESSIONS.hours, String(hours))
+  return fill(SESSIONS.days, String(Math.round(hours / 24)))
+}
+
+/**
+ * The session picker: what this conversation may continue, one press each.
+ *
+ * Ids are carried by the buttons and never printed. A session id is a machine
+ * identifier — asking someone to read one off a card and type it back is how
+ * this ends up unusable on the phone it is mostly used from, and it is also
+ * what would force a second authorization path for typed ids.
+ * @param input - the rows, the workspace they belong to, and each row's payload.
+ * @returns a schema 2.0 card object.
+ */
+export function sessionsCard(input: {
   readonly rows: readonly SessionCardRow[]
   readonly workspace: string
-  readonly canList: boolean
+  readonly hidden?: number | undefined
+  /** The keyword the list was narrowed by, so an empty one says which emptiness. */
+  readonly keyword?: string | undefined
+  /** The clock the relative labels are read against; injectable for tests. */
+  readonly now?: number | undefined
+  /** False when the deployment composes no query service at all. */
+  readonly canList?: boolean | undefined
+  readonly valueFor: (sessionId: string) => object
 }): object {
-  const fields: object[] = []
-  if (!input.canList) {
-    fields.push(...field(SESSION.title, SESSION.unavailable, undefined, true))
-  } else if (input.rows.length === 0) {
-    fields.push(...field(SESSION.title, SESSION.noSessions, undefined, true))
-  } else {
-    for (const row of input.rows) {
-      // Title line (readable), id line (copyable on mobile), current marker as note.
-      const title = row.title !== undefined && row.title !== '' ? row.title : SESSION.empty
-      fields.push(line(title, SIZE.label, '14px 0px 0px 0px', 'grey'))
-      const note = row.current ? (row.override ? SESSION.currentOverride : SESSION.current) : undefined
-      fields.push(line(note === undefined ? row.id : `${row.id}（${note.zh}）`, SIZE.body, '2px 0px 0px 0px'))
-      if (row !== input.rows[input.rows.length - 1]) {
-        fields.push(line('', SIZE.body, '10px 0px 0px 0px'))
-      }
-    }
+  const now = input.now ?? Date.now()
+  /**
+   * One session as a pressable row: what it was last about, then the facts
+   * that separate it from its neighbours. The current one states itself
+   * instead of offering a press, the same way every settled row here does.
+   */
+  const rowFor = (row: SessionCardRow): object => {
+    const label = row.lastSaid ?? row.title ?? SESSIONS.untitled
+    const notes = [
+      row.when === undefined ? undefined : agoLabel(now - row.when),
+      row.turns === undefined || row.turns === 0 ? undefined : fill(SESSIONS.turns, String(row.turns)),
+      row.live && !row.current ? SESSIONS.elsewhere : undefined,
+    ].filter((note): note is Copy => note !== undefined)
+    const detail = notes.length === 0
+      ? undefined
+      : { zh: notes.map(note => note.zh).join(' · '), en: notes.map(note => note.en).join(' · ') }
+    return row.current
+      ? settledRow(label, detail, SESSIONS.inUse, INK.info.token)
+      : optionRow({ label, description: detail }, input.valueFor(row.id))
   }
-  // Workspace goes in the header subtitle (readable); the panel holds only the session list.
-  const context: Line = input.canList && input.workspace !== '' ? input.workspace : SESSION.subtitle
-  return card('neutral', SESSION.summary, [
-    ...heading('neutral', SESSION.title, context),
-    panel(fields),
-    ...footer(SESSION.footer),
+
+  /** A cluster's quiet heading; nothing is drawn for a cluster with no rows. */
+  const group = (heading: Copy, rows: readonly SessionCardRow[]): object[] =>
+    rows.length === 0 ? [] : [line(heading, SIZE.label, '16px 20px 2px 20px', 'grey'), ...rows.map(rowFor)]
+
+  const here = input.rows.filter(row => row.own)
+  const elsewhere = input.rows.filter(row => !row.own)
+  const grouped = here.length > 0 && elsewhere.length > 0
+    ? [...group(SESSIONS.hereGroup, here), ...group(SESSIONS.elsewhereGroup, elsewhere)]
+    : input.rows.map(rowFor)
+  return card('info', SESSIONS.summary, [
+    ...heading('info', SESSIONS.title, fill(SESSIONS.context, workspaceLabel(input.workspace))),
+    ...input.canList === false ? [line(SESSIONS.unavailable, SIZE.body, '14px 20px 0px 20px', 'grey')] : [],
+    ...input.canList !== false && input.rows.length === 0
+      // Three different emptinesses, and only one of them means "send a
+      // message": nothing matched the keyword, nothing is drawable but older
+      // ones exist, or there is genuinely nothing here.
+      ? input.keyword !== undefined && input.keyword !== ''
+        ? [line(SESSIONS.noMatch, SIZE.body, '14px 20px 0px 20px', 'grey')]
+        : input.hidden === undefined || input.hidden <= 0
+          ? [line(SESSIONS.none, SIZE.body, '14px 20px 0px 20px', 'grey')]
+          : []
+      : grouped,
+    ...input.hidden === undefined || input.hidden <= 0
+      ? []
+      : [line(fill(SESSIONS.more, String(input.hidden)), SIZE.label, '10px 20px 0px 20px', 'grey')],
+    ...footer(SESSIONS.foot),
   ])
+}
+
+/**
+ * A workspace as a subtitle names it: the last two path segments.
+ *
+ * A whole absolute path in a subtitle is longer than the title, wraps on a
+ * phone, and puts the operator's home directory on a group's screen — while
+ * the part that identifies the directory is its tail.
+ * @param path - the workspace directory.
+ * @returns the short form.
+ */
+function workspaceLabel(path: string): string {
+  const parts = path.split('/').filter(part => part !== '')
+  return parts.length <= 2 ? path : parts.slice(-2).join('/')
 }
 
 /** Every toast this channel raises, in the languages it raises them. */
@@ -1045,6 +1134,9 @@ export const TOAST = {
   refreshed: { zh: '已刷新', en: 'Refreshed' },
   notYours: { zh: '你无权修改本会话', en: 'You are not allowed to change this conversation' },
   presetSwitching: { zh: '正在切换…', en: 'Switching…' },
+  sessionSwitched: { zh: '已切过去，下一条消息接续', en: 'Switched — your next message continues it' },
+  sessionOwn: { zh: '已回到这个聊天自己的会话', en: "Back on this chat's own session" },
+  sessionGone: { zh: '这个会话已经不在可接续列表里了', en: 'That session is no longer on offer here' },
   presetFailed: { zh: '切换失败，看操作台日志', en: 'The switch failed; see the operator console' },
   presetQueued: {
     zh: '已记下，当前这轮任务结束后生效',

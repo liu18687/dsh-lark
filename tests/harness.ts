@@ -438,6 +438,103 @@ export function createFakePermissionPresets(
   }
 }
 
+/**
+ * A session corpus, as the host's `sessionQuery` engine lists it: records
+ * carrying a header and a live flag, and titles folded per session with
+ * failures isolated to the session they belong to.
+ */
+export function createFakeSessionQuery(
+  records: readonly {
+    id: string
+    cwd?: string
+    createdAt?: number
+    live?: boolean
+    title?: string
+    unreadable?: boolean
+    /** Delegated work, which is never a conversation to continue. */
+    origin?: string
+    delegationDepth?: number
+    /** What happened in this session, oldest first. */
+    messages?: readonly { text: string; at: number; from?: string }[]
+    /** Turns taken, when a test cares; defaults to one per message. */
+    turns?: number
+  }[],
+) {
+  const listed: number[] = []
+  /** Every batch of ids a title read asked for, so a test can count the reads. */
+  const titled: string[][] = []
+  /** A listing this test is holding open, to drive what happens mid-derivation. */
+  let held: Promise<void> | undefined
+  /**
+   * Hold the next listings open until the returned function is called, so a
+   * test can land another command inside one derivation.
+   */
+  const hold = (): (() => void) => {
+    let release = (): void => {}
+    held = new Promise<void>((resolve) => { release = resolve })
+    return () => { held = undefined; release() }
+  }
+  return {
+    listed,
+    titled,
+    hold,
+    query: {
+      listSessions: async () => {
+        listed.push(listed.length + 1)
+        if (held !== undefined) await held
+        return records.map((record) => ({
+          header: {
+            id: record.id,
+            ...record.cwd === undefined ? {} : { cwd: record.cwd },
+            ...record.createdAt === undefined ? {} : { createdAt: record.createdAt },
+            ...record.origin === undefined ? {} : { origin: record.origin },
+            ...record.delegationDepth === undefined ? {} : { delegationDepth: record.delegationDepth },
+          },
+          live: record.live === true,
+          persisted: true,
+        }))
+      },
+      listEvents: async (id: string) => {
+        const record = records.find((candidate) => candidate.id === id)
+        return (record?.messages ?? []).flatMap((message, index) => [
+          { sessionId: id, seq: index * 2, type: 'turn/start', time: message.at, surface: 'model' as const },
+          { sessionId: id, seq: index * 2 + 1, type: 'user/message', time: message.at, surface: 'model' as const },
+        ])
+      },
+      readEvent: async (request: { sessionId: string; seq: number; before?: number }) => {
+        const record = records.find((candidate) => candidate.id === request.sessionId)
+        const raw = (record?.messages ?? []).flatMap((message, index) => [
+          { seq: index * 2, type: 'turn/start', time: message.at, data: {} },
+          {
+            seq: index * 2 + 1,
+            type: 'user/message',
+            time: message.at,
+            data: {
+              source: { kind: message.from ?? 'user' },
+              content: [{ type: 'text', text: message.text }],
+            },
+          },
+        ])
+        const from = Math.max(0, request.seq - (request.before ?? 0))
+        return { events: raw.filter((event) => event.seq >= from && event.seq <= request.seq) }
+      },
+      readTitleSnapshots: async (ids: readonly string[]) => {
+        titled.push([...ids])
+        return ids.map((id) => {
+        const record = records.find((candidate) => candidate.id === id)
+        return record?.unreadable === true
+          ? { sessionId: id, status: 'rejected' as const, reason: new Error('unreadable log (fake)') }
+          : {
+              sessionId: id,
+              status: 'fulfilled' as const,
+              value: { session: { id }, ...record?.title === undefined ? {} : { title: { title: record.title } } },
+            }
+        })
+      },
+    },
+  }
+}
+
 /** An in-memory `agents` registry capturing every agent it produced. */
 export function createFakeAgents(options: { readonly canRegister?: boolean } = {}) {
   const created: CreatedAgent[] = []
@@ -446,6 +543,8 @@ export function createFakeAgents(options: { readonly canRegister?: boolean } = {
   /** Agents a test declared already live under another owner, so `get` adopts one. */
   const live = new Map<string, CreatedAgent['agent']>()
   const resumed: string[] = []
+  /** Ids handed to `create`, so a test can tell a resume from a fresh start. */
+  const made: string[] = []
   const looked: string[] = []
 
   const makeAgent = (sessionId: string): CreatedAgent['agent'] => {
@@ -567,6 +666,7 @@ export function createFakeAgents(options: { readonly canRegister?: boolean } = {
       readonly agentOptions?: HostAgentOptions
       readonly setup?: (agentCtx: Context) => Promise<void>
     }) {
+      made.push(options.sessionId)
       const agent = makeAgent(options.sessionId)
       const record: CreatedAgent = {
         sessionId: options.sessionId,
@@ -588,6 +688,7 @@ export function createFakeAgents(options: { readonly canRegister?: boolean } = {
     live,
     /** Ids handed to `resume` and to `get`, in call order. */
     resumed,
+    made,
     looked,
     /** Declare one id already live under another owner. */
     declareLive(sessionId: string): CreatedAgent['agent'] {
@@ -638,6 +739,8 @@ export async function mountChannel(
     sessionProjections?: object
     /** The `permissionPresets` table a preset switch is classified against. */
     permissionPresets?: object
+    /** The `sessionQuery` engine the session picker lists through. */
+    sessionQuery?: object
     /** False models a tool registry too old to take per-agent registrations. */
     agentsCanRegisterTools?: boolean
     /** The `credentials` seam the app secret is stored behind. */
@@ -674,6 +777,7 @@ export async function mountChannel(
   if (services.planMode !== undefined) ctx.provide('planMode', services.planMode)
   if (services.sessionProjections !== undefined) ctx.provide('sessionProjections', services.sessionProjections)
   if (services.permissionPresets !== undefined) ctx.provide('permissionPresets', services.permissionPresets)
+  if (services.sessionQuery !== undefined) ctx.provide('sessionQuery', services.sessionQuery)
   if (services.credentials !== undefined) ctx.provide('credentials', services.credentials)
   if (services.commands !== undefined) ctx.provide('commands', services.commands)
   if (services.attachments !== undefined) ctx.provide('attachments', services.attachments)
@@ -762,7 +866,11 @@ export function createFakePresets(ids: string[] = ['default'], defaultId = ids[0
 }
 
 /** An in-memory `workspaceRegistry` recording lookups, creations, and attachments. */
-export function createFakeWorkspaces(registered: Record<string, string> = {}) {
+export function createFakeWorkspaces(
+  registered: Record<string, string> = {},
+  /** Sessions the operator archived, which no surface should offer. */
+  archivedSessionIds: readonly string[] = [],
+) {
   const created: string[] = []
   const attached: { workspaceId: string; sessionId: string }[] = []
   const state = { failAttach: false }
@@ -789,6 +897,7 @@ export function createFakeWorkspaces(registered: Record<string, string> = {}) {
     list() {
       return Object.entries(registered).map(([path, id]) => entity(path, id))
     },
+    archivedSessionIds,
   }
   return { service, created, attached, state }
 }
