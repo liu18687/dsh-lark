@@ -48,6 +48,8 @@ export interface CotPort {
   writeCotEvents(handle: CotHandle, events: readonly CotEvent[]): Promise<void>
   /** Delete a thinking-process message; a silenced turn leaves no card behind. */
   deleteCot(handle: CotHandle): Promise<void>
+  /** Send a short guide reply that opens a topic under the message; returns the new thread id. */
+  openThread(chatId: string, replyTo: string): Promise<string | undefined>
 }
 
 /** How many events one write call may carry, per the API's own bound. */
@@ -125,6 +127,8 @@ export interface CotRendererOptions {
 interface LiveRun {
   readonly turn: number
   readonly opening: Promise<CotHandle | undefined>
+  /** For deferred cards (main-channel turns): resolves the pending opening. */
+  readonly resolveOpening: ((handle: CotHandle | undefined) => void) | undefined
   /** Events awaiting a write; drained in arrival order. */
   readonly pending: CotEvent[]
   /** Settles when the queue is idle, so disposal can wait for it. */
@@ -185,20 +189,33 @@ export function createCotRenderer(
   const ensure = (turn: number): LiveRun => {
     if (live !== undefined && live.turn === turn) return live
     if (live !== undefined) closeRun(live)
-    const opening = port
-      .createCot(chatId, {
-        ...aimed === undefined ? {} : { replyTo: aimed.messageId },
-        ...aimed === undefined || aimed.threadId === undefined ? {} : { threadId: aimed.threadId },
-        hidden,
+    // A main-channel group message gets its card mounted in the topic the
+    // answer itself creates, so the card cannot open eagerly: the events
+    // buffer behind a deferred opening that the turn's end resolves.
+    const mainChannel = aimed !== undefined && aimed.threadId === undefined && aimed.inThread === true
+    let opening: Promise<CotHandle | undefined>
+    let resolveOpening: ((handle: CotHandle | undefined) => void) | undefined
+    if (mainChannel) {
+      opening = new Promise<CotHandle | undefined>((resolve) => {
+        resolveOpening = resolve
       })
-      .catch((error: unknown) => {
-        // The process is presentation; the answer still arrives without it.
-        onFailure(error)
-        return undefined
-      })
+    } else {
+      opening = port
+        .createCot(chatId, {
+          ...aimed === undefined ? {} : { replyTo: aimed.messageId },
+          ...aimed === undefined || aimed.threadId === undefined ? {} : { threadId: aimed.threadId },
+          hidden,
+        })
+        .catch((error: unknown) => {
+          // The process is presentation; the answer still arrives without it.
+          onFailure(error)
+          return undefined
+        })
+    }
     live = {
       turn,
       opening,
+      resolveOpening,
       pending: [],
       draining: Promise.resolve(),
       reasoningOpen: false,
@@ -321,15 +338,56 @@ export function createCotRenderer(
       if (isTurnEndEvent(event)) {
         // One message per turn: the text the turn ended on.
         const answered = held !== undefined && held.turn === event.data.turn
+        const run = live !== undefined && live.turn === event.data.turn ? live : undefined
+        if (run !== undefined) live = undefined
+        const detail = turnErrorDetail(event.data)
+        const mainChannel = run !== undefined && aimed !== undefined && aimed.threadId === undefined && aimed.inThread === true
+
+        // Main-channel group message: the answer's guide reply opens the
+        // topic, then the whole turn — buffered events plus the answer —
+        // mounts into that topic as one collapsible card.
+        if (answered && run !== undefined && mainChannel) {
+          const heldEvent = held!.event
+          const text = stripToolCallMarkup(assistantText(heldEvent.data as AssistantMessageData))
+          held = undefined
+          void (async () => {
+            let handle: CotHandle | undefined
+            try {
+              const threadId = await port.openThread(chatId, aimed!.messageId)
+              handle = threadId === undefined
+                ? undefined
+                : await port.createCot(chatId, { replyTo: aimed!.messageId, threadId, hidden })
+            } catch (error) {
+              onFailure(error)
+            }
+            run.resolveOpening?.(handle)
+            if (handle !== undefined) {
+              if (text !== '') {
+                const messageId = `answer-${run.turn}`
+                enqueue(
+                  run,
+                  cotEvent('TEXT_MESSAGE_START', { messageId, role: 'assistant' }),
+                  cotEvent('TEXT_MESSAGE_CONTENT', { messageId, delta: text }),
+                  cotEvent('TEXT_MESSAGE_END', { messageId }),
+                )
+              }
+              closeRun(run, detail === '' ? undefined : detail)
+            } else {
+              // The topic could not be opened; the answer still reaches the chat.
+              closeRun(run, detail === '' ? undefined : detail)
+              answer.handle(heldEvent)
+            }
+          })()
+          return
+        }
+
         if (answered) {
           const text = stripToolCallMarkup(assistantText(held!.event.data as AssistantMessageData))
           const inThread = aimed?.threadId !== undefined
           // Inside a topic the whole turn lives in one process card: the
           // answer is appended to the (collapsible) thinking process instead
-          // of landing as a separate message. Main-channel messages keep the
-          // separate reply — it is the one that creates their topic.
-          if (inThread && showProcess && live !== undefined && live.turn === event.data.turn && text !== '') {
-            const run = live
+          // of landing as a separate message.
+          if (inThread && showProcess && run !== undefined && text !== '') {
             const messageId = `answer-${run.turn}`
             enqueue(
               run,
@@ -341,23 +399,24 @@ export function createCotRenderer(
             answer.handle(held!.event)
           }
           held = undefined
+        } else if (run !== undefined) {
+          run.resolveOpening?.(undefined)
         }
-        if (live === undefined || live.turn !== event.data.turn) return
-        const run = live
-        live = undefined
-        const detail = turnErrorDetail(event.data)
-        closeRun(run, detail === '' ? undefined : detail)
-        // A turn that ended with no answer (the silence rule) should leave no
-        // process card either: once its events have drained, delete the CoT
-        // message so a quiet chat stays quiet. Errors keep their card — the
-        // failure notice is the one thing a broken turn must still show.
-        if (!answered && detail === '') {
-          const settled = run.draining
-          void settled.then(() =>
-            run.opening.then(handle => {
-              if (handle !== undefined) return port.deleteCot(handle)
-            }),
-          ).catch(onFailure)
+
+        if (run !== undefined) {
+          closeRun(run, detail === '' ? undefined : detail)
+          // A turn that ended with no answer (the silence rule) should leave no
+          // process card either: once its events have drained, delete the CoT
+          // message so a quiet chat stays quiet. Errors keep their card — the
+          // failure notice is the one thing a broken turn must still show.
+          if (!answered && detail === '') {
+            const settled = run.draining
+            void settled.then(() =>
+              run.opening.then(handle => {
+                if (handle !== undefined) return port.deleteCot(handle)
+              }),
+            ).catch(onFailure)
+          }
         }
       }
     },

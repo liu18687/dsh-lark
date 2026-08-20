@@ -90,6 +90,8 @@ export function createFakePort() {
   }[] = []
   /** Thinking processes the renderer deleted, with the handle it held. */
   const deletedCots: { cotId: string; messageId: string }[] = []
+  /** Topics the renderer asked the transport to open under a message. */
+  const openedThreads: { chatId: string; replyTo: string; threadId: string }[] = []
   /** Downloadable resources, by file key, as the transport would serve them. */
   const resourceBytes = new Map<string, { buffer: Uint8Array; contentType?: string }>()
   /** Members returned by the optional cached roster lookup. */
@@ -209,6 +211,11 @@ export function createFakePort() {
     async deleteCot(handle) {
       deletedCots.push(handle)
     },
+    async openThread(chatId, replyTo) {
+      counter += 1
+      openedThreads.push({ chatId, replyTo, threadId: `omt_${counter}` })
+      return `omt_${counter}`
+    },
     async downloadResourceWithMeta(messageId, fileKey, _type) {
       downloads.push({ fileKey, via: 'memory' })
       const stored = resourceBytes.get(fileKey)
@@ -278,6 +285,7 @@ export function createFakePort() {
     downloads,
     cots,
     deletedCots,
+    openedThreads,
     state,
     gates,
     /** Deliver one inbound chat message to every subscribed handler. */

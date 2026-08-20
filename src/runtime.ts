@@ -36,6 +36,9 @@ const MESSAGE_DELETE_API = '/open-apis/im/v1/messages'
 /** Shown in the chat when a thread-creating reply is rejected by the platform. */
 const THREAD_CREATE_FAILED_NOTICE = '⚠️ 本群尚未开启「话题」功能，机器人无法以话题形式回复。请群主在 群设置 → 开启话题 后 @ 我再试；开启后我将自动按话题回复。 | This group has topics disabled. Ask an admin to enable topics in group settings; replies will then land in threads automatically.'
 
+/** The guide reply that opens a topic under a main-channel message. */
+const THREAD_GUIDE_TEXT = '🤖 已为这条消息创建独立话题：话题内消息共享同一上下文，不同话题互不干扰，后续请在此话题继续交流。 | A topic was created for this message — messages inside share one context, each topic stays independent. Continue here.'
+
 /**
  * Narrow a resolved configuration to one carrying live credentials.
  * @param config - resolved plugin configuration.
@@ -207,6 +210,18 @@ export function createLarkChannelPort(config: ChannelConfig, authorization: Auth
         method: 'DELETE',
         url: `${MESSAGE_DELETE_API}/${handle.messageId}`,
       })
+    },
+    async openThread(_chatId: string, replyTo: string): Promise<string | undefined> {
+      const response = await raw.request({
+        method: 'POST',
+        url: `/open-apis/im/v1/messages/${replyTo}/reply`,
+        data: {
+          content: JSON.stringify({ text: THREAD_GUIDE_TEXT }),
+          msg_type: 'text',
+          reply_in_thread: true,
+        },
+      }) as { data?: { thread_id?: string; message_id?: string } }
+      return response.data?.thread_id
     },
     async createSlashCommand(command: string, description: string): Promise<void> {
       await raw.request({
