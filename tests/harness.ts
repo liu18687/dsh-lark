@@ -56,6 +56,8 @@ type PortHandler = MessageHandler | CardActionHandler | RejectHandler | ErrorHan
 /** One streaming card opened by the renderer, with the content it received. */
 export interface StreamedCard {
   to: string
+  /** The send options the card opened with, so a test can assert its aim. */
+  opts?: SendOptions
   /** Ordered controller operations: appended chunks and whole-content replacements. */
   ops: ({ append: string } | { set: string })[]
   /** The card's content as the controller applied the operations. */
@@ -121,6 +123,8 @@ export function createFakePort() {
     failPanelDelete: false,
     /** Reject opening a thinking process, as an old deployment would. */
     failCotCreate: false,
+    /** Refuse to open a topic under a main-channel message. */
+    failOpenThread: false,
     /** Reject writing events to one. */
     failCotWrite: false,
     /** Reject roster reads, as an app without member-list permission would. */
@@ -212,6 +216,7 @@ export function createFakePort() {
       deletedCots.push(handle)
     },
     async openThread(chatId, replyTo) {
+      if (state.failOpenThread) return undefined
       counter += 1
       openedThreads.push({ chatId, replyTo, threadId: `omt_${counter}` })
       return `omt_${counter}`
@@ -248,10 +253,10 @@ export function createFakePort() {
       panelCommands.push(command)
       panelCreated.push(command)
     },
-    async stream(to, input): Promise<SendResult> {
+    async stream(to, input, opts): Promise<SendResult> {
       if (state.failStreams) throw new Error('stream rejected (fake)')
       counter += 1
-      const card: StreamedCard = { to, ops: [], content: '', closed: false }
+      const card: StreamedCard = { to, ops: [], content: '', closed: false, ...opts === undefined ? {} : { opts } }
       streams.push(card)
       const controller: MarkdownStreamController = {
         messageId: `om_stream_${counter}`,

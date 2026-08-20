@@ -87,19 +87,31 @@ export type BotVerdict =
 
 /**
  * Decide what one bot-sent message gets.
- * @param input - who sent it, into which conversation, and this bot's own id.
+ * @param input - who sent it, into which conversation, and this bot's own ids
+ * (the bot open id events carry, and the app id Feishu echoes back on the
+ * app's own messages, which arrive as events too).
  * @param peers - bot open ids this deployment answers; empty narrows nothing.
  * @param budget - the hop budget to spend from.
  * @returns the verdict, and the hop already spent when it is `answer`.
  */
 export function judgeBotMessage(
-  input: { readonly senderId: string; readonly key: string; readonly ownBotId?: string | undefined },
+  input: {
+    readonly senderId: string
+    readonly key: string
+    readonly ownBotId?: string | undefined
+    readonly ownAppId?: string | undefined
+  },
   peers: ReadonlySet<string>,
   budget: HopBudget,
 ): BotVerdict {
   // Never our own voice: a channel that answers itself needs no second bot to
-  // loop, and a deployment can list its own id by mistake in one paste.
-  if (input.ownBotId !== undefined && input.senderId === input.ownBotId) return { kind: 'self' }
+  // loop, and a deployment can list its own id by mistake in one paste. The
+  // platform reports the app's own messages under its app id (`cli_…`), so
+  // both identities must count as self.
+  if (
+    (input.ownBotId !== undefined && input.senderId === input.ownBotId)
+    || (input.ownAppId !== undefined && input.senderId === input.ownAppId)
+  ) return { kind: 'self' }
   if (peers.size > 0 && !peers.has(input.senderId)) return { kind: 'stranger', senderId: input.senderId }
   if (!budget.take(input.key)) return { kind: 'exhausted', spent: budget.spent(input.key) }
   return { kind: 'answer' }

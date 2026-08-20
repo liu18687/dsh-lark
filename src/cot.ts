@@ -1,5 +1,6 @@
 /**
- * The thinking process as a native CoT message.
+ * The thinking process as a native CoT message — and, where the CoT API
+ * cannot go, as one stream card.
  *
  * Feishu carries an agent's process as its own message, driven by AG-UI events,
  * and renders it the way the platform's own agents look: reasoning streams into
@@ -7,6 +8,13 @@
  * code block. That vocabulary lines up with the host's session events almost
  * one to one, so this renderer translates rather than draws — and the final
  * answer goes where the platform says it belongs, in an ordinary message.
+ *
+ * Topic threads are the one place the CoT message cannot live: the platform
+ * rejects `receive_id_type=thread_id` for apps (a bot can never be a topic
+ * participant). A thread-bound turn — a main-channel group message answered
+ * by creating a topic, or a message already inside one — therefore buffers
+ * the process and mounts it with the answer as one stream card inside the
+ * topic, so the answer never leaves the conversation that asked for it.
  * @module dsh-lark-channel/cot
  */
 
@@ -22,8 +30,8 @@ import {
   toolResultText,
   turnErrorDetail,
 } from './host.ts'
-import { stripToolCallMarkup } from './outbound.ts'
-import type { HostSessionEvent, OutboundRenderer, ReplyTarget, ToolPresentation } from './outbound.ts'
+import { openStream, replyOptions, stripToolCallMarkup } from './outbound.ts'
+import type { HostSessionEvent, OutboundPort, OutboundRenderer, ReplyTarget, ToolPresentation } from './outbound.ts'
 
 /** One AG-UI event, as the write API takes it. */
 export interface CotEvent {
@@ -40,8 +48,8 @@ export interface CotHandle {
   readonly messageId: string
 }
 
-/** The CoT operations this renderer drives. */
-export interface CotPort {
+/** The CoT operations this renderer drives, plus the outbound card transport thread-bound turns mount through. */
+export interface CotPort extends OutboundPort {
   /** Open a thinking process in one chat, optionally aimed at the message that asked. */
   createCot(chatId: string, options: { replyTo?: string; hidden: boolean; threadId?: string }): Promise<CotHandle>
   /** Append events to one thinking process, in order. */
@@ -57,6 +65,38 @@ const MAX_EVENTS_PER_WRITE = 50
 
 /** How long one event's JSON may be, per the API's own bound. */
 const MAX_EVENT_CONTENT_CHARS = 4096
+
+/**
+ * How much reasoning a topic card carries. The platform's CoT UI collapses a
+ * long process; a topic card cannot, so the tail of the reasoning — where the
+ * conclusion lives — is what survives the cap.
+ */
+const MAX_THREAD_REASONING_CHARS = 1200
+
+/**
+ * Assemble the merged card a thread-bound turn mounts: the buffered process
+ * first, the answer appended after it, as the platform CoT would show them.
+ * @param thread - the buffered process of the turn.
+ * @param answer - the turn's final text.
+ * @param showProcess - whether the process appears at all.
+ * @returns the card's markdown body.
+ */
+function threadCardMarkdown(thread: { reasoning: string; toolLines: string[] }, answer: string, showProcess: boolean): string {
+  const parts: string[] = []
+  if (showProcess) {
+    const process: string[] = []
+    if (thread.reasoning.trim() !== '') {
+      const capped = thread.reasoning.length > MAX_THREAD_REASONING_CHARS
+        ? thread.reasoning.slice(-MAX_THREAD_REASONING_CHARS)
+        : thread.reasoning
+      process.push('> ' + capped.replace(/\n+/g, '\n> '))
+    }
+    process.push(...thread.toolLines)
+    if (process.length > 0) parts.push('**思考过程**\n' + process.join('\n'))
+  }
+  parts.push(answer)
+  return parts.join('\n\n')
+}
 
 /**
  * Tool-call kinds the host reports, mapped to the platform's icon vocabulary.
@@ -137,6 +177,16 @@ interface LiveRun {
   reasoningOpen: boolean
   /** Whether the run was already closed by a terminal event. */
   finished: boolean
+  /**
+   * Thread-bound turns render as one stream card inside the topic instead of
+   * a CoT message: the CoT API rejects `receive_id_type=thread_id` (the bot
+   * can never be a topic participant), so the buffered process and the answer
+   * mount together once the turn ends.
+   */
+  readonly thread?: {
+    reasoning: string
+    toolLines: string[]
+  }
 }
 
 /**
@@ -189,18 +239,15 @@ export function createCotRenderer(
   const ensure = (turn: number): LiveRun => {
     if (live !== undefined && live.turn === turn) return live
     if (live !== undefined) closeRun(live)
-    // A main-channel group message gets its card mounted in the topic the
-    // answer itself creates, so the card cannot open eagerly: the events
-    // buffer behind a deferred opening that the turn's end resolves.
+    // The CoT API cannot address a topic (the bot is never a topic
+    // participant), so thread-bound turns — a main-channel group message
+    // answered by creating one, or a message already inside one — buffer the
+    // process and mount it with the answer as one stream card at turn end.
     const mainChannel = aimed !== undefined && aimed.threadId === undefined && aimed.inThread === true
-    let opening: Promise<CotHandle | undefined>
-    let resolveOpening: ((handle: CotHandle | undefined) => void) | undefined
-    if (mainChannel) {
-      opening = new Promise<CotHandle | undefined>((resolve) => {
-        resolveOpening = resolve
-      })
-    } else {
-      opening = port
+    const inTopic = aimed !== undefined && aimed.threadId !== undefined
+    const thread = mainChannel || inTopic ? { reasoning: '', toolLines: [] as string[] } : undefined
+    const opening = thread === undefined
+      ? port
         .createCot(chatId, {
           ...aimed === undefined ? {} : { replyTo: aimed.messageId },
           ...aimed === undefined || aimed.threadId === undefined ? {} : { threadId: aimed.threadId },
@@ -211,17 +258,20 @@ export function createCotRenderer(
           onFailure(error)
           return undefined
         })
-    }
+      : Promise.resolve(undefined)
     live = {
       turn,
       opening,
-      resolveOpening,
+      resolveOpening: undefined,
       pending: [],
       draining: Promise.resolve(),
       reasoningOpen: false,
       finished: false,
+      ...thread === undefined ? {} : { thread },
     }
-    enqueue(live, cotEvent('RUN_STARTED', { threadId: chatId, runId: `turn-${turn}` }))
+    if (thread === undefined) {
+      enqueue(live, cotEvent('RUN_STARTED', { threadId: chatId, runId: `turn-${turn}` }))
+    }
     return live
   }
 
@@ -229,6 +279,9 @@ export function createCotRenderer(
   const closeRun = (run: LiveRun, failure?: string): void => {
     if (run.finished) return
     run.finished = true
+    // Thread-bound runs never opened a CoT message: their card already
+    // mounted at turn end, and there is nothing left to drain or finish.
+    if (run.thread !== undefined) return
     if (run.reasoningOpen) {
       enqueue(run, cotEvent('REASONING_MESSAGE_END', { messageId: `reasoning-${run.turn}` }))
       run.reasoningOpen = false
@@ -290,6 +343,11 @@ export function createCotRenderer(
         if (!showProcess || chunk.type !== 'reasoning-delta') return
         if (chunk.text === undefined || chunk.text === '') return
         const run = ensure(event.data.turn)
+        if (run.thread !== undefined) {
+          // The card is assembled at turn end; deltas just accumulate.
+          run.thread.reasoning += chunk.text
+          return
+        }
         const messageId = `reasoning-${run.turn}`
         if (!run.reasoningOpen) {
           run.reasoningOpen = true
@@ -302,6 +360,10 @@ export function createCotRenderer(
         if (!showProcess) return
         const run = ensure(event.data.turn)
         const shown = presentCall(event.data.name, event.data.arguments)
+        if (run.thread !== undefined) {
+          run.thread.toolLines.push(`🔧 ${shown.title}`)
+          return
+        }
         const toolCallId = event.data.callId
         if (run.reasoningOpen) {
           run.reasoningOpen = false
@@ -325,6 +387,9 @@ export function createCotRenderer(
         const { callId, text } = toolResultText(event.data)
         if (callId === undefined) return
         const run = ensure(event.data.turn)
+        // The topic card keeps tool titles, not result payloads: a code block
+        // per call would bury the answer the card exists to show.
+        if (run.thread !== undefined) return
         enqueue(run, cotEvent('TOOL_CALL_RESULT', {
           messageId: `result-${callId}`,
           toolCallId: callId,
@@ -341,40 +406,38 @@ export function createCotRenderer(
         const run = live !== undefined && live.turn === event.data.turn ? live : undefined
         if (run !== undefined) live = undefined
         const detail = turnErrorDetail(event.data)
-        const mainChannel = run !== undefined && aimed !== undefined && aimed.threadId === undefined && aimed.inThread === true
 
-        // Main-channel group message: the answer's guide reply opens the
-        // topic, then the whole turn — buffered events plus the answer —
-        // mounts into that topic as one collapsible card.
-        if (answered && run !== undefined && mainChannel) {
+        // Thread-bound turn (a main-channel group message answered by
+        // creating a topic, or a message already inside one): the CoT API
+        // cannot address a topic, so the merged card — buffered process plus
+        // the answer — mounts inside it as one stream card.
+        if (run?.thread !== undefined) {
+          closeRun(run, detail === '' ? undefined : detail)
+          if (!answered) return
           const heldEvent = held!.event
           const text = stripToolCallMarkup(assistantText(heldEvent.data as AssistantMessageData))
           held = undefined
+          if (text === '') return
+          const target: ReplyTarget = aimed!.threadId === undefined
+            ? { messageId: aimed!.messageId, inThread: true }
+            : { messageId: aimed!.messageId, threadId: aimed!.threadId }
+          const opts = replyOptions(target)
           void (async () => {
-            let handle: CotHandle | undefined
             try {
-              const threadId = await port.openThread(chatId, aimed!.messageId)
-              handle = threadId === undefined
-                ? undefined
-                : await port.createCot(chatId, { replyTo: aimed!.messageId, threadId, hidden })
+              const threadId = aimed!.threadId ?? await port.openThread(chatId, aimed!.messageId)
+              if (threadId === undefined) {
+                // The topic could not be opened; the answer still reaches the
+                // chat through the ordinary reply path.
+                answer.handle(heldEvent)
+                return
+              }
+              const handle = openStream(port, chatId, opts, onFailure)
+              handle.set(threadCardMarkdown(run!.thread!, text, showProcess))
+              const settled = handle.finish().catch(onFailure)
+              closing.add(settled)
+              void settled.finally(() => closing.delete(settled))
             } catch (error) {
               onFailure(error)
-            }
-            run.resolveOpening?.(handle)
-            if (handle !== undefined) {
-              if (text !== '') {
-                const messageId = `answer-${run.turn}`
-                enqueue(
-                  run,
-                  cotEvent('TEXT_MESSAGE_START', { messageId, role: 'assistant' }),
-                  cotEvent('TEXT_MESSAGE_CONTENT', { messageId, delta: text }),
-                  cotEvent('TEXT_MESSAGE_END', { messageId }),
-                )
-              }
-              closeRun(run, detail === '' ? undefined : detail)
-            } else {
-              // The topic could not be opened; the answer still reaches the chat.
-              closeRun(run, detail === '' ? undefined : detail)
               answer.handle(heldEvent)
             }
           })()
@@ -382,22 +445,9 @@ export function createCotRenderer(
         }
 
         if (answered) {
-          const text = stripToolCallMarkup(assistantText(held!.event.data as AssistantMessageData))
-          const inThread = aimed?.threadId !== undefined
-          // Inside a topic the whole turn lives in one process card: the
-          // answer is appended to the (collapsible) thinking process instead
-          // of landing as a separate message.
-          if (inThread && showProcess && run !== undefined && text !== '') {
-            const messageId = `answer-${run.turn}`
-            enqueue(
-              run,
-              cotEvent('TEXT_MESSAGE_START', { messageId, role: 'assistant' }),
-              cotEvent('TEXT_MESSAGE_CONTENT', { messageId, delta: text }),
-              cotEvent('TEXT_MESSAGE_END', { messageId }),
-            )
-          } else {
-            answer.handle(held!.event)
-          }
+          // CoT-mode turns: the process card carries the process; the answer
+          // goes through the answer half, aimed at the message that asked.
+          answer.handle(held!.event)
           held = undefined
         } else if (run !== undefined) {
           run.resolveOpening?.(undefined)

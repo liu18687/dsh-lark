@@ -1595,7 +1595,7 @@ export function installBridge(
     const conversation = conversationKey(config.sessionScope, msg)
     if (msg.senderIsBot === true) {
       const verdict = judgeBotMessage(
-        { senderId: msg.senderId, key: conversation, ownBotId: ownBotId() },
+        { senderId: msg.senderId, key: conversation, ownBotId: ownBotId(), ownAppId: config.appId },
         botPeers,
         hops,
       )

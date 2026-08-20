@@ -201,7 +201,7 @@ type StreamOp =
   | { kind: 'set'; text: string }
 
 /** A live streaming card: buffered operations plus its settlement. */
-interface StreamHandle {
+export interface StreamHandle {
   /** Queue a typewriter append. */
   append(text: string): void
   /** Queue a whole-content replacement, correcting what already streamed. */
@@ -222,7 +222,7 @@ interface StreamHandle {
  * @param onFailure - report the stream failure that triggered the fallback.
  * @returns the handle its owner drives and settles.
  */
-function openStream(
+export function openStream(
   port: OutboundPort,
   chatId: string,
   opts: SendOptions | undefined,

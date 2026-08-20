@@ -61,6 +61,12 @@ describe('judging a bot message', () => {
       .toEqual({ kind: 'self' })
   })
 
+  it('treats its own app id as its own voice — the platform echoes it back on the app\'s messages', () => {
+    const peers = new Set(['cli_self_app'])
+    expect(judgeBotMessage({ senderId: 'cli_self_app', key: 'oc_1', ownAppId: 'cli_self_app' }, peers, budget()))
+      .toEqual({ kind: 'self' })
+  })
+
   it('stops a peer once the exchange runs out of hops', () => {
     const peers = new Set(['ou_peer'])
     const hops = budget(2)
