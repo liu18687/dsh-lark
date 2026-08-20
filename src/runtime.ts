@@ -108,9 +108,15 @@ const WS_REFRESH_INTERVAL_MS = 3 * 60 * 1000
 
 export function createLarkChannelPort(config: ChannelConfig, authorization: Authorization): ChannelPort {
   const channel = createLarkChannel(channelOptions(config, authorization))
-  const timer = setInterval(() => {
+  const reconnect = () => {
     void (channel as unknown as { forceReconnect?: () => Promise<unknown> }).forceReconnect?.().catch(() => {})
-  }, WS_REFRESH_INTERVAL_MS)
+  }
+  // A quick supervisor restart can leave the broker routing events to the
+  // stale session, so the fresh process looks healthy but hears nothing.
+  // Refresh once shortly after boot, then keep the steady 3-minute cadence.
+  const bootRefresh = setTimeout(reconnect, 30 * 1000)
+  bootRefresh.unref?.()
+  const timer = setInterval(reconnect, WS_REFRESH_INTERVAL_MS)
   timer.unref?.()
   // The slash-command panel has no SDK method; it is a plain app-config API,
   // reached through the transport's own authenticated client.
