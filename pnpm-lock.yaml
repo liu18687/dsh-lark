@@ -12,8 +12,8 @@ importers:
         specifier: ^3.18.1
         version: 3.18.1
       '@larksuite/channel':
-        specifier: ^0.4.1
-        version: 0.4.1
+        specifier: ^0.5.0
+        version: 0.5.0
       qrcode-terminal:
         specifier: ^0.12.0
         version: 0.12.0
@@ -75,8 +75,8 @@ packages:
   '@jridgewell/sourcemap-codec@1.5.5':
     resolution: {integrity: sha512-cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og==}
 
-  '@larksuite/channel@0.4.1':
-    resolution: {integrity: sha512-9xklkzGEnME9MCCKlSzgG0FERJV4HlNX52hthytpxxP2oqH5S8lQBixPsHYU0AQ8SBfzP+LaGz5QaDOlP4EY0A==}
+  '@larksuite/channel@0.5.0':
+    resolution: {integrity: sha512-+uwIKWiETXytgLyTWnxrFUdZdN0JWDyU2q+JhuscWbqFPPcRl3OM+ZMXIKwo780Ewk6uqhVw5K+m4f9iWSqjrA==}
     engines: {node: '>=18'}
 
   '@larksuiteoapi/node-sdk@1.73.0':
@@ -996,7 +996,7 @@ snapshots:
 
   '@jridgewell/sourcemap-codec@1.5.5': {}
 
-  '@larksuite/channel@0.4.1':
+  '@larksuite/channel@0.5.0':
     dependencies:
       '@larksuiteoapi/node-sdk': 1.73.0
       https-proxy-agent: 9.1.0

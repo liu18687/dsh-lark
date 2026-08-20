@@ -68,19 +68,25 @@ describe('thread-bound turns (topic cards)', () => {
     }
   })
 
-  it('leaves a silent turn with no topic, no card, and no message', async () => {
+  it('mounts the card even when the turn produced no answer text', async () => {
     const harness = await mountChannel({ requireMention: false })
     try {
       const emit = await groupChat(harness, fakeMessage({
         chatId: 'oc_group', chatType: 'group', messageId: 'om_root', content: 'hi',
       }))
       emit('step/start', { turn: 1, step: 1 })
-      emit('assistant/chunk', { turn: 1, chunk: { type: 'reasoning-delta', text: '闲聊，静默。' } })
+      emit('assistant/chunk', { turn: 1, chunk: { type: 'reasoning-delta', text: '闲聊。' } })
       emit('turn/end', { turn: 1, reason: { kind: 'completed' } })
-      await new Promise((done) => { setTimeout(done, 30) })
-      expect(harness.fake.openedThreads).toHaveLength(0)
-      expect(harness.fake.streams).toHaveLength(0)
-      expect(harness.fake.sent).toHaveLength(0)
+
+      // The room must always see that the bot ran: the topic opens and the
+      // card mounts, with a placeholder where the answer would be.
+      await vi.waitFor(() => { expect(harness.fake.openedThreads).toHaveLength(1) })
+      await vi.waitFor(() => { expect(harness.fake.sent).toHaveLength(1) })
+      const sent = harness.fake.sent[0]!
+      const card = (sent.input as { card: { body: { elements: Array<Record<string, unknown>> } } }).card
+      const [process, answer] = card.body.elements
+      expect(process).toMatchObject({ tag: 'collapsible_panel' })
+      expect(answer).toMatchObject({ tag: 'markdown', content: '（本轮没有输出文本）' })
     } finally {
       await harness.dispose()
     }

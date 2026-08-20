@@ -461,6 +461,50 @@ const RECONNECT_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000] as const
 const RECONNECT_QUOTA_WINDOW_MS = 30 * 60 * 1000
 const RECONNECT_QUOTA_LIMIT = 10
 
+/**
+ * How long one inbound message's handler may run before the transport's
+ * per-chat pipeline is released without it. The SDK serializes delivery per
+ * chat through a promise chain: one handler that never settles wedges every
+ * later message of that chat behind it — the bot stays connected and healthy
+ * while the room goes permanently deaf. Racing the handler bounds the wedge:
+ * the hung work keeps unwinding in the background (a late reply still lands),
+ * and the next message is processed on time.
+ */
+const MESSAGE_HANDLER_TIMEOUT_MS = 60 * 1000
+
+/**
+ * Race one inbound handler against a deadline. The deadline rejection is what
+ * the transport's pipeline observes — it swallows rejections and moves on to
+ * the next message — while the hung work keeps unwinding in the background.
+ * Exported so the bound itself is unit-tested without a full channel.
+ * @param work - the handler's promise.
+ * @param options - the deadline and its report.
+ * @returns `work`'s result, or the deadline's rejection.
+ */
+export function raceInboundHandler<T>(
+  work: Promise<T>,
+  options: { readonly timeoutMs: number; readonly onTimeout: () => void },
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      options.onTimeout()
+      reject(new Error('lark-channel: inbound handler timed out'))
+    }, options.timeoutMs)
+    timer.unref?.()
+  })
+  return Promise.race([work, deadline]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer)
+  })
+}
+
+/**
+ * How long releasing a conversation (agent cancellation and disposal) may
+ * take before the command proceeds without it. Disposal can wait on a turn
+ * that never ends; the release is a cleanup, not the answer.
+ */
+const RELEASE_GRACE_MS = 10 * 1000
+
 /** The host tool this channel shadows so questions become chat cards. */
 const QUESTION_TOOL = 'ask_user_question'
 
@@ -1375,8 +1419,35 @@ export function installBridge(
       // agent idle, and a switch waiting for exactly that would slip through
       // the window and write to a session being disposed. Shut the writing
       // down first, then take the agent away.
-      await maintenance.cancel(releasedId)
-      await sessions.release(key)
+      //
+      // Every await is bounded: disposal can wait on a turn that never ends,
+      // and a hung release must not wedge this chat's whole pipeline. Abort
+      // the live turn first, then give each cleanup a grace window; whatever
+      // is still winding down finishes in the background.
+      const live = (ctx.get('agents') as DurableAgentRegistry | undefined)?.get(releasedId)
+      try {
+        live?.cancel('conversation released')
+      } catch (error) {
+        notify(`lark-channel: cancelling ${releasedId} before release failed: ${String(error)}`)
+      }
+      const bounded = (work: Promise<unknown>, label: string): Promise<void> => {
+        let timer: NodeJS.Timeout | undefined
+        const grace = new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            notify(`lark-channel: ${label} for ${key} exceeded ${RELEASE_GRACE_MS / 1000}s; proceeding without it`)
+            resolve()
+          }, RELEASE_GRACE_MS)
+          timer.unref?.()
+        })
+        return Promise.race([
+          work.then(() => undefined, () => undefined),
+          grace,
+        ]).finally(() => {
+          if (timer !== undefined) clearTimeout(timer)
+        })
+      }
+      await bounded(maintenance.cancel(releasedId), 'maintenance.cancel')
+      await bounded(sessions.release(key), 'sessions.release')
       runningBySession.delete(releasedId)
       callSnapshots.delete(releasedId)
       aimBySession.delete(releasedId)
@@ -2785,7 +2856,21 @@ export function installBridge(
   // downloads, workspace/model switches) could interleave freely. Serialized
   // intake covers up to `followup()` returning; the turn itself still runs in
   // the background, which is why reply targets bind to turns, not to arrival.
-  ctx.effect(() => port.on('message', handleMessage), 'lark:on(message)')
+  ctx.effect(() => port.on('message', (msg) => {
+    // The transport serializes delivery per chat through a promise chain; a
+    // handler that hangs would wedge every later message of that chat behind
+    // it while the connection keeps looking healthy. Race it: the pipeline
+    // moves on at the deadline, the hung work unwinds in the background, and
+    // the operator hears about it.
+    return raceInboundHandler(handleMessage(msg), {
+      timeoutMs: MESSAGE_HANDLER_TIMEOUT_MS,
+      onTimeout: () => {
+        notify(`lark-channel: inbound handler for ${msg.messageId} in ${msg.chatId} exceeded `
+          + `${MESSAGE_HANDLER_TIMEOUT_MS / 1000}s; releasing the chat pipeline`)
+        ctx.logger.warn('inbound handler timed out: %s in %s', msg.messageId, msg.chatId)
+      },
+    })
+  }), 'lark:on(message)')
   ctx.effect(() => port.on('cardAction', handleCardAction), 'lark:on(cardAction)')
 
   // Observability. Without these, the failure modes an operator actually hits —

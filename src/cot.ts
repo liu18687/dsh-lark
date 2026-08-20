@@ -74,6 +74,12 @@ const MAX_EVENT_CONTENT_CHARS = 4096
 const MAX_THREAD_REASONING_CHARS = 1200
 
 /**
+ * The answer text a turn without output still shows: the room must always see
+ * that the bot ran, never a silent void it cannot tell apart from a crash.
+ */
+const EMPTY_ANSWER_PLACEHOLDER = '（本轮没有输出文本）'
+
+/**
  * Assemble the merged card a thread-bound turn mounts: the buffered process
  * folded inside a collapsible panel (collapsed by default, the way the
  * platform's CoT UI folds its thinking area), and the answer after it.
@@ -421,11 +427,16 @@ export function createCotRenderer(
         // the answer — mounts inside it as one stream card.
         if (run?.thread !== undefined) {
           closeRun(run, detail === '' ? undefined : detail)
-          if (!answered) return
-          const heldEvent = held!.event
-          const text = stripToolCallMarkup(assistantText(heldEvent.data as AssistantMessageData))
+          // Errors reach the chat through the answer half as the failure
+          // line; every other turn mounts its card, even one whose answer is
+          // empty — the room must always see that the bot ran.
+          if (detail !== '') return
+          const heldEvent = held?.event
+          const text = heldEvent === undefined
+            ? ''
+            : stripToolCallMarkup(assistantText(heldEvent.data as AssistantMessageData))
           held = undefined
-          if (text === '') return
+          const cardAnswer = text === '' ? EMPTY_ANSWER_PLACEHOLDER : text
           const target: ReplyTarget = aimed!.threadId === undefined
             ? { messageId: aimed!.messageId, inThread: true }
             : { messageId: aimed!.messageId, threadId: aimed!.threadId }
@@ -436,15 +447,15 @@ export function createCotRenderer(
               if (threadId === undefined) {
                 // The topic could not be opened; the answer still reaches the
                 // chat through the ordinary reply path.
-                answer.handle(heldEvent)
+                if (heldEvent !== undefined) answer.handle(heldEvent)
                 return
               }
               // One interactive card, sent when the turn settles: the
               // answer with the folded process above it.
-              await port.send(chatId, { card: threadCardJson(run!.thread!, text, showProcess) }, opts)
+              await port.send(chatId, { card: threadCardJson(run!.thread!, cardAnswer, showProcess) }, opts)
             } catch (error) {
               onFailure(error)
-              answer.handle(heldEvent)
+              if (heldEvent !== undefined) answer.handle(heldEvent)
             }
           })()
           return
@@ -460,19 +471,9 @@ export function createCotRenderer(
         }
 
         if (run !== undefined) {
+          // The process card stays whatever the turn produced: a turn without
+          // an answer still shows the room that the bot ran.
           closeRun(run, detail === '' ? undefined : detail)
-          // A turn that ended with no answer (the silence rule) should leave no
-          // process card either: once its events have drained, delete the CoT
-          // message so a quiet chat stays quiet. Errors keep their card — the
-          // failure notice is the one thing a broken turn must still show.
-          if (!answered && detail === '') {
-            const settled = run.draining
-            void settled.then(() =>
-              run.opening.then(handle => {
-                if (handle !== undefined) return port.deleteCot(handle)
-              }),
-            ).catch(onFailure)
-          }
         }
       }
     },
