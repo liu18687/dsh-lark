@@ -759,6 +759,8 @@ export async function mountChannel(
     agentsCanRegisterTools?: boolean
     /** The `credentials` seam the app secret is stored behind. */
     credentials?: object
+    /** Exposes the transport's raw client, which enables boot backfill. */
+    rawRequest?: (payload: { method: string; url: string; data?: unknown }) => Promise<unknown>
   } = {},
 ) {
   const ctx = new Context()
@@ -796,6 +798,7 @@ export async function mountChannel(
   if (services.commands !== undefined) ctx.provide('commands', services.commands)
   if (services.attachments !== undefined) ctx.provide('attachments', services.attachments)
   const fake = createFakePort()
+  if (services.rawRequest !== undefined) fake.port.rawRequest = services.rawRequest
   const portConfigs: ChannelConfig[] = []
   const notices: string[] = []
   const originalCreatePort = internals.createPort

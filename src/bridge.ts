@@ -177,6 +177,12 @@ export interface ChannelPort extends OutboundPort, SlashPanelPort, ImagePort, In
   getChatMembers?(chatId: string): Promise<readonly { readonly id: string; readonly name?: string }[]>
   /** Replace a sent card's content in place. */
   updateCard(messageId: string, card: object): Promise<void>
+  /**
+   * The transport's authenticated raw client, when the port exposes one.
+   * Boot backfill lists chat history through it; a port without it (tests,
+   * older transports) simply runs no backfill.
+   */
+  rawRequest?(payload: { method: string; url: string; data?: unknown }): Promise<unknown>
 }
 
 /** One conversation's chat and its outbound renderer, keyed by session id. */
@@ -729,7 +735,15 @@ export function installBridge(
     readonly quotaWindowMs?: number
     readonly quotaLimit?: number
   },
-): void {
+  /**
+   * Records every message the transport delivers, so boot backfill can tell
+   * "the WebSocket already delivered this" apart from "this arrived while the
+   * connection was down". Composed when the deployment runs boot backfill.
+   */
+  backfill?: {
+    observe: (messageId: string, chatId: string, createTime: number) => boolean
+  },
+): { ingest: (msg: NormalizedMessage) => Promise<void> } {
   const bySession = new Map<string, ChatBinding>()
   const pendingApprovals = new Map<string, PendingApproval>()
   /**
@@ -2785,7 +2799,13 @@ export function installBridge(
   // downloads, workspace/model switches) could interleave freely. Serialized
   // intake covers up to `followup()` returning; the turn itself still runs in
   // the background, which is why reply targets bind to turns, not to arrival.
-  ctx.effect(() => port.on('message', handleMessage), 'lark:on(message)')
+  ctx.effect(() => port.on('message', (msg) => {
+    // First claim wins: when boot backfill has already recovered this
+    // message through the list API, the live delivery must not process it a
+    // second time.
+    if (backfill !== undefined && !backfill.observe(msg.messageId, msg.chatId, msg.createTime)) return
+    return handleMessage(msg)
+  }), 'lark:on(message)')
   ctx.effect(() => port.on('cardAction', handleCardAction), 'lark:on(cardAction)')
 
   // Observability. Without these, the failure modes an operator actually hits —
@@ -2981,4 +3001,8 @@ export function installBridge(
     })
     return () => port.disconnect().catch(reportSendFailure)
   }, 'lark:connect')
+
+  // Boot backfill feeds recovered messages through the same funnel the
+  // transport uses, so nothing about authorization or topic handling differs.
+  return { ingest: handleMessage }
 }

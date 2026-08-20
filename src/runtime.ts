@@ -16,6 +16,7 @@ import type { CotEvent, CotHandle } from './cot.ts'
 import type { PanelCommand } from './slash-panel.ts'
 import { beginOnboarding } from './onboarding.ts'
 import type { LarkCredentials, OnboardedApp, RegisterAppPort } from './onboarding.ts'
+import { createBackfillStore, runBackfill } from './backfill.ts'
 import { describeAuthorization, resolveAuthorization } from './authorization.ts'
 import type { Authorization } from './authorization.ts'
 import type { HostLoader, HostSettings } from './host.ts'
@@ -112,6 +113,12 @@ export function channelOptions(config: ChannelConfig, authorization: Authorizati
 // unaffected.
 const WS_REFRESH_INTERVAL_MS = 3 * 60 * 1000
 
+// Boot backfill waits for the WebSocket (and its 30s boot refresh) to settle
+// before its first sweep; steady sweeps then ride the WS-refresh cadence so a
+// silent routing gap is recovered within minutes instead of at the next boot.
+const BACKFILL_FIRST_DELAY_MS = 45 * 1000
+const BACKFILL_INTERVAL_MS = WS_REFRESH_INTERVAL_MS
+
 export function createLarkChannelPort(config: ChannelConfig, authorization: Authorization): ChannelPort {
   const channel = createLarkChannel(channelOptions(config, authorization))
   const reconnect = () => {
@@ -161,6 +168,7 @@ export function createLarkChannelPort(config: ChannelConfig, authorization: Auth
     }
   }
   return Object.assign(channel, {
+    rawRequest: (payload: { method: string; url: string; data?: unknown }) => raw.request(payload),
     send: sendWithThreadRetry,
     async listSlashCommands(): Promise<PanelCommand[]> {
       // The collection route requires a paging query; without one it 404s.
@@ -282,15 +290,71 @@ export function apply(ctx: Context, config: Config): void {
     started = true
     const authorization = resolveAuthorization(resolved)
     internals.notify(describeAuthorization(authorization))
-    installBridge(
+    const port = internals.createPort(resolved, authorization)
+    // Boot backfill: the platform never replays events the long connection
+    // missed, so a restart window would otherwise eat every message sent
+    // during it. The store records every delivered message (live or
+    // recovered), dedupes by id, and persists a per-chat cursor so the next
+    // boot only re-lists the tail around it.
+    const backfill = createBackfillStore({
+      initial: resolved.chatBackfill,
+      persistState,
+      notify: internals.notify,
+    })
+    // Claim-dedupe only makes sense when backfill actually runs: without a
+    // raw client the sweeps never list anything, and the platform never
+    // re-delivers a message id, so dropping duplicates would be pure loss.
+    const canBackfill = authorization.groups.size > 0 && port.rawRequest !== undefined
+    const { ingest: backfillIngest } = installBridge(
       ctx,
       resolved,
-      internals.createPort(resolved, authorization),
+      port,
       internals.notify,
       authorization,
       persistState,
       internals.reconnectDeadlineMs === undefined ? undefined : { deadlineMs: internals.reconnectDeadlineMs },
+      canBackfill ? { observe: (messageId, chatId, createTime) => backfill.observe(messageId, chatId, createTime) } : undefined,
     )
+    if (canBackfill) {
+      let running = false
+      const sweep = () => {
+        if (running || !active) return
+        running = true
+        const ownBotId = port.getBotIdentity?.()?.openId
+        void runBackfill({
+          lister: { request: payload => port.rawRequest!(payload) },
+          chats: [...authorization.groups],
+          ...(ownBotId === undefined ? {} : { ownBotId }),
+          ingest: async msg => {
+            // Reached through the same funnel live events take; the bridge
+            // returned it above. Reinstalling is not possible here, so the
+            // ingest handle travels via the port-adjacent closure below.
+            await backfillIngest(msg)
+          },
+          store: backfill,
+          notify: internals.notify,
+        }).catch(error => {
+          internals.notify(`lark-channel: backfill failed: ${String(error)}`)
+        }).finally(() => { running = false })
+      }
+      // First sweep waits for the connection (and its boot refresh) to
+      // settle; later sweeps ride the steady WS-refresh cadence, so a silent
+      // gap is recovered within minutes, not just at the next restart.
+      const first = setTimeout(sweep, BACKFILL_FIRST_DELAY_MS)
+      first.unref?.()
+      const timer = setInterval(sweep, BACKFILL_INTERVAL_MS)
+      timer.unref?.()
+      ctx.effect(() => () => { clearTimeout(first); clearInterval(timer) }, 'lark:backfill')
+    }
+    // The debounced cursor write must land before the supervisor kills us,
+    // or the next boot's overlap window would re-ingest messages the process
+    // had already answered once.
+    const flushAndExit = () => {
+      try { backfill.flush() } catch { /* best effort on the way out */ }
+      process.exit(0)
+    }
+    process.once('SIGTERM', flushAndExit)
+    process.once('SIGINT', flushAndExit)
   }
 
   const bootstrap = async (): Promise<void> => {
