@@ -34,7 +34,7 @@ const COT_API = '/open-apis/im/v1/message_cot'
 const MESSAGE_DELETE_API = '/open-apis/im/v1/messages'
 
 /** Shown in the chat when a thread-creating reply is rejected by the platform. */
-const THREAD_CREATE_FAILED_NOTICE = '⚠️ 未能以话题形式回复（平台拒绝创建话题）。请确认本群已开启话题功能。 | Failed to reply in thread; please enable topics for this group.'
+const THREAD_CREATE_FAILED_NOTICE = '⚠️ 本群尚未开启「话题」功能，机器人无法以话题形式回复。请群主在 群设置 → 开启话题 后 @ 我再试；开启后我将自动按话题回复。 | This group has topics disabled. Ask an admin to enable topics in group settings; replies will then land in threads automatically.'
 
 /**
  * Narrow a resolved configuration to one carrying live credentials.
@@ -131,14 +131,22 @@ export function createLarkChannelPort(config: ChannelConfig, authorization: Auth
   // rejected (topic groups disabled, permission gaps); retry a couple of
   // times, then say so in the chat instead of vanishing silently.
   const baseSend = channel.send.bind(channel)
+  // Chats that rejected a thread-creating reply (topics disabled). Remembered
+  // so a group without the topic feature gets one clear notice instead of
+  // retrying — and failing — on every message.
+  const topicUnsupported = new Set<string>()
   const sendWithThreadRetry: ChannelPort['send'] = async (to, input, opts) => {
     const creating = (opts as (SendOptions & { creatingThread?: boolean }) | undefined)?.creatingThread === true
     if (!creating) return baseSend(to, input, opts)
+    if (topicUnsupported.has(to)) {
+      throw new Error('lark-channel: topic replies are unsupported in this chat')
+    }
     for (let attempt = 0; ; attempt++) {
       try {
         return await baseSend(to, input, opts)
       } catch (error) {
         if (attempt >= 2) {
+          topicUnsupported.add(to)
           try {
             await baseSend(to, { text: THREAD_CREATE_FAILED_NOTICE }, {})
           } catch {
