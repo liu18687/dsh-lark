@@ -45,6 +45,8 @@ export interface CotPort {
   createCot(chatId: string, options: { replyTo?: string; hidden: boolean }): Promise<CotHandle>
   /** Append events to one thinking process, in order. */
   writeCotEvents(handle: CotHandle, events: readonly CotEvent[]): Promise<void>
+  /** Delete a thinking-process message; a silenced turn leaves no card behind. */
+  deleteCot(handle: CotHandle): Promise<void>
 }
 
 /** How many events one write call may carry, per the API's own bound. */
@@ -313,7 +315,8 @@ export function createCotRenderer(
       }
       if (isTurnEndEvent(event)) {
         // One message per turn: the text the turn ended on.
-        if (held?.turn === event.data.turn) {
+        const answered = held?.turn === event.data.turn
+        if (answered) {
           answer.handle(held.event)
           held = undefined
         }
@@ -322,6 +325,18 @@ export function createCotRenderer(
         live = undefined
         const detail = turnErrorDetail(event.data)
         closeRun(run, detail === '' ? undefined : detail)
+        // A turn that ended with no answer (the silence rule) should leave no
+        // process card either: once its events have drained, delete the CoT
+        // message so a quiet chat stays quiet. Errors keep their card — the
+        // failure notice is the one thing a broken turn must still show.
+        if (!answered && detail === '') {
+          const settled = run.draining
+          void settled.then(() =>
+            run.opening.then(handle => {
+              if (handle !== undefined) return port.deleteCot(handle)
+            }),
+          ).catch(() => {})
+        }
       }
     },
     async close() {

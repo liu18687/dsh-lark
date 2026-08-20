@@ -31,6 +31,7 @@ const SLASH_COMMAND_API = '/open-apis/application/v7/app_slash_commands'
  * terminal `RUN_FINISHED` closes it without a further call.
  */
 const COT_API = '/open-apis/im/v1/message_cot'
+const MESSAGE_DELETE_API = '/open-apis/im/v1/messages'
 
 /**
  * Narrow a resolved configuration to one carrying live credentials.
@@ -157,6 +158,12 @@ export function createLarkChannelPort(config: ChannelConfig, authorization: Auth
         method: 'PUT',
         url: COT_API,
         data: { events, message_id: handle.messageId, cot_id: handle.cotId },
+      })
+    },
+    async deleteCot(handle: CotHandle): Promise<void> {
+      await raw.request({
+        method: 'DELETE',
+        url: `${MESSAGE_DELETE_API}/${handle.messageId}`,
       })
     },
     async createSlashCommand(command: string, description: string): Promise<void> {
