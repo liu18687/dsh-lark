@@ -103,7 +103,7 @@ export function channelOptions(config: ChannelConfig, authorization: Authorizati
 // private in the SDK's public types but exists at runtime; reconnect only
 // tears down and re-establishes the inbound WebSocket, so active turns are
 // unaffected.
-const WS_REFRESH_INTERVAL_MS = 10 * 60 * 1000
+const WS_REFRESH_INTERVAL_MS = 3 * 60 * 1000
 
 export function createLarkChannelPort(config: ChannelConfig, authorization: Authorization): ChannelPort {
   const channel = createLarkChannel(channelOptions(config, authorization))
