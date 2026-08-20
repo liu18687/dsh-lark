@@ -209,7 +209,6 @@ export function createFakePort() {
     async deleteCot(handle) {
       deletedCots.push(handle)
     },
-    },
     async downloadResourceWithMeta(messageId, fileKey, _type) {
       downloads.push({ fileKey, via: 'memory' })
       const stored = resourceBytes.get(fileKey)
