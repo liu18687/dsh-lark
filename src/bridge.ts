@@ -1351,7 +1351,9 @@ export function installBridge(
    */
   const replyTargetOf = (msg: NormalizedMessage): ReplyTarget => ({
     messageId: msg.messageId,
-    ...msg.threadId === undefined ? {} : { threadId: msg.threadId },
+    ...msg.threadId === undefined
+      ? (msg.chatType === 'p2p' ? {} : { inThread: true })
+      : { threadId: msg.threadId },
   })
 
   /**

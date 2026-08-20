@@ -4,7 +4,7 @@
  */
 
 import { createLarkChannel, registerApp } from '@larksuite/channel'
-import type { LarkChannelOptions, PolicyConfig } from '@larksuite/channel'
+import type { LarkChannelOptions, PolicyConfig, SendOptions } from '@larksuite/channel'
 import type { Context } from '@deepseek-ai/cordis'
 import { Config, resolveConfig } from './config.ts'
 import type { ResolvedConfig } from './config.ts'
@@ -32,6 +32,9 @@ const SLASH_COMMAND_API = '/open-apis/application/v7/app_slash_commands'
  */
 const COT_API = '/open-apis/im/v1/message_cot'
 const MESSAGE_DELETE_API = '/open-apis/im/v1/messages'
+
+/** Shown in the chat when a thread-creating reply is rejected by the platform. */
+const THREAD_CREATE_FAILED_NOTICE = '⚠️ 未能以话题形式回复（平台拒绝创建话题）。请确认本群已开启话题功能。 | Failed to reply in thread; please enable topics for this group.'
 
 /**
  * Narrow a resolved configuration to one carrying live credentials.
@@ -123,7 +126,31 @@ export function createLarkChannelPort(config: ChannelConfig, authorization: Auth
   const raw = channel.rawClient as {
     request(payload: { method: string; url: string; data?: unknown }): Promise<unknown>
   }
+  // A main-channel group message is answered in thread form, which asks the
+  // platform to create a topic rooted at that message. Creation can be
+  // rejected (topic groups disabled, permission gaps); retry a couple of
+  // times, then say so in the chat instead of vanishing silently.
+  const baseSend = channel.send.bind(channel)
+  const sendWithThreadRetry: ChannelPort['send'] = async (to, input, opts) => {
+    const creating = (opts as (SendOptions & { creatingThread?: boolean }) | undefined)?.creatingThread === true
+    if (!creating) return baseSend(to, input, opts)
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await baseSend(to, input, opts)
+      } catch (error) {
+        if (attempt >= 2) {
+          try {
+            await baseSend(to, { text: THREAD_CREATE_FAILED_NOTICE }, {})
+          } catch {
+            // The notice itself may fail; the original error still surfaces.
+          }
+          throw error
+        }
+      }
+    }
+  }
   return Object.assign(channel, {
+    send: sendWithThreadRetry,
     async listSlashCommands(): Promise<PanelCommand[]> {
       // The collection route requires a paging query; without one it 404s.
       const response = await raw.request({

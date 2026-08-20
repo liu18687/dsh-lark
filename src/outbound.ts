@@ -35,6 +35,8 @@ export interface ReplyTarget {
   readonly messageId: string
   /** Present when the trigger sat inside a topic thread, so the reply stays in it. */
   readonly threadId?: string
+  /** The trigger has no thread yet: reply in thread form, which creates one. */
+  readonly inThread?: boolean
 }
 
 /** Renders one owned chat's session events as chat output. */
@@ -135,7 +137,9 @@ function failureLine(detail: string): string {
  * @param target - the aimed reply target, or undefined for plain chat sends.
  * @returns the options every outbound call of that reply carries.
  */
-export function replyOptions(target: ReplyTarget | undefined): SendOptions {
+export type ThreadReplyOptions = SendOptions & { readonly creatingThread?: boolean }
+
+export function replyOptions(target: ReplyTarget | undefined): ThreadReplyOptions {
   return {
     // An `@name` the model typed becomes a real mention, resolved against the
     // chat's own roster — the platform leaves an unknown or ambiguous name as
@@ -147,7 +151,9 @@ export function replyOptions(target: ReplyTarget | undefined): SendOptions {
       ? {}
       : {
         replyTo: target.messageId,
-        ...target.threadId === undefined ? {} : { replyInThread: true },
+        ...target.threadId === undefined
+          ? (target.inThread === true ? { replyInThread: true, creatingThread: true } : {})
+          : { replyInThread: true },
       },
   }
 }

@@ -68,11 +68,12 @@ export function conversationKey(scope: SessionScope, msg: NormalizedMessage): st
     case 'chat':
       return msg.chatId
     case 'chat-thread':
-      // Only a topic group splits into threads; an ordinary group carries none,
-      // and there the whole chat is the finest facet available.
-      return msg.threadId === undefined
-        ? msg.chatId
-        : `${msg.chatId}${FACET_SEPARATOR}${msg.threadId}`
+      // Topic messages split by thread. A group main-channel message owns its
+      // own topic — the reply turns it into one — so it owns its own session
+      // too, and the group as a whole never shares one. P2P has no topics.
+      if (msg.threadId !== undefined) return `${msg.chatId}${FACET_SEPARATOR}${msg.threadId}`
+      if (msg.chatType === 'p2p') return msg.chatId
+      return `${msg.chatId}${FACET_SEPARATOR}msg:${msg.messageId}`
     case 'chat-sender':
       return `${msg.chatId}${FACET_SEPARATOR}${msg.senderId}`
     default: {
