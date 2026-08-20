@@ -315,9 +315,9 @@ export function createCotRenderer(
       }
       if (isTurnEndEvent(event)) {
         // One message per turn: the text the turn ended on.
-        const answered = held?.turn === event.data.turn
+        const answered = held !== undefined && held.turn === event.data.turn
         if (answered) {
-          answer.handle(held.event)
+          answer.handle(held!.event)
           held = undefined
         }
         if (live === undefined || live.turn !== event.data.turn) return
