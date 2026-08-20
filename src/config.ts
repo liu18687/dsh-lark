@@ -24,20 +24,6 @@ const DEFAULT_DENY_TOOLS = [] as const
  * Runtime plugin configuration supplied by the profile composition. Package
  * installation policy is owned by the provisioning CLI, not this schema.
  */
-/** One chat's boot-backfill cursor, persisted inside {@link Config.chatBackfill}. */
-export interface ChatBackfillEntry {
-  /** Newest processed message `create_time` (epoch ms). */
-  lastSeenMs: number
-  /** Recent message ids, newest last, bounded for overlap dedupe across restarts. */
-  recentIds: string[]
-}
-
-/** Loader-visible schema for one backfill cursor entry. */
-const ChatBackfillEntrySchema = z.object({
-  lastSeenMs: z.number(),
-  recentIds: z.array(String),
-})
-
 export interface Config {
   /**
    * Names this row when a deployment composes more than one, so two bots keep
@@ -101,13 +87,6 @@ export interface Config {
    * empty-string value marks automatic derivation (the override was reset).
    */
   chatSessions?: Record<string, string>
-  /**
-   * Managed state, not configuration: the boot-backfill cursor per chat —
-   * the newest processed `create_time` (epoch ms) plus a bounded window of
-   * recent message ids for overlap dedupe. Written by the backfill store,
-   * never by an operator.
-   */
-  chatBackfill?: Record<string, ChatBackfillEntry>
   /** Provider route override for chat agents; defaults to the host `agentDefaultModel` selection. */
   provider?: string
   /** Model id override for chat agents; defaults to the host `agentDefaultModel` selection. */
@@ -289,7 +268,6 @@ export interface ResolvedConfig {
   chatModels: Record<string, string>
   chatEpochs: Record<string, string>
   chatSessions: Record<string, string>
-  chatBackfill: Record<string, ChatBackfillEntry>
   provider?: string | undefined
   model?: string | undefined
   preset?: string | undefined
@@ -325,7 +303,6 @@ export const Config: z<Config> = z.object({
   chatModels: z.dict(String).default({}),
   chatEpochs: z.dict(String).default({}),
   chatSessions: z.dict(String).default({}),
-  chatBackfill: z.dict(ChatBackfillEntrySchema).default({}),
   provider: z.string(),
   model: z.string(),
   preset: z.string(),
@@ -361,7 +338,6 @@ export function resolveConfig(config: Config): ResolvedConfig {
     chatModels: config.chatModels ?? {},
     chatEpochs: config.chatEpochs ?? {},
     chatSessions: config.chatSessions ?? {},
-    chatBackfill: config.chatBackfill ?? {},
     sessionScope: config.sessionScope ?? 'chat',
     output: config.output ?? 'cot',
     showProcess: config.showProcess ?? true,

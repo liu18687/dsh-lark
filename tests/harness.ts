@@ -56,8 +56,6 @@ type PortHandler = MessageHandler | CardActionHandler | RejectHandler | ErrorHan
 /** One streaming card opened by the renderer, with the content it received. */
 export interface StreamedCard {
   to: string
-  /** The send options the card opened with, so a test can assert its aim. */
-  opts?: SendOptions
   /** Ordered controller operations: appended chunks and whole-content replacements. */
   ops: ({ append: string } | { set: string })[]
   /** The card's content as the controller applied the operations. */
@@ -253,10 +251,10 @@ export function createFakePort() {
       panelCommands.push(command)
       panelCreated.push(command)
     },
-    async stream(to, input, opts): Promise<SendResult> {
+    async stream(to, input): Promise<SendResult> {
       if (state.failStreams) throw new Error('stream rejected (fake)')
       counter += 1
-      const card: StreamedCard = { to, ops: [], content: '', closed: false, ...opts === undefined ? {} : { opts } }
+      const card: StreamedCard = { to, ops: [], content: '', closed: false }
       streams.push(card)
       const controller: MarkdownStreamController = {
         messageId: `om_stream_${counter}`,
@@ -764,8 +762,6 @@ export async function mountChannel(
     agentsCanRegisterTools?: boolean
     /** The `credentials` seam the app secret is stored behind. */
     credentials?: object
-    /** Exposes the transport's raw client, which enables boot backfill. */
-    rawRequest?: (payload: { method: string; url: string; data?: unknown }) => Promise<unknown>
   } = {},
 ) {
   const ctx = new Context()
@@ -803,7 +799,6 @@ export async function mountChannel(
   if (services.commands !== undefined) ctx.provide('commands', services.commands)
   if (services.attachments !== undefined) ctx.provide('attachments', services.attachments)
   const fake = createFakePort()
-  if (services.rawRequest !== undefined) fake.port.rawRequest = services.rawRequest
   const portConfigs: ChannelConfig[] = []
   const notices: string[] = []
   const originalCreatePort = internals.createPort
