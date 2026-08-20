@@ -30,7 +30,7 @@ import {
   toolResultText,
   turnErrorDetail,
 } from './host.ts'
-import { openStream, replyOptions, stripToolCallMarkup } from './outbound.ts'
+import { replyOptions, stripToolCallMarkup } from './outbound.ts'
 import type { HostSessionEvent, OutboundPort, OutboundRenderer, ReplyTarget, ToolPresentation } from './outbound.ts'
 
 /** One AG-UI event, as the write API takes it. */
@@ -75,27 +75,35 @@ const MAX_THREAD_REASONING_CHARS = 1200
 
 /**
  * Assemble the merged card a thread-bound turn mounts: the buffered process
- * first, the answer appended after it, as the platform CoT would show them.
+ * folded inside a collapsible panel (collapsed by default, the way the
+ * platform's CoT UI folds its thinking area), and the answer after it.
  * @param thread - the buffered process of the turn.
  * @param answer - the turn's final text.
  * @param showProcess - whether the process appears at all.
- * @returns the card's markdown body.
+ * @returns a card JSON 2.0 object, sent as an interactive message.
  */
-function threadCardMarkdown(thread: { reasoning: string; toolLines: string[] }, answer: string, showProcess: boolean): string {
-  const parts: string[] = []
+function threadCardJson(thread: { reasoning: string; toolLines: string[] }, answer: string, showProcess: boolean): object {
+  const elements: object[] = []
   if (showProcess) {
     const process: string[] = []
     if (thread.reasoning.trim() !== '') {
       const capped = thread.reasoning.length > MAX_THREAD_REASONING_CHARS
         ? thread.reasoning.slice(-MAX_THREAD_REASONING_CHARS)
         : thread.reasoning
-      process.push('> ' + capped.replace(/\n+/g, '\n> '))
+      process.push(capped)
     }
     process.push(...thread.toolLines)
-    if (process.length > 0) parts.push('**思考过程**\n' + process.join('\n'))
+    if (process.length > 0) {
+      elements.push({
+        tag: 'collapsible_panel',
+        expanded: false,
+        header: { title: { tag: 'markdown', content: '**思考过程**' } },
+        elements: [{ tag: 'markdown', content: process.join('\n') }],
+      })
+    }
   }
-  parts.push(answer)
-  return parts.join('\n\n')
+  elements.push({ tag: 'markdown', content: answer })
+  return { schema: '2.0', body: { elements } }
 }
 
 /**
@@ -431,11 +439,9 @@ export function createCotRenderer(
                 answer.handle(heldEvent)
                 return
               }
-              const handle = openStream(port, chatId, opts, onFailure)
-              handle.set(threadCardMarkdown(run!.thread!, text, showProcess))
-              const settled = handle.finish().catch(onFailure)
-              closing.add(settled)
-              void settled.finally(() => closing.delete(settled))
+              // One interactive card, sent when the turn settles: the
+              // answer with the folded process above it.
+              await port.send(chatId, { card: threadCardJson(run!.thread!, text, showProcess) }, opts)
             } catch (error) {
               onFailure(error)
               answer.handle(heldEvent)

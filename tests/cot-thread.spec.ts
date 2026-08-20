@@ -27,18 +27,24 @@ describe('thread-bound turns (topic cards)', () => {
       await vi.waitFor(() => { expect(harness.fake.openedThreads).toHaveLength(1) })
       expect(harness.fake.openedThreads[0]!.replyTo).toBe('om_root')
       // ...and no CoT message is created, because the CoT API cannot address
-      // a topic. The merged card rides the stream-card transport instead.
-      await vi.waitFor(() => { expect(harness.fake.streams).toHaveLength(1) })
+      // a topic. The merged card rides an interactive message instead.
+      await vi.waitFor(() => { expect(harness.fake.sent).toHaveLength(1) })
       expect(harness.fake.cots).toHaveLength(0)
-      const card = harness.fake.streams[0]!
-      expect(card.to).toBe('oc_group')
-      expect(card.opts?.replyTo).toBe('om_root')
-      expect(card.opts?.replyInThread).toBe(true)
-      // Process first, answer appended — the same shape the CoT UI shows.
-      expect(card.content).toContain('思考过程')
-      expect(card.content).toContain('看不懂，问一句。')
-      expect(card.content).toContain('这个我没看懂，你是想让我做什么？')
-      await vi.waitFor(() => { expect(card.closed).toBe(true) })
+      expect(harness.fake.streams).toHaveLength(0)
+      const sent = harness.fake.sent[0]!
+      expect(sent.to).toBe('oc_group')
+      expect(sent.opts?.replyTo).toBe('om_root')
+      expect(sent.opts?.replyInThread).toBe(true)
+      const card = (sent.input as { card: { schema: string; body: { elements: Array<Record<string, unknown>> } } }).card
+      expect(card.schema).toBe('2.0')
+      const [process, answer] = card.body.elements
+      // The folded thinking panel comes first, collapsed by default...
+      expect(process).toMatchObject({ tag: 'collapsible_panel', expanded: false })
+      const panel = process as { header: { title: { content: string } }; elements: [{ content: string }] }
+      expect(panel.header.title.content).toContain('思考过程')
+      expect(panel.elements[0]!.content).toContain('看不懂，问一句。')
+      // ...and the answer is appended after it.
+      expect(answer).toMatchObject({ tag: 'markdown', content: '这个我没看懂，你是想让我做什么？' })
     } finally {
       await harness.dispose()
     }
@@ -91,14 +97,19 @@ describe('thread-bound turns (topic cards)', () => {
       emit('assistant/message', { turn: 1, message: { content: [{ type: 'text', text: 'test 环境，成功率掉到 80%。' }] } })
       emit('turn/end', { turn: 1, reason: { kind: 'completed' } })
 
-      await vi.waitFor(() => { expect(harness.fake.streams).toHaveLength(1) })
+      await vi.waitFor(() => { expect(harness.fake.sent).toHaveLength(1) })
       expect(harness.fake.openedThreads).toHaveLength(0)
       expect(harness.fake.cots).toHaveLength(0)
-      const card = harness.fake.streams[0]!
-      expect(card.opts?.replyTo).toBe('om_in')
-      expect(card.opts?.replyInThread).toBe(true)
-      expect(card.content).toContain('test 环境，成功率掉到 80%。')
-      expect(card.content).toContain('查日志。')
+      expect(harness.fake.streams).toHaveLength(0)
+      const sent = harness.fake.sent[0]!
+      expect(sent.opts?.replyTo).toBe('om_in')
+      expect(sent.opts?.replyInThread).toBe(true)
+      const card = (sent.input as { card: { body: { elements: Array<Record<string, unknown>> } } }).card
+      const [process, answer] = card.body.elements
+      expect(process).toMatchObject({ tag: 'collapsible_panel', expanded: false })
+      const panel = process as { elements: [{ content: string }] }
+      expect(panel.elements[0]!.content).toContain('查日志。')
+      expect(answer).toMatchObject({ tag: 'markdown', content: 'test 环境，成功率掉到 80%。' })
     } finally {
       await harness.dispose()
     }
