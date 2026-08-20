@@ -88,6 +88,8 @@ export function createFakePort() {
     /** Stamps exactly as written, so ordering can be asserted. */
     timestamps: string[]
   }[] = []
+  /** Thinking processes the renderer deleted, with the handle it held. */
+  const deletedCots: { cotId: string; messageId: string }[] = []
   /** Downloadable resources, by file key, as the transport would serve them. */
   const resourceBytes = new Map<string, { buffer: Uint8Array; contentType?: string }>()
   /** Members returned by the optional cached roster lookup. */
@@ -204,6 +206,10 @@ export function createFakePort() {
       })))
       cot.timestamps.push(...events.map((e) => e.timestamp))
     },
+    async deleteCot(handle) {
+      deletedCots.push(handle)
+    },
+    },
     async downloadResourceWithMeta(messageId, fileKey, _type) {
       downloads.push({ fileKey, via: 'memory' })
       const stored = resourceBytes.get(fileKey)
@@ -272,6 +278,7 @@ export function createFakePort() {
     memberLookups,
     downloads,
     cots,
+    deletedCots,
     state,
     gates,
     /** Deliver one inbound chat message to every subscribed handler. */
