@@ -335,7 +335,7 @@ export function createCotRenderer(
             run.opening.then(handle => {
               if (handle !== undefined) return port.deleteCot(handle)
             }),
-          ).catch(() => {})
+          ).catch(onFailure)
         }
       }
     },
