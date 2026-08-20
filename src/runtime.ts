@@ -173,12 +173,13 @@ export function createLarkChannelPort(config: ChannelConfig, authorization: Auth
     async deleteSlashCommand(commandId: string): Promise<void> {
       await raw.request({ method: 'DELETE', url: `${SLASH_COMMAND_API}/${commandId}` })
     },
-    async createCot(chatId: string, options: { replyTo?: string; hidden: boolean }): Promise<CotHandle> {
+    async createCot(chatId: string, options: { replyTo?: string; hidden: boolean; threadId?: string }): Promise<CotHandle> {
+      const inThread = options.threadId !== undefined
       const response = await raw.request({
         method: 'POST',
-        url: `${COT_API}?receive_id_type=chat_id`,
+        url: `${COT_API}?receive_id_type=${inThread ? 'thread_id' : 'chat_id'}`,
         data: {
-          receive_id: chatId,
+          receive_id: inThread ? options.threadId : chatId,
           ...options.replyTo === undefined ? {} : { origin_message_id: options.replyTo },
           cot_hidden: options.hidden,
           // A thinking process is not news: it must not raise an unread badge

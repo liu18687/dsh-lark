@@ -12,6 +12,7 @@
 
 import {
   assistantText,
+  type AssistantMessageData,
   isAssistantChunkEvent,
   isAssistantMessageEvent,
   isStepStartEvent,
@@ -42,7 +43,7 @@ export interface CotHandle {
 /** The CoT operations this renderer drives. */
 export interface CotPort {
   /** Open a thinking process in one chat, optionally aimed at the message that asked. */
-  createCot(chatId: string, options: { replyTo?: string; hidden: boolean }): Promise<CotHandle>
+  createCot(chatId: string, options: { replyTo?: string; hidden: boolean; threadId?: string }): Promise<CotHandle>
   /** Append events to one thinking process, in order. */
   writeCotEvents(handle: CotHandle, events: readonly CotEvent[]): Promise<void>
   /** Delete a thinking-process message; a silenced turn leaves no card behind. */
@@ -185,7 +186,11 @@ export function createCotRenderer(
     if (live !== undefined && live.turn === turn) return live
     if (live !== undefined) closeRun(live)
     const opening = port
-      .createCot(chatId, { ...aimed === undefined ? {} : { replyTo: aimed.messageId }, hidden })
+      .createCot(chatId, {
+        ...aimed === undefined ? {} : { replyTo: aimed.messageId },
+        ...aimed === undefined || aimed.threadId === undefined ? {} : { threadId: aimed.threadId },
+        hidden,
+      })
       .catch((error: unknown) => {
         // The process is presentation; the answer still arrives without it.
         onFailure(error)
@@ -317,7 +322,24 @@ export function createCotRenderer(
         // One message per turn: the text the turn ended on.
         const answered = held !== undefined && held.turn === event.data.turn
         if (answered) {
-          answer.handle(held!.event)
+          const text = stripToolCallMarkup(assistantText(held!.event.data as AssistantMessageData))
+          const inThread = aimed?.threadId !== undefined
+          // Inside a topic the whole turn lives in one process card: the
+          // answer is appended to the (collapsible) thinking process instead
+          // of landing as a separate message. Main-channel messages keep the
+          // separate reply — it is the one that creates their topic.
+          if (inThread && showProcess && live !== undefined && live.turn === event.data.turn && text !== '') {
+            const run = live
+            const messageId = `answer-${run.turn}`
+            enqueue(
+              run,
+              cotEvent('TEXT_MESSAGE_START', { messageId, role: 'assistant' }),
+              cotEvent('TEXT_MESSAGE_CONTENT', { messageId, delta: text }),
+              cotEvent('TEXT_MESSAGE_END', { messageId }),
+            )
+          } else {
+            answer.handle(held!.event)
+          }
           held = undefined
         }
         if (live === undefined || live.turn !== event.data.turn) return
