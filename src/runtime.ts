@@ -98,8 +98,19 @@ export function channelOptions(config: ChannelConfig, authorization: Authorizati
  * @param authorization - who this deployment answers.
  * @returns the real `@larksuite/channel` client behind the bridge's port surface.
  */
+// Periodic WS refresh: bounds the "SDK reports connected but events stopped
+// arriving" failure mode (silent broker routing loss). forceReconnect is
+// private in the SDK's public types but exists at runtime; reconnect only
+// tears down and re-establishes the inbound WebSocket, so active turns are
+// unaffected.
+const WS_REFRESH_INTERVAL_MS = 10 * 60 * 1000
+
 export function createLarkChannelPort(config: ChannelConfig, authorization: Authorization): ChannelPort {
   const channel = createLarkChannel(channelOptions(config, authorization))
+  const timer = setInterval(() => {
+    void (channel as unknown as { forceReconnect?: () => Promise<unknown> }).forceReconnect?.().catch(() => {})
+  }, WS_REFRESH_INTERVAL_MS)
+  timer.unref?.()
   // The slash-command panel has no SDK method; it is a plain app-config API,
   // reached through the transport's own authenticated client.
   const raw = channel.rawClient as {
