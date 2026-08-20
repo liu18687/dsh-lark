@@ -73,6 +73,11 @@ export function channelOptions(config: ChannelConfig, authorization: Authorizati
     policy,
     source: 'dsh-lark-channel',
     respectProxyEnv: true,
+    // App-level keepalive watchdog: detect and force-recover from silent WS
+    // death (half-open socket — no close event, no error), which otherwise
+    // leaves the bot deaf while looking healthy. On unrecoverable failure,
+    // exit so the supervisor (launchd/systemd) restarts the process.
+    keepalive: { enabled: true, onUnrecoverable: () => process.exit(1) },
   }
   // The transport batches by CHAT: messages arriving within its window are
   // merged into one, `{...last, content: joined}` — the LAST sender's name on
