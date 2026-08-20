@@ -597,6 +597,7 @@ const FILE_SEND = {
   // two rooms being asked to authorize something should not be able to end up
   // asked in two different words because one copy was edited.
   title: APPROVAL.title,
+  eyebrow: APPROVAL.eyebrow,
   context: { zh: 'Agent 想把一个文件发到这个群', en: 'The agent wants to send a file to this group' },
   path: { zh: '文件', en: 'File' },
   workspace: { zh: '工作区', en: 'Workspace' },
@@ -640,7 +641,7 @@ export function fileApprovalCard(input: {
   const path = clip(input.path, COMMAND_MAX_CHARS)
   const workspace = clip(input.workspace, COMMAND_MAX_CHARS)
   return card('warning', join(FILE_SEND.title, `：${path.shown}`, `: ${path.shown}`), [
-    ...heading('warning', FILE_SEND.title, FILE_SEND.context),
+    ...heading('warning', FILE_SEND.title, FILE_SEND.context, FILE_SEND.eyebrow),
     quoted(FILE_SEND.path, path.shown, 'grey-50', path.hidden),
     quoted(FILE_SEND.workspace, workspace.shown, 'grey-50', workspace.hidden),
     quoted(FILE_SEND.size, formatByteSize(input.bytes), 'grey-50'),
