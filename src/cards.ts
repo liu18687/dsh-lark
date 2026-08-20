@@ -52,11 +52,11 @@ export type CardState = 'info' | 'success' | 'warning' | 'danger' | 'neutral'
  * `config.style.color`, so each card ships only the one pair it uses.
  */
 const INK: Record<CardState, { readonly token: string; readonly light: string; readonly dark: string }> = {
-  info: { token: 'dsh_ink_info', light: 'rgba(20, 86, 240, 1)', dark: 'rgba(117, 164, 255, 1)' },
-  success: { token: 'dsh_ink_success', light: 'rgba(26, 117, 38, 1)', dark: 'rgba(81, 186, 67, 1)' },
-  warning: { token: 'dsh_ink_warning', light: 'rgba(164, 73, 4, 1)', dark: 'rgba(243, 135, 27, 1)' },
-  danger: { token: 'dsh_ink_danger', light: 'rgba(192, 42, 38, 1)', dark: 'rgba(246, 130, 126, 1)' },
-  neutral: { token: 'dsh_ink', light: 'rgba(28, 31, 36, 1)', dark: 'rgba(244, 246, 248, 1)' },
+  info: { token: 'dsh_ink_info', light: 'rgba(91, 82, 224, 1)', dark: 'rgba(157, 148, 255, 1)' },
+  success: { token: 'dsh_ink_success', light: 'rgba(5, 122, 85, 1)', dark: 'rgba(110, 231, 183, 1)' },
+  warning: { token: 'dsh_ink_warning', light: 'rgba(146, 92, 8, 1)', dark: 'rgba(250, 204, 21, 1)' },
+  danger: { token: 'dsh_ink_danger', light: 'rgba(190, 18, 60, 1)', dark: 'rgba(253, 164, 175, 1)' },
+  neutral: { token: 'dsh_ink', light: 'rgba(23, 26, 40, 1)', dark: 'rgba(240, 242, 248, 1)' },
 }
 
 /**
@@ -166,9 +166,10 @@ function card(state: CardState, summary: Copy, elements: readonly object[]): obj
  * Title and one line of context. The ink follows the card's state, which is
  * how a settled card reads as settled before any word is parsed.
  */
-function heading(state: CardState, title: Line, context: Line): object[] {
+function heading(state: CardState, title: Line, context: Line, eyebrow?: Line): object[] {
   return [
-    line(title, SIZE.title, '20px 20px 0px 20px', INK[state].token),
+    ...eyebrow === undefined ? [] : [line(eyebrow, SIZE.label, '20px 20px 0px 20px', INK[state].token)],
+    line(title, SIZE.title, eyebrow === undefined ? '20px 20px 0px 20px' : '2px 20px 0px 20px', INK[state].token),
     line(context, SIZE.body, '2px 20px 0px 20px', 'grey'),
   ]
 }
@@ -190,9 +191,9 @@ function quoted(
   return {
     tag: 'interactive_container',
     background_style: surface,
-    corner_radius: '10px',
+    corner_radius: '12px',
     has_border: false,
-    padding: '14px 16px 14px 16px',
+    padding: '16px 18px 16px 18px',
     direction: 'vertical',
     horizontal_spacing: '8px',
     vertical_spacing: '0px',
@@ -253,7 +254,7 @@ function actions(buttons: readonly CardButton[], compact = false): object {
     background_style: 'default',
     horizontal_spacing: '8px',
     horizontal_align: 'left',
-    margin: '16px 20px 0px 20px',
+    margin: '18px 20px 0px 20px',
     columns: buttons.map(button => ({
       tag: 'column',
       width: 'weighted',
@@ -289,7 +290,7 @@ function optionRow(
   return {
     tag: 'interactive_container',
     background_style: 'default',
-    corner_radius: '10px',
+    corner_radius: '12px',
     has_border: true,
     border_color: 'grey-300',
     padding: '12px 16px 12px 16px',
@@ -461,6 +462,7 @@ const REASON_MAX_CHARS = 300
 const TRUNCATED = { zh: '已截断 %s 个字符', en: '%s characters truncated' }
 const APPROVAL = {
   title: { zh: '需要你的授权', en: 'Approval needed' },
+  eyebrow: { zh: '审批', en: 'APPROVAL' },
   context: { zh: '%s · 沙箱之外的操作，等待确认', en: '%s · outside the sandbox, awaiting your call' },
   command: { zh: '将执行', en: 'Will run' },
   reason: { zh: '模型说明', en: "Model's reason" },
@@ -483,6 +485,7 @@ const APPROVAL = {
 }
 const QUESTION = {
   title: { zh: '需要你确认', en: 'A decision is needed' },
+  eyebrow: { zh: '提问', en: 'QUESTION' },
   context: { zh: '助手需要一个决定才能继续', en: 'The assistant needs your answer to continue' },
   answered: { zh: '已作答', en: 'Answered' },
   cancelled: { zh: '这个提问已取消', en: 'Question cancelled' },
@@ -535,7 +538,9 @@ export function approvalCard(input: {
         ? join(fill(APPROVAL.context, input.toolName), `｜${fill(APPROVAL.escalationTo, input.escalateTo!).zh}`,
           ` | ${fill(APPROVAL.escalationTo, input.escalateTo!).en}`)
         : fill(APPROVAL.context, input.toolName),
+      APPROVAL.eyebrow,
     ),
+    { tag: 'hr', margin: '12px 20px 0px 20px' },
     ...command.shown === '' ? [] : [quoted(APPROVAL.command, command.shown, 'grey-50', command.hidden)],
     ...reason.shown === '' ? [] : [quoted(APPROVAL.reason, reason.shown, 'orange-50', reason.hidden)],
     actions([
@@ -722,7 +727,8 @@ export function questionCard(input: {
   )
   const title = input.header ?? QUESTION.title
   return card('info', isCopy(title) ? title : { zh: title, en: title }, [
-    ...heading('info', title, QUESTION.context),
+    ...heading('info', title, QUESTION.context, QUESTION.eyebrow),
+    { tag: 'hr', margin: '12px 20px 0px 20px' },
     line(input.question, SIZE.body, '12px 20px 0px 20px'),
     ...input.options.length === 0
       ? []
