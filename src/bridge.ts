@@ -179,6 +179,12 @@ export interface ChannelPort extends OutboundPort, SlashPanelPort, ImagePort, In
   getChatMembers?(chatId: string): Promise<readonly { readonly id: string; readonly name?: string }[]>
   /** Replace a sent card's content in place. */
   updateCard(messageId: string, card: object): Promise<void>
+  /**
+   * Fetch one message's interactive card and read its text. A card-entity
+   * message arrives with only a `card_id` reference, so the event body holds
+   * no words; this is how an alert card becomes text the model can read.
+   */
+  fetchMessageCard?(messageId: string): Promise<string | undefined>
 }
 
 /** One conversation's chat and its outbound renderer, keyed by session id. */
@@ -1732,6 +1738,19 @@ export function installBridge(
       // A person speaking is the signal that the exchange is still wanted.
       hops.reset(conversation)
       exhausted.delete(conversation)
+    }
+    // Card-entity messages carry only a card_id reference: the SDK leaves
+    // their content as a placeholder. Fetch the card JSON and read its text,
+    // so an alert card reaches the model as the words it shows; a card that
+    // cannot be read is dropped rather than fed to the model as a placeholder.
+    if (msg.rawContentType === 'interactive' && (msg.content.trim() === '' || msg.content === '[interactive card]')) {
+      const fetched = await port.fetchMessageCard?.(msg.messageId).catch(() => undefined)
+      if (fetched === undefined || fetched.trim() === '') {
+        notify(`lark-channel: dropped unreadable card ${msg.messageId} in ${msg.chatId}`)
+        return
+      }
+      msg = { ...msg, content: fetched }
+      notify(`lark-channel: enriched card ${msg.messageId} in ${msg.chatId} with ${fetched.length} chars of text`)
     }
     // An @-only ping carries no text; starting a turn on an empty prompt spends
     // a turn for nothing. Skipped before the acknowledgement, which would

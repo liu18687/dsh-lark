@@ -16,6 +16,7 @@ import type { CotEvent, CotHandle } from './cot.ts'
 import type { PanelCommand } from './slash-panel.ts'
 import { beginOnboarding } from './onboarding.ts'
 import type { LarkCredentials, OnboardedApp, RegisterAppPort } from './onboarding.ts'
+import { extractCardText } from './card-text.ts'
 import { describeAuthorization, resolveAuthorization } from './authorization.ts'
 import type { Authorization } from './authorization.ts'
 import type { HostLoader, HostSettings } from './host.ts'
@@ -152,6 +153,16 @@ export function createLarkChannelPort(config: ChannelConfig, authorization: Auth
     }
   }
   return Object.assign(channel, {
+    fetchMessageCard: async (messageId: string) => {
+      try {
+        const items = await channel.fetchRawMessage(messageId, { cardContentType: 'user_card_content' })
+        const raw = items[0]?.body?.content
+        if (typeof raw !== 'string' || raw === '') return undefined
+        return extractCardText(raw)
+      } catch {
+        return undefined
+      }
+    },
     send: sendWithThreadRetry,
     async listSlashCommands(): Promise<PanelCommand[]> {
       // The collection route requires a paging query; without one it 404s.

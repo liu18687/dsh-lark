@@ -81,5 +81,5 @@ export function presenceSection(
  */
 export function batonNote(senderId: string): string {
   return `(from another agent — reply with <at user_id="${senderId}"></at> to hand the turn back,`
-    + ' or say nothing to end it)'
+    + ' or answer it directly like any message)'
 }

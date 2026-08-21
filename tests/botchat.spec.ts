@@ -110,7 +110,7 @@ describe('presence', () => {
     // Names repeat in a workspace; a mention that resolves to the wrong
     // colleague, or to nobody, ends an exchange that was meant to continue.
     expect(note).toContain('<at user_id="ou_peer"></at>')
-    expect(note).toContain('say nothing')
+    expect(note).toContain('answer it directly like any message')
   })
 
   it('works before the transport has resolved an identity', () => {
