@@ -441,15 +441,16 @@ describe('dsh-lark-channel', () => {
       expect(created.registeredTools.map((tool) => tool.name)).toContain('ask_user_question')
       expect(created.denyReason('ask_user_question')).toBeUndefined()
 
-      // With no plan service composed there is no host plan tool to shadow,
-      // and nothing else this channel cannot answer — so nothing is denied and
-      // no prompt section claims otherwise.
+      // With no plan service composed there is no host plan tool to shadow;
+      // the fault-library archive is the one capability this deployment has
+      // not configured, so it alone is denied.
       expect(created.denyReason('exit_plan_mode')).toBeUndefined()
       expect(created.denyReason('bash')).toBeUndefined()
-      // Nothing is denied, but the agent is still told where it woke up.
+      expect(created.denyReason('archive_finding')).toContain('unavailable in this chat channel')
+      // The agent is still told where it woke up.
       const presence = created.promptSections.find((s) => s.name === 'lark-channel:presence')
       expect(presence?.text).toContain('Your reply IS the message')
-      expect(presence?.text).not.toContain('Unavailable here')
+      expect(presence?.text).toContain('Unavailable here')
       await harness.dispose()
     })
 
@@ -495,9 +496,10 @@ describe('dsh-lark-channel', () => {
       const harness = await mountChannel({ denyTools: [] })
       const created = await firstAgent(harness)
       expect(created.denyReason('ask_user_question')).toBeUndefined()
-      // One section either way: the agent's bearings, with no denial line.
+      // One section either way: the agent's bearings. The fault-library
+      // archive is unconfigured here, so its denial line is present.
       expect(created.promptSections.map((s) => s.name)).toEqual(['lark-channel:presence'])
-      expect(created.promptSections[0]!.text).not.toContain('Unavailable here')
+      expect(created.promptSections[0]!.text).toContain('Unavailable here')
       await harness.dispose()
     })
 

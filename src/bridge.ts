@@ -104,6 +104,8 @@ import {
   sendFileTool,
 } from './outbound-file.ts'
 import type { OutboundFile, SendFilePorts } from './outbound-file.ts'
+import { archiveFindingTool, ARCHIVE_TOOL } from './archive.ts'
+import type { ArchivePorts } from './archive.ts'
 import { failureDetail } from './format.ts'
 import { syncSlashPanel } from './slash-panel.ts'
 import type { SlashPanelPort } from './slash-panel.ts'
@@ -621,6 +623,7 @@ function composeChatAgent(
   askQuestions: ((questions: readonly AskedQuestion[], sessionId: string | undefined) => Promise<QuestionAnswer[]>) | undefined,
   planReview: PlanReviewPorts | undefined,
   sendFiles: SendFilePorts | undefined,
+  archives: ArchivePorts | undefined,
   self: BotSelf,
 ): void {
   const tools = agentCtx.get('tools') as HostTools | undefined
@@ -671,6 +674,21 @@ function composeChatAgent(
     denied.add(SEND_FILE_TOOL)
   }
 
+  // `archive_finding` is the same kind of capability: it exists only because
+  // this deployment named a fault-library Base, and it is denied wherever it
+  // cannot run, so the model never offers an archive it cannot write.
+  const registersArchive = archives !== undefined
+    && !denied.has(ARCHIVE_TOOL)
+    && tools?.register !== undefined
+  if (registersArchive) tools?.register?.(archiveFindingTool(archives!))
+  else {
+    if (archives !== undefined && !denied.has(ARCHIVE_TOOL)) {
+      archives.report(`lark-channel: ${ARCHIVE_TOOL} could not be registered for this agent `
+        + '(this host tool registry takes no per-agent tools)')
+    }
+    denied.add(ARCHIVE_TOOL)
+  }
+
   // Every chat agent gets its bearings, denials or none: an agent told nothing
   // about where it woke up treats a chat like a ticket queue.
   const prompt = agentCtx.get('systemPrompt') as HostSystemPrompt | undefined
@@ -710,6 +728,10 @@ function denialReason(name: string): string {
     // Nothing here is waiting for an answer: there is no file channel at all.
     return `${unavailable}: no file can leave the workspace for this chat. `
       + 'Put what matters into your reply — the findings, the excerpt that counts — rather than offering an attachment.'
+  }
+  if (name === ARCHIVE_TOOL) {
+    return `${unavailable}: no fault library is configured for this chat. `
+      + 'Put the conclusion into your reply instead.'
   }
   // Anything the deployment denied by configuration. It may be a tool with no
   // answer, no interface, and no substitute, so this promises none of those.
@@ -1077,6 +1099,26 @@ export function installBridge(
       }
     : undefined
 
+  /** The fault-library archive, when the deployment named a Base table. */
+  const archiveConfigured = config.archiveBaseToken !== undefined && config.archiveTableId !== undefined
+  if (
+    (config.archiveBaseToken === undefined) !== (config.archiveTableId === undefined)
+  ) {
+    notify('lark-channel: archiveBaseToken and archiveTableId must be set together; archive_finding is not registered')
+  }
+  const archivePorts: ArchivePorts | undefined = archiveConfigured
+    ? {
+        baseToken: config.archiveBaseToken,
+        tableId: config.archiveTableId,
+        chatLinkOf: (sessionId) => {
+          const binding = bySession.get(sessionId)
+          if (binding === undefined) return undefined
+          return `https://applink.feishu.cn/client/chat/open?openChatId=${binding.chatId}`
+        },
+        report: notify,
+      }
+    : undefined
+
   /** Resolved once; a display nicety must not be able to break activation. */
   let pluginVersion = ''
   try {
@@ -1111,7 +1153,7 @@ export function installBridge(
       presentCall: createCallPresenter(ctx.get('tools') as HostTools | undefined, toolScope),
       setup: async (agentCtx: Context) => {
         if (presets !== undefined && presetId !== undefined) await presets.mount(agentCtx, presetId)
-        composeChatAgent(agentCtx, config, askQuestions, planReview, sendFilePorts, botSelf())
+        composeChatAgent(agentCtx, config, askQuestions, planReview, sendFilePorts, archivePorts, botSelf())
       },
     }
   }

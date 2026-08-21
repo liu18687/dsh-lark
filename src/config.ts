@@ -253,6 +253,13 @@ export interface Config {
    * human — it grants more power than the sandbox allows.
    */
   approvers?: string[]
+  /**
+   * The fault-library Base (`archive_finding` destination): the base token and
+   * the table id of the records table. Both absent leaves the archiving tool
+   * unregistered; either alone is a misconfiguration the bridge reports.
+   */
+  archiveBaseToken?: string
+  archiveTableId?: string
 }
 
 /** Configuration after defaults have been resolved; credentials may still be pending onboarding. */
@@ -288,6 +295,8 @@ export interface ResolvedConfig {
   senderAllowlist: string[]
   groupAllowlist: string[]
   approvers: string[]
+  archiveBaseToken?: string | undefined
+  archiveTableId?: string | undefined
 }
 
 /** Loader-visible configuration schema and defaults. */
@@ -323,6 +332,8 @@ export const Config: z<Config> = z.object({
   senderAllowlist: z.array(String),
   groupAllowlist: z.array(String),
   approvers: z.array(String),
+  archiveBaseToken: z.string(),
+  archiveTableId: z.string(),
 })
 
 /**
@@ -355,5 +366,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
     senderAllowlist: config.senderAllowlist ?? [],
     groupAllowlist: config.groupAllowlist ?? [],
     approvers: config.approvers ?? [],
+    archiveBaseToken: config.archiveBaseToken,
+    archiveTableId: config.archiveTableId,
   }
 }
