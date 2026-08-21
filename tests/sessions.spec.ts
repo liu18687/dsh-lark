@@ -30,63 +30,67 @@ describe('what a conversation may continue', () => {
     // A subagent session opens with an instruction the agent wrote, runs one
     // turn and ends. Listing them buries the conversations a person had.
     const records: HostSessionRecord[] = [
-      { header: { id: 'session-real', cwd: '/work', createdAt: 10 } },
+      { header: { id: 'lark-oc_1', cwd: '/work', createdAt: 10 } },
       { header: { id: 'session-sub', cwd: '/work', createdAt: 20, origin: 'subagent', delegationDepth: 1 } },
       { header: { id: 'session-forked', cwd: '/work', createdAt: 30, parentSession: 'session-real' } },
     ]
     expect(sessionChoices(records, new Map(), HERE, path => path).map(choice => choice.id))
-      .toEqual(['session-real'])
+      .toEqual(['lark-oc_1'])
   })
 
-  it('offers its own history and sessions no chat owns, and nothing else', () => {
+  it('offers its own history and the same chat\'s topics, and nothing else', () => {
     const records = corpus(
       { id: 'lark-oc_1', cwd: '/work', createdAt: 30 },
       { id: 'lark-oc_1--e1', cwd: '/work', createdAt: 40 },
-      { id: 'session-web-ui', cwd: '/work', createdAt: 50 },
-      // Another chat, and another bot row in the same workspace: their titles
-      // summarize conversations this room was never part of.
+      // A topic of this group: another conversation of the same chat.
+      { id: 'lark-oc_1:omt_topic', cwd: '/work', createdAt: 45 },
+      // A one-shot per-message session: noise, hidden rather than listed.
+      { id: 'lark-oc_1:msg:om_x', cwd: '/work', createdAt: 50 },
+      // Another surface's web session, another chat, another bot row: all
+      // someone else's, none offered.
+      { id: 'session-web-ui', cwd: '/work', createdAt: 55 },
       { id: 'lark-oc_2', cwd: '/work', createdAt: 60 },
       { id: 'lark-support-oc_1', cwd: '/work', createdAt: 70 },
     )
     const offered = sessionChoices(records, new Map(), HERE, path => path)
-    expect(offered.map(choice => choice.id)).toEqual(['session-web-ui', 'lark-oc_1--e1', 'lark-oc_1'])
+    expect(offered.map(choice => choice.id)).toEqual(['lark-oc_1:omt_topic', 'lark-oc_1--e1', 'lark-oc_1'])
     expect(offered.map(choice => choice.own)).toEqual([false, true, true])
   })
 
   it('keeps to the conversation\'s workspace, comparing canonical paths', () => {
     const records = corpus(
-      { id: 'session-here', cwd: '/tmp/work', createdAt: 10 },
-      { id: 'session-elsewhere', cwd: '/other', createdAt: 20 },
-      { id: 'session-nowhere', createdAt: 30 },
+      { id: 'lark-oc_1', cwd: '/tmp/work', createdAt: 10 },
+      { id: 'lark-oc_1--e1', cwd: '/other', createdAt: 20 },
+      { id: 'lark-oc_1--e2', createdAt: 30 },
     )
     // `/tmp` is a link into `/private/var` on macOS, so a session recorded
     // under one spelling must still be recognized under the other — a
     // conversation would otherwise be offered nothing in its own directory.
     const canonical = (path: string) => (path.startsWith('/private/') ? path : `/private${path}`)
     const offered = sessionChoices(records, new Map(), { ...HERE, workspace: '/private/tmp/work' }, canonical)
-    expect(offered.map(choice => choice.id)).toEqual(['session-here'])
+    expect(offered.map(choice => choice.id)).toEqual(['lark-oc_1'])
   })
 
-  it('marks the one in use and the ones another surface is driving', () => {
+  it('marks the one in use and the topic another surface is driving', () => {
     const records = corpus(
       { id: 'lark-oc_1', cwd: '/work', createdAt: 10 },
-      { id: 'session-web-ui', cwd: '/work', createdAt: 20, live: true },
+      { id: 'lark-oc_1:omt_live', cwd: '/work', createdAt: 20, live: true },
     )
-    const offered = sessionChoices(records, new Map([['session-web-ui', '看一眼部署']]), HERE, path => path)
-    expect(offered[0]).toMatchObject({ id: 'session-web-ui', title: '看一眼部署', live: true, current: false })
+    const offered = sessionChoices(records, new Map([['lark-oc_1:omt_live', '看一眼部署']]), HERE, path => path)
+    expect(offered[0]).toMatchObject({ id: 'lark-oc_1:omt_live', title: '看一眼部署', live: true, current: false })
     expect(offered[1]).toMatchObject({ id: 'lark-oc_1', live: false, current: true })
   })
 
   it('narrows by keyword over titles and ids', () => {
     const records = corpus(
-      { id: 'session-a', cwd: '/work', createdAt: 10 },
-      { id: 'session-b', cwd: '/work', createdAt: 20 },
+      { id: 'lark-oc_1--e1', cwd: '/work', createdAt: 10 },
+      { id: 'lark-oc_1--e2', cwd: '/work', createdAt: 20 },
     )
-    const titles = new Map([['session-a', '权限预设的设计'], ['session-b', '文件收发']])
+    const titles = new Map([['lark-oc_1--e1', '权限预设的设计'], ['lark-oc_1--e2', '文件收发']])
     expect(sessionChoices(records, titles, { ...HERE, keyword: '权限' }, path => path).map(c => c.id))
-      .toEqual(['session-a'])
-    expect(sessionChoices(records, titles, { ...HERE, keyword: 'session-b' }, path => path).map(c => c.id))
-      .toEqual(['session-b'])
+      .toEqual(['lark-oc_1--e1'])
+    expect(sessionChoices(records, titles, { ...HERE, keyword: 'lark-oc_1--e2' }, path => path).map(c => c.id))
+      .toEqual(['lark-oc_1--e2'])
   })
 })
 
@@ -279,11 +283,18 @@ describe('one derivation of the picker', () => {
   })
 
   it('draws what it read, and counts the rest', async () => {
-    const rows = Array.from({ length: PICKER_ROWS + 6 }, (_, index) => ({
-      id: `session-${index}`,
+    // Topics of this chat fill the card; two foreign rows — another surface's
+    // web session and another chat — are hidden and counted.
+    const topics = Array.from({ length: PICKER_ROWS + 4 }, (_, index) => ({
+      id: `lark-oc_1:omt_${index}`,
       createdAt: 10_000 - index,
       said: 10_000 - index,
     }))
+    const rows = [
+      ...topics,
+      { id: 'session-web-ui', createdAt: 1, said: 1 },
+      { id: 'lark-oc_2', createdAt: 0, said: 0 },
+    ]
     const offered = await offer(engine(rows))
 
     expect(offered.rows).toHaveLength(PICKER_ROWS)
@@ -332,18 +343,19 @@ describe('one derivation of the picker', () => {
   it('keeps every session where the host lends no event listing', async () => {
     // Without `listEvents` nothing ever happened in ANY session as far as this
     // can tell, and dropping them all leaves a picker that offers only what
-    // this chat already had — which is the opposite of the point.
+    // this chat already had — which is the opposite of the point. Same-chat
+    // sessions survive; foreign ones stay hidden either way.
     const offered = await offerSessions({
       query: {
         listSessions: async () => [
-          { header: { id: 'session-web-ui', cwd: '/work', createdAt: 10 }, live: false },
+          { header: { id: 'lark-oc_1:omt_kept', cwd: '/work', createdAt: 10 }, live: false },
         ],
       },
       scope: HERE,
       canonical: path => path,
     })
 
-    expect(offered.rows.map(row => row.id)).toEqual(['session-web-ui'])
+    expect(offered.rows.map(row => row.id)).toEqual(['lark-oc_1:omt_kept'])
   })
 
   it('always shows the conversation where it is, however quiet that session is', async () => {
@@ -353,21 +365,21 @@ describe('one derivation of the picker', () => {
       // More than the window this reads facts for, so the parked one is not
       // merely off the card — it is off the end of what gets described.
       ...Array.from({ length: PICKER_ROWS * 3 }, (_, index) => ({
-        id: `session-busy-${index}`,
+        id: `lark-oc_1:omt_busy_${index}`,
         createdAt: 90_000 - index,
         said: 90_000 - index,
       })),
-      { id: 'session-parked', createdAt: 10, said: 20 },
+      { id: 'lark-oc_1--parked', createdAt: 10, said: 20 },
     ]
     const offered = await offerSessions({
       query: engine(rows),
-      scope: { ...HERE, current: 'session-parked' },
+      scope: { ...HERE, current: 'lark-oc_1--parked' },
       canonical: path => path,
     })
 
     expect(offered.rows).toHaveLength(PICKER_ROWS)
-    expect(offered.rows.map(row => row.id)).toContain('session-parked')
-    expect(offered.rows.find(row => row.current)?.id).toBe('session-parked')
+    expect(offered.rows.map(row => row.id)).toContain('lark-oc_1--parked')
+    expect(offered.rows.find(row => row.current)?.id).toBe('lark-oc_1--parked')
   })
 
   it('offers nothing, and says why, when the corpus cannot be listed', async () => {

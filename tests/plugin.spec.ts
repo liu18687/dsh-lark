@@ -3155,7 +3155,7 @@ describe('dsh-lark-channel', () => {
       const store = createFakeSettings()
       const { query } = createFakeSessionQuery([
         {
-          id: 'session-web-ui',
+          id: 'lark-oc_chat_1--web',
           cwd: process.cwd(),
           createdAt: Date.now() - 3_600_000,
           title: '在网页上开的活',
@@ -3190,20 +3190,20 @@ describe('dsh-lark-channel', () => {
       expect(shown).toContain('再看看卡片')
       expect(shown.replace(/\s+/g, ' ')).toContain('2 轮')
       // Ids are carried, never printed: nobody should be asked to transcribe one.
-      expect(shown).not.toContain('session-web-ui')
+      expect(shown).not.toContain('lark-oc_chat_1--web')
 
       const row = cardControls(card)
-        .find((control) => (control.value as { session: string }).session === 'session-web-ui')!
+        .find((control) => (control.value as { session: string }).session === 'lark-oc_chat_1--web')!
       const response = await harness.fake.emitCardAction(clickAction(row.value))
       expect(response).toMatchObject({ toast: { type: 'success' } })
 
       // The next message continues that session rather than the derived one.
-      harness.agents.resumable.add('session-web-ui')
+      harness.agents.resumable.add('lark-oc_chat_1--web')
       await harness.fake.emitMessage(fakeMessage({ content: 'go on' }))
-      await vi.waitFor(() => { expect(harness.agents.resumed).toContain('session-web-ui') })
+      await vi.waitFor(() => { expect(harness.agents.resumed).toContain('lark-oc_chat_1--web') })
       // CONTINUED, not started over: nothing was created under that id, which
       // is what a resume failure falling through to the create rung would do.
-      expect(harness.agents.made).not.toContain('session-web-ui')
+      expect(harness.agents.made).not.toContain('lark-oc_chat_1--web')
       await harness.dispose()
     })
 
@@ -3242,14 +3242,14 @@ describe('dsh-lark-channel', () => {
       // empty at filter time, so it only ever matched session ids.
       const { query, titled } = createFakeSessionQuery([
         {
-          id: 'session-docs',
+          id: 'lark-oc_chat_1--docs',
           cwd: process.cwd(),
           createdAt: Date.now() - 3_600_000,
           title: '整理云文档目录',
           messages: [{ text: '继续整理那批文档', at: Date.now() - 3_000_000 }],
         },
         {
-          id: 'session-build',
+          id: 'lark-oc_chat_1--build',
           cwd: process.cwd(),
           createdAt: Date.now() - 1_800_000,
           title: '修构建脚本',
@@ -3266,7 +3266,7 @@ describe('dsh-lark-channel', () => {
       await harness.fake.emitMessage(fakeMessage({ content: '/sessions 云文档' }))
       await vi.waitFor(() => { expect(harness.fake.sent.length).toBeGreaterThan(1) })
       const card = (harness.fake.sent.at(-1)!.input as { card: object }).card
-      expect(cardControls(card).map((c) => (c.value as { session: string }).session)).toEqual(['session-docs'])
+      expect(cardControls(card).map((c) => (c.value as { session: string }).session)).toEqual(['lark-oc_chat_1--docs'])
       await harness.dispose()
     })
 
@@ -3277,7 +3277,7 @@ describe('dsh-lark-channel', () => {
       // the DERIVED session's agent, which a pick had just released.
       const { query } = createFakeSessionQuery([
         {
-          id: 'session-web-ui',
+          id: 'lark-oc_chat_1--web',
           cwd: process.cwd(),
           createdAt: Date.now() - 3_600_000,
           messages: [{ text: '在网页端开的那一段', at: Date.now() - 3_000_000 }],
@@ -3295,13 +3295,13 @@ describe('dsh-lark-channel', () => {
         }),
       }
       const harness = await mountChannel({}, { sessionQuery: query, sessionProjections })
-      harness.agents.resumable.add('session-web-ui')
+      harness.agents.resumable.add('lark-oc_chat_1--web')
       await harness.fake.emitMessage(fakeMessage({ content: '/sessions' }))
       await vi.waitFor(() => { expect(harness.fake.sent.length).toBeGreaterThan(0) })
       const picker = (harness.fake.sent.at(-1)!.input as { card: object }).card
       await harness.fake.emitCardAction(clickAction(cardControls(picker)[0]!.value))
       await harness.fake.emitMessage(fakeMessage({ content: 'carry on' }))
-      await vi.waitFor(() => { expect(harness.agents.resumed).toContain('session-web-ui') })
+      await vi.waitFor(() => { expect(harness.agents.resumed).toContain('lark-oc_chat_1--web') })
 
       await harness.fake.emitMessage(fakeMessage({ content: '/status' }))
       await vi.waitFor(() => {
@@ -3310,7 +3310,7 @@ describe('dsh-lark-channel', () => {
       })
       const status = (harness.fake.sent.filter((m) => 'card' in m.input).at(-1)!.input as { card: object }).card
       const texts = cardTexts(status).map((t) => t.content)
-      expect(texts).toContain('session-web-ui')
+      expect(texts).toContain('lark-oc_chat_1--web')
       // The row that says which sandbox is in force, read off the session the
       // conversation is actually on.
       expect(texts).toContain('权限')
@@ -3321,7 +3321,7 @@ describe('dsh-lark-channel', () => {
     it('derives the list once per press, and repaints from what it authorized', async () => {
       const { query, listed } = createFakeSessionQuery([
         {
-          id: 'session-web-ui',
+          id: 'lark-oc_chat_1--web',
           cwd: process.cwd(),
           createdAt: Date.now() - 3_600_000,
           messages: [{ text: '在网页端开的那一段', at: Date.now() - 3_000_000 }],
@@ -3350,7 +3350,7 @@ describe('dsh-lark-channel', () => {
       const target = realpathSync(mkdtempSync(join(tmpdir(), 'ws-race-')))
       const { query, hold } = createFakeSessionQuery([
         {
-          id: 'session-web-ui',
+          id: 'lark-oc_chat_1--web',
           cwd: process.cwd(),
           createdAt: Date.now() - 3_600_000,
           messages: [{ text: '在网页端开的那一段', at: Date.now() - 3_000_000 }],
@@ -3372,7 +3372,7 @@ describe('dsh-lark-channel', () => {
       // derives — not on the one the press named.
       await harness.fake.emitMessage(fakeMessage({ content: 'after the move' }))
       await vi.waitFor(() => { expect(harness.agents.created.length).toBeGreaterThan(0) })
-      expect(harness.agents.resumed).not.toContain('session-web-ui')
+      expect(harness.agents.resumed).not.toContain('lark-oc_chat_1--web')
       expect(harness.agents.created.at(-1)!.meta?.cwd).toBe(target)
       await harness.dispose()
     })
@@ -3385,7 +3385,7 @@ describe('dsh-lark-channel', () => {
       // carry on with.
       const { query } = createFakeSessionQuery([
         {
-          id: 'session-web-ui',
+          id: 'lark-oc_chat_1--web',
           cwd: process.cwd(),
           createdAt: Date.now() - 3_600_000,
           messages: [{ text: '在网页端开的那一段', at: Date.now() - 3_000_000 }],
@@ -3400,7 +3400,7 @@ describe('dsh-lark-channel', () => {
       // The session is NOT resumable here: the log will not load.
       await harness.fake.emitMessage(fakeMessage({ content: 'go on' }))
       await vi.waitFor(() => { expect(sentText(harness)).toContain('打不开了') })
-      expect(harness.agents.made).not.toContain('session-web-ui')
+      expect(harness.agents.made).not.toContain('lark-oc_chat_1--web')
 
       // And the pick is retired rather than left to fail forever: the next
       // message lands on this conversation's own session.
@@ -3414,19 +3414,19 @@ describe('dsh-lark-channel', () => {
       // offering an archived session would be the one surface it did not reach.
       const { query } = createFakeSessionQuery([
         {
-          id: 'session-kept',
+          id: 'lark-oc_chat_1--kept',
           cwd: process.cwd(),
           createdAt: Date.now() - 3_600_000,
           messages: [{ text: '这一段还留着', at: Date.now() - 3_000_000 }],
         },
         {
-          id: 'session-archived',
+          id: 'lark-oc_chat_1--archived',
           cwd: process.cwd(),
           createdAt: Date.now() - 1_800_000,
           messages: [{ text: '这一段已经归档了', at: Date.now() - 1_700_000 }],
         },
       ])
-      const workspaces = createFakeWorkspaces({}, ['session-archived'])
+      const workspaces = createFakeWorkspaces({}, ['lark-oc_chat_1--archived'])
       const harness = await mountChannel({}, { sessionQuery: query, workspaces: workspaces.service })
       await harness.fake.emitMessage(fakeMessage({ content: '/sessions' }))
       await vi.waitFor(() => { expect(harness.fake.sent.length).toBeGreaterThan(0) })
@@ -3434,8 +3434,8 @@ describe('dsh-lark-channel', () => {
 
       expect(cardTexts(card).map((t) => t.content).join('\n')).not.toContain('已经归档')
       const offered = cardControls(card).map((c) => (c.value as { session: string }).session)
-      expect(offered).toContain('session-kept')
-      expect(offered).not.toContain('session-archived')
+      expect(offered).toContain('lark-oc_chat_1--kept')
+      expect(offered).not.toContain('lark-oc_chat_1--archived')
       await harness.dispose()
     })
 
@@ -3444,13 +3444,13 @@ describe('dsh-lark-channel', () => {
       // else, or a row reads as older than the one above it.
       const { query } = createFakeSessionQuery([
         {
-          id: 'session-old-but-live',
+          id: 'lark-oc_chat_1--old-live',
           cwd: process.cwd(),
           createdAt: Date.now() - 30 * 86_400_000,
           messages: [{ text: '开得早但刚聊过', at: Date.now() - 60_000 }],
         },
         {
-          id: 'session-new-but-cold',
+          id: 'lark-oc_chat_1--new-cold',
           cwd: process.cwd(),
           createdAt: Date.now() - 3_600_000,
           messages: [{ text: '开得晚但很久没动', at: Date.now() - 3_000_000 }],
@@ -3462,7 +3462,7 @@ describe('dsh-lark-channel', () => {
       const card = (harness.fake.sent.at(-1)!.input as { card: object }).card
 
       expect(cardControls(card).map((c) => (c.value as { session: string }).session))
-        .toEqual(['session-old-but-live', 'session-new-but-cold'])
+        .toEqual(['lark-oc_chat_1--old-live', 'lark-oc_chat_1--new-cold'])
       await harness.dispose()
     })
 
@@ -3471,14 +3471,14 @@ describe('dsh-lark-channel', () => {
       // Dropping it must not leave a hole the card fills with a row it never
       // read — those render with no time, no turns and no opening line.
       const empties = Array.from({ length: 8 }, (_, index) => ({
-        id: `session-empty-${index}`,
+        id: `lark-oc_chat_1:omt_empty_${index}`,
         cwd: process.cwd(),
         createdAt: Date.now() - (index + 1) * 60_000,
       }))
       const { query } = createFakeSessionQuery([
         ...empties,
         {
-          id: 'session-real',
+          id: 'lark-oc_chat_1--real',
           cwd: process.cwd(),
           createdAt: Date.now() - 10 * 60_000,
           messages: [{ text: '真正聊过的那一段', at: Date.now() - 9 * 60_000 }],
@@ -3490,7 +3490,7 @@ describe('dsh-lark-channel', () => {
       const card = (harness.fake.sent.at(-1)!.input as { card: object }).card
 
       const offered = cardControls(card).map((c) => (c.value as { session: string }).session)
-      expect(offered).toEqual(['session-real'])
+      expect(offered).toEqual(['lark-oc_chat_1--real'])
       expect(cardTexts(card).map((t) => t.content).join('\n')).toContain('真正聊过的那一段')
       await harness.dispose()
     })
@@ -3498,7 +3498,7 @@ describe('dsh-lark-channel', () => {
     it('goes back by pressing the conversation\'s own session', async () => {
       const { query } = createFakeSessionQuery([
         {
-          id: 'session-web-ui',
+          id: 'lark-oc_chat_1--web',
           cwd: process.cwd(),
           createdAt: Date.now() - 3_600_000,
           messages: [{ text: '在别处开的那一段', at: Date.now() - 3_000_000 }],
@@ -3515,7 +3515,7 @@ describe('dsh-lark-channel', () => {
       await vi.waitFor(() => { expect(harness.fake.sent.length).toBeGreaterThan(0) })
       const first = (harness.fake.sent.at(-1)!.input as { card: object }).card
       const away = cardControls(first)
-        .find((control) => (control.value as { session: string }).session === 'session-web-ui')!
+        .find((control) => (control.value as { session: string }).session === 'lark-oc_chat_1--web')!
       await harness.fake.emitCardAction(clickAction(away.value))
 
       // The repainted card offers the derived session, and pressing it is the
@@ -3555,14 +3555,14 @@ describe('dsh-lark-channel', () => {
       const target = realpathSync(mkdtempSync(join(tmpdir(), 'ws-pick-')))
       const { query } = createFakeSessionQuery([
         {
-          id: 'session-web-ui',
+          id: 'lark-oc_chat_1--web',
           cwd: process.cwd(),
           createdAt: Date.now() - 3_600_000,
           messages: [{ text: '在别处开的那一段', at: Date.now() - 3_000_000 }],
         },
       ])
       const harness = await mountChannel({}, { sessionQuery: query, workspaces: createFakeWorkspaces().service })
-      harness.agents.resumable.add('session-web-ui')
+      harness.agents.resumable.add('lark-oc_chat_1--web')
       await harness.fake.emitMessage(fakeMessage({ content: '/sessions' }))
       await vi.waitFor(() => { expect(harness.fake.sent.length).toBeGreaterThan(0) })
       const card = (harness.fake.sent.at(-1)!.input as { card: object }).card
@@ -3573,7 +3573,7 @@ describe('dsh-lark-channel', () => {
       await harness.fake.emitMessage(fakeMessage({ content: `/cd ${process.cwd()}` }))
       await vi.waitFor(() => { expect(sentText(harness)).toContain('当前就在') })
       await harness.fake.emitMessage(fakeMessage({ content: 'still here' }))
-      await vi.waitFor(() => { expect(harness.agents.resumed).toContain('session-web-ui') })
+      await vi.waitFor(() => { expect(harness.agents.resumed).toContain('lark-oc_chat_1--web') })
 
       // A `/cd` that moves ends the pick, because the picked session belongs to
       // the directory this conversation just left.
@@ -3582,7 +3582,7 @@ describe('dsh-lark-channel', () => {
       const before = harness.agents.resumed.length
       await harness.fake.emitMessage(fakeMessage({ content: 'after cd' }))
       await vi.waitFor(() => { expect(harness.agents.created.length).toBeGreaterThan(1) })
-      expect(harness.agents.resumed.slice(before)).not.toContain('session-web-ui')
+      expect(harness.agents.resumed.slice(before)).not.toContain('lark-oc_chat_1--web')
       expect(harness.agents.created.at(-1)!.meta?.cwd).toBe(target)
       await harness.dispose()
     })

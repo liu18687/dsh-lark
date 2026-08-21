@@ -319,17 +319,29 @@ function isOwnSession(id: string, base: string): boolean {
 }
 
 /**
- * Whether one session id was derived for SOME conversation of this channel.
- *
- * Every prefix this channel derives with begins with the channel's own marker,
- * instance rows included, so anything else came from another surface — the web
- * UI, the CLI — and belongs to nobody's chat.
- * @param id - the session id to test.
+ * The prefix every conversation of one chat shares: the channel marker plus
+ * the chat id, cut at the first facet separator.
+ * @param base - a conversation's base session id.
  * @param marker - the channel's session-id marker.
- * @returns true when some conversation owns it.
+ * @returns the chat's id prefix, without facets.
  */
-function isChatSession(id: string, marker: string): boolean {
-  return id.startsWith(marker)
+function chatPrefixOf(base: string, marker: string): string {
+  const colon = base.indexOf(':', marker.length)
+  return colon === -1 ? base : base.slice(0, colon)
+}
+
+/**
+ * Whether one session id is a per-message one-shot session. Under the
+ * chat-thread scope every main-channel group message owns such a session for
+ * exactly its own turn — the topic it creates carries the conversation — so
+ * offering them as rows to "continue" is the noise a full inbox complains
+ * about. They stay resumable (a press on the current one is how a picked
+ * conversation comes back), but are counted as hidden, not listed.
+ * @param id - the session id to test.
+ * @returns true when the id carries the per-message facet.
+ */
+function isPerMessageSession(id: string): boolean {
+  return id.includes(':msg:')
 }
 
 /** What the picker needs to know about the conversation it is built for. */
@@ -384,9 +396,13 @@ export function sessionChoices(
     .filter(record => input.archived?.has(record.header!.id!) !== true)
     .filter(record => {
       const id = record.header!.id!
-      // Own history, or a session no conversation owns. Another chat's session
-      // is never offered: its title alone summarizes what was said there.
-      return isOwnSession(id, input.base) || !isChatSession(id, input.marker)
+      // Own history, or another conversation of the SAME chat — a topic of
+      // this group. Another chat's session is never offered, the workspace's
+      // web/CLI sessions are another surface's rows, and per-message one-shot
+      // sessions are noise: all hidden, not listed.
+      const chatPrefix = chatPrefixOf(input.base, input.marker)
+      return isOwnSession(id, input.base)
+        || (id.startsWith(`${chatPrefix}:`) && !isPerMessageSession(id))
     })
     // A session carries the directory it runs in, so one from elsewhere would
     // move this conversation's sandbox without anyone saying so.
@@ -485,6 +501,21 @@ export async function offerSessions(offer: SessionOffer): Promise<OfferedSession
   })
   const keyword = scope.keyword?.trim() ?? ''
   const candidates = sessionChoices(records, new Map(), { ...scope, keyword: '' }, canonical)
+  // Sessions that survived the corpus filters but not the ownership rule —
+  // another surface's web/CLI rows, another chat's history, and per-message
+  // one-shot sessions — so the card can say how many it is not showing.
+  const home = canonical(scope.workspace)
+  const chatPrefix = chatPrefixOf(scope.base, scope.marker)
+  const excluded = records
+    .filter(record => typeof record.header?.id === 'string' && record.header.id !== ''
+      && !isDelegated(record)
+      && (scope.archived?.has(record.header.id) !== true)
+      && record.header?.cwd !== undefined && canonical(record.header.cwd) === home)
+    .filter(record => {
+      const id = record.header!.id!
+      return !isOwnSession(id, scope.base)
+        && !(id.startsWith(`${chatPrefix}:`) && !isPerMessageSession(id))
+    }).length
   // A keyword is matched against titles, so the titles have to exist before the
   // filter runs — the reason a keyword used to match nothing but ids. Bounded,
   // because this is a title read per candidate.
@@ -543,5 +574,5 @@ export async function offerSessions(offer: SessionOffer): Promise<OfferedSession
     const title = titles.get(choice.id)
     return title === undefined ? choice : { ...choice, title }
   })
-  return { rows, hidden: kept.length - rows.length + (shortlist.length - window.length) }
+  return { rows, hidden: excluded + kept.length - rows.length + (shortlist.length - window.length) }
 }
