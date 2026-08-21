@@ -849,6 +849,7 @@ export function installBridge(
     defaultPath: defaultCwd,
     entries: config.chatWorkspaces,
     roots: config.workspaceRoots,
+    aliases: config.workspaceAliases,
     persist: persistState,
     report: notify,
     // Every session id this row derives carries its own prefix, so two bots

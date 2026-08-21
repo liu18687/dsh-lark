@@ -130,6 +130,8 @@ export interface ChatWorkspacesOptions {
   readonly entries?: Record<string, string> | undefined
   /** Directory prefixes `/cd` may enter; empty allows anywhere. */
   readonly roots?: readonly string[] | undefined
+  /** Friendly names: alias → directory. `/cd <alias>` resolves through it. */
+  readonly aliases?: Readonly<Record<string, string>> | undefined
   /** Deep-merge one patch into the plugin's settings section; false = not composed. */
   readonly persist?: ((patch: { chatWorkspaces: Record<string, string> }) => Promise<boolean>) | undefined
   /** Operator console line. */
@@ -166,6 +168,7 @@ export class ChatWorkspaces {
   /** The default's canonical form, for deciding that a `/cd` target IS the default. */
   private readonly defaultCanonical: string
   private readonly roots: readonly string[]
+  private readonly aliases: ReadonlyMap<string, string>
   private readonly persist: (patch: { chatWorkspaces: Record<string, string> }) => Promise<boolean>
   private readonly report: (line: string) => void
   private readonly probe: WorkspaceProbe
@@ -179,6 +182,7 @@ export class ChatWorkspaces {
   constructor(options: ChatWorkspacesOptions) {
     this.defaultPath = options.defaultPath
     this.roots = options.roots ?? []
+    this.aliases = new Map(Object.entries(options.aliases ?? {}))
     this.persist = options.persist ?? (async () => false)
     this.report = options.report ?? (() => {})
     this.probe = options.probe ?? probeDirectory
@@ -248,8 +252,19 @@ export class ChatWorkspaces {
    * @param input - the operator's target exactly as typed.
    * @returns what happened, for the chat reply.
    */
+  /** The alias naming one path, when the deployment named one. */
+  aliasOf(path: string): string | undefined {
+    for (const [alias, target] of this.aliases) {
+      if (expandHome(target, this.home) === path) return alias
+    }
+    return undefined
+  }
+
   async switch(key: string, input: string): Promise<SwitchResult> {
-    const expanded = expandHome(input, this.home)
+    // An alias is a name the deployment taught the channel, so it resolves
+    // before basename matching — and wins over an identically named basename.
+    const aliased = this.aliases.get(input.trim())
+    const expanded = expandHome(aliased ?? input, this.home)
     let candidate: string
     if (isAbsolute(expanded)) {
       candidate = expanded
@@ -329,7 +344,9 @@ export async function runWorkspaceCommand(
         ...index === 0 ? ['默认'] : [],
         ...path === current ? ['当前'] : [],
       ]
-      return `- \`${basename(path)}\` ${path}${marks.length > 0 ? `（${marks.join('，')}）` : ''}`
+      const alias = store.aliasOf(path)
+      const name = alias ?? basename(path)
+      return `- \`${name}\` ${path}${marks.length > 0 ? `（${marks.join('，')}）` : ''}`
     })
     return [
       '**工作区**',

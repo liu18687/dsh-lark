@@ -62,6 +62,12 @@ export interface Config {
    */
   workspaceRoots?: string[]
   /**
+   * Friendly names for workspaces: alias → directory. `/cd <alias>` resolves
+   * through this map and `/ws` shows the alias beside the path, so a chat can
+   * say `hub` instead of a full path.
+   */
+  workspaceAliases?: Record<string, string>
+  /**
    * Managed state, not configuration: the workspace each conversation was
    * `/cd`-ed to, keyed by conversation key, written back through the settings
    * service. An empty-string value marks "explicitly the default" — the
@@ -271,6 +277,7 @@ export interface ResolvedConfig {
   domain?: string | undefined
   cwd?: string | undefined
   workspaceRoots: string[]
+  workspaceAliases: Record<string, string>
   chatWorkspaces: Record<string, string>
   chatModels: Record<string, string>
   chatEpochs: Record<string, string>
@@ -308,6 +315,7 @@ export const Config: z<Config> = z.object({
   domain: z.string(),
   cwd: z.string(),
   workspaceRoots: z.array(String),
+  workspaceAliases: z.dict(String).default({}),
   chatWorkspaces: z.dict(String).default({}),
   chatModels: z.dict(String).default({}),
   chatEpochs: z.dict(String).default({}),
@@ -345,6 +353,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
   return {
     ...config,
     workspaceRoots: config.workspaceRoots ?? [],
+    workspaceAliases: config.workspaceAliases ?? {},
     chatWorkspaces: config.chatWorkspaces ?? {},
     chatModels: config.chatModels ?? {},
     chatEpochs: config.chatEpochs ?? {},

@@ -29,6 +29,7 @@ function createStore(options: {
   directories?: string[]
   persisted?: boolean
   known?: string[]
+  aliases?: Record<string, string>
 } = {}) {
   const patches: object[] = []
   const reports: string[] = []
@@ -36,6 +37,7 @@ function createStore(options: {
     defaultPath: '/srv/default',
     entries: options.entries,
     roots: options.roots,
+    aliases: options.aliases,
     probe: fakeProbe([
       ...options.directories ?? ['/srv/default', '/srv/alpha', '/srv/beta'],
       ...options.known ?? [],
@@ -145,6 +147,28 @@ describe('ChatWorkspaces', () => {
     const { store } = createStore({ entries: { other: '/srv/alpha' } })
     const result = await store.switch('chat', 'alpha')
     expect(result).toMatchObject({ ok: true, path: '/srv/alpha' })
+  })
+
+  it('resolves a deployment alias, winning over an identically named basename', async () => {
+    const { store } = createStore({
+      aliases: { hub: '/srv/alpha' },
+      entries: { other: '/srv/hub' },
+      directories: ['/srv/default', '/srv/alpha', '/srv/hub'],
+    })
+    // Both `/srv/hub` (basename) and the alias `hub` exist: the alias wins.
+    const result = await store.switch('chat', 'hub')
+    expect(result).toMatchObject({ ok: true, path: '/srv/alpha' })
+    expect(store.aliasOf('/srv/alpha')).toBe('hub')
+    expect(store.aliasOf('/srv/default')).toBeUndefined()
+  })
+
+  it('lists the alias beside its path in /ws', async () => {
+    const { store } = createStore({
+      aliases: { hub: '/srv/alpha' },
+      entries: { other: '/srv/alpha' },
+    })
+    const markdown = await runWorkspaceCommand('ws', '/ws', 'chat', store, async () => {})
+    expect(markdown).toContain('`hub` /srv/alpha')
   })
 
   it('refuses an ambiguous or unknown shorthand with directions', async () => {
