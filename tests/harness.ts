@@ -91,7 +91,7 @@ export function createFakePort() {
   /** Thinking processes the renderer deleted, with the handle it held. */
   const deletedCots: { cotId: string; messageId: string }[] = []
   /** Topics the renderer asked the transport to open under a message. */
-  const openedThreads: { chatId: string; replyTo: string; threadId: string }[] = []
+  const openedThreads: { chatId: string; replyTo: string; threadId: string; guideMessageId: string }[] = []
   /** Downloadable resources, by file key, as the transport would serve them. */
   const resourceBytes = new Map<string, { buffer: Uint8Array; contentType?: string }>()
   /** Members returned by the optional cached roster lookup. */
@@ -216,8 +216,9 @@ export function createFakePort() {
     async openThread(chatId, replyTo) {
       if (state.failOpenThread) return undefined
       counter += 1
-      openedThreads.push({ chatId, replyTo, threadId: `omt_${counter}` })
-      return `omt_${counter}`
+      const guideMessageId = `om_guide_${counter}`
+      openedThreads.push({ chatId, replyTo, threadId: `omt_${counter}`, guideMessageId })
+      return { threadId: `omt_${counter}`, guideMessageId }
     },
     async downloadResourceWithMeta(messageId, fileKey, _type) {
       downloads.push({ fileKey, via: 'memory' })

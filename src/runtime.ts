@@ -213,7 +213,7 @@ export function createLarkChannelPort(config: ChannelConfig, authorization: Auth
         url: `${MESSAGE_DELETE_API}/${handle.messageId}`,
       })
     },
-    async openThread(_chatId: string, replyTo: string): Promise<string | undefined> {
+    async openThread(_chatId: string, replyTo: string): Promise<{ threadId: string; guideMessageId: string } | undefined> {
       const response = await raw.request({
         method: 'POST',
         url: `/open-apis/im/v1/messages/${replyTo}/reply`,
@@ -223,7 +223,8 @@ export function createLarkChannelPort(config: ChannelConfig, authorization: Auth
           reply_in_thread: true,
         },
       }) as { data?: { thread_id?: string; message_id?: string } }
-      return response.data?.thread_id
+      if (response.data?.thread_id === undefined || response.data?.message_id === undefined) return undefined
+      return { threadId: response.data.thread_id, guideMessageId: response.data.message_id }
     },
     async createSlashCommand(command: string, description: string): Promise<void> {
       await raw.request({
